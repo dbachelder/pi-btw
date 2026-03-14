@@ -29,6 +29,9 @@
   "publishConfig": {
     "access": "public"
   },
+  "scripts": {
+    "test": "vitest --run"
+  },
   "pi": {
     "extensions": [
       "./extensions"
@@ -42,5 +45,8 @@
     "@mariozechner/pi-ai": "*",
     "@mariozechner/pi-coding-agent": "*",
     "@mariozechner/pi-tui": "*"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.0"
   }
 }

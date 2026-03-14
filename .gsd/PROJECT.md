@@ -10,7 +10,7 @@ A user can open BTW instantly, ask and continue a side conversation in place wit
 
 ## Current State
 
-The project is a small extension package with one main extension entrypoint in `extensions/btw.ts`, a README documenting BTW thread semantics, and a BTW skill for discoverability. Today the side conversation is command-driven and rendered as a widget above the editor. Thread continuity, contextual vs tangent mode, hidden thread persistence, and explicit inject/summarize handoff already exist.
+The project now ships a real BTW modal shell instead of a widget-only side channel. `extensions/btw.ts` opens BTW as a focused overlay with its own composer, transcript, streamed status text, follow-up submission path, and Escape dismissal, while still persisting thread continuity through the same hidden custom session entries and reset markers used before. The above-editor widget remains as a lightweight mirror, not the primary interaction surface.
 
 ## Architecture / Key Patterns
 
@@ -23,3 +23,7 @@ See `.gsd/REQUIREMENTS.md` for the explicit capability contract, requirement sta
 ## Milestone Sequence
 
 - [ ] M001: Embedded BTW modal chat — Replace the current widget-only BTW interaction with a lightweight modal multi-turn side chat while preserving BTW semantics.
+  - [x] S01: Modal BTW chat shell
+  - [ ] S02: BTW contract preservation
+  - [ ] S03: Explicit handoff and background-session integration
+  - [ ] S04: Slash-command support and graceful fallback

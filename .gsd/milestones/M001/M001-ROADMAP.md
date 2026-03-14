@@ -48,7 +48,7 @@ This milestone is complete only when all are true:
 
 ## Slices
 
-- [ ] **S01: Modal BTW chat shell** `risk:high` `depends:[]`
+- [x] **S01: Modal BTW chat shell** `risk:high` `depends:[]`
   > After this: BTW opens as a real modal side-chat with focused input, supports at least one follow-up turn in place, and dismisses via Escape.
 
 - [ ] **S02: BTW contract preservation** `risk:medium` `depends:[S01]`

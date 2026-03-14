@@ -11,7 +11,7 @@ A small [pi](https://github.com/badlogic/pi-mono) extension that adds a `/btw` s
 - opens a parallel side conversation without interrupting the main run
 - keeps a continuous BTW thread by default
 - supports `/btw:tangent` for a contextless side thread that does not inherit the current main-session conversation
-- streams answers into a widget above the editor
+- opens a focused BTW modal shell with its own composer and transcript
 - keeps BTW thread entries out of the main agent's future context
 - lets you inject the full thread, or a summary of it, back into the main agent
 - optionally saves an individual BTW exchange as a visible session note with `--save`
@@ -62,7 +62,8 @@ pi install /absolute/path/to/pi-btw
 - runs right away
 - works while pi is busy
 - continues the current BTW thread
-- streams into a widget above the editor
+- opens or refreshes the focused BTW modal shell
+- streams into the BTW modal transcript/status surface
 - persists the BTW exchange as hidden thread state
 - with `--save`, also saves that single exchange as a visible session note
 
@@ -71,18 +72,19 @@ pi install /absolute/path/to/pi-btw
 - clears the current BTW thread
 - starts a fresh thread that still inherits the current main-session context
 - optionally asks the first question in the new thread immediately
+- if no question is provided, opens a fresh BTW modal ready for the next prompt
 
 ### `/btw:tangent [--save] <question>`
 
 - starts or continues a contextless tangent thread
 - does not inherit the current main-session conversation
 - if you switch from `/btw` to `/btw:tangent` (or back), the previous side thread is cleared so the modes do not mix
-- streams into the same above-editor widget
+- opens or refreshes the same focused BTW modal shell
 - with `--save`, also saves that single exchange as a visible session note
 
 ### `/btw:clear`
 
-- dismisses the BTW widget
+- dismisses the BTW modal/widget
 - clears the current BTW thread
 
 ### `/btw:inject [instructions]`
@@ -105,7 +107,7 @@ pi install /absolute/path/to/pi-btw
 BTW exchanges are persisted in the session as hidden custom entries so they:
 
 - survive reloads and restarts
-- rehydrate the BTW widget for the current branch
+- rehydrate the BTW modal shell for the current branch
 - preserve whether the current side thread is a normal `/btw` thread or a contextless `/btw:tangent`
 - stay out of the main agent's LLM context
 

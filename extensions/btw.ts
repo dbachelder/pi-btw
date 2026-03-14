@@ -11,7 +11,17 @@ import {
   type Message,
   type ThinkingLevel as AiThinkingLevel,
 } from "@mariozechner/pi-ai";
-import { Box, Text } from "@mariozechner/pi-tui";
+import {
+  Box,
+  Container,
+  Input,
+  Spacer,
+  Text,
+  type Focusable,
+  type KeybindingsManager,
+  type OverlayHandle,
+  type TUI,
+} from "@mariozechner/pi-tui";
 
 const BTW_MESSAGE_TYPE = "btw-note";
 const BTW_ENTRY_TYPE = "btw-thread-entry";
@@ -58,6 +68,12 @@ type BtwSlot = {
   answer: string;
   done: boolean;
   controller: AbortController;
+};
+
+type OverlayRuntime = {
+  handle?: OverlayHandle;
+  refresh?: () => void;
+  close?: () => void;
 };
 
 function isVisibleBtwMessage(message: { role: string; customType?: string }): boolean {
@@ -220,11 +236,181 @@ function notify(ctx: ExtensionContext | ExtensionCommandContext, message: string
   }
 }
 
+function getOverlayTitle(mode: BtwThreadMode): string {
+  return mode === "tangent" ? "BTW tangent" : "BTW";
+}
+
+function buildOverlayTranscript(slots: BtwSlot[]): string[] {
+  if (slots.length === 0) {
+    return ["No BTW thread yet. Ask a side question to start one."];
+  }
+
+  const lines: string[] = [];
+  for (let i = 0; i < slots.length; i++) {
+    const slot = slots[i];
+    if (i > 0) {
+      lines.push("", "────────────────────────────────────────");
+    }
+
+    lines.push(`You  ${slot.question}`);
+
+    if (slot.thinking) {
+      lines.push("", `Thinking${!slot.done && !slot.answer ? " ▍" : ""}`, slot.thinking);
+    }
+
+    if (slot.answer) {
+      lines.push("", `Assistant${!slot.done ? " ▍" : ""}`, slot.answer);
+    } else if (!slot.done) {
+      lines.push("", "Assistant", "⏳ thinking...");
+    }
+
+    lines.push("", `Model  ${slot.modelLabel}`);
+  }
+
+  return lines;
+}
+
+class BtwOverlayComponent extends Container implements Focusable {
+  private readonly input: Input;
+  private readonly transcript: Container;
+  private readonly statusText: Text;
+  private readonly modeText: Text;
+  private readonly summaryText: Text;
+  private readonly hintsText: Text;
+  private readonly getSlots: () => BtwSlot[];
+  private readonly getStatus: () => string | null;
+  private readonly getMode: () => BtwThreadMode;
+  private readonly onSubmitCallback: (value: string) => void;
+  private readonly onDismissCallback: () => void;
+  private readonly tui: TUI;
+  private _focused = false;
+
+  get focused(): boolean {
+    return this._focused;
+  }
+
+  set focused(value: boolean) {
+    this._focused = value;
+    this.input.focused = value;
+  }
+
+  constructor(
+    tui: TUI,
+    _theme: ExtensionContext["ui"]["theme"],
+    keybindings: KeybindingsManager,
+    getSlots: () => BtwSlot[],
+    getStatus: () => string | null,
+    getMode: () => BtwThreadMode,
+    onSubmit: (value: string) => void,
+    onDismiss: () => void,
+  ) {
+    super();
+    this.tui = tui;
+    this.getSlots = getSlots;
+    this.getStatus = getStatus;
+    this.getMode = getMode;
+    this.onSubmitCallback = onSubmit;
+    this.onDismissCallback = onDismiss;
+
+    this.addChild(new Text("", 0, 0));
+    this.modeText = new Text("", 1, 0);
+    this.addChild(this.modeText);
+    this.addChild(new Spacer(1));
+
+    this.summaryText = new Text("", 1, 0);
+    this.addChild(this.summaryText);
+    this.addChild(new Spacer(1));
+
+    this.transcript = new Container();
+    this.addChild(this.transcript);
+    this.addChild(new Spacer(1));
+
+    this.statusText = new Text("", 1, 0);
+    this.addChild(this.statusText);
+    this.addChild(new Spacer(1));
+
+    this.input = new Input();
+    this.input.onSubmit = (value) => {
+      this.onSubmitCallback(value);
+    };
+    this.input.onEscape = () => {
+      this.onDismissCallback();
+    };
+    this.addChild(this.input);
+    this.addChild(new Spacer(1));
+
+    this.hintsText = new Text("", 1, 0);
+    this.addChild(this.hintsText);
+    this.addChild(new Text("", 0, 0));
+
+    const originalHandleInput = this.input.handleInput.bind(this.input);
+    this.input.handleInput = (data: string) => {
+      if (keybindings.matches(data, "selectCancel")) {
+        this.onDismissCallback();
+        return;
+      }
+      originalHandleInput(data);
+    };
+
+    this.refresh();
+  }
+
+  setDraft(value: string): void {
+    this.input.setValue(value);
+    this.tui.requestRender();
+  }
+
+  getDraft(): string {
+    return this.input.getValue();
+  }
+
+  refresh(): void {
+    this.modeText.setText(` ${getOverlayTitle(this.getMode())} · hidden thread preserved `);
+    const slots = this.getSlots();
+    const exchanges = slots.filter((slot) => slot.done).length;
+    const active = slots.some((slot) => !slot.done) ? " · streaming" : " · idle";
+    this.summaryText.setText(` ${exchanges} exchange${exchanges === 1 ? "" : "s"}${active}`);
+
+    this.transcript.clear();
+    for (const line of buildOverlayTranscript(slots)) {
+      this.transcript.addChild(new Text(line, 1, 0));
+    }
+
+    const status = this.getStatus() ?? "Ready. Enter submits; Escape dismisses without clearing.";
+    this.statusText.setText(` ${status}`);
+    this.hintsText.setText(" Enter submit · Escape dismiss · /btw:clear resets thread ");
+    this.tui.requestRender();
+  }
+}
+
 export default function (pi: ExtensionAPI) {
   let pendingThread: BtwDetails[] = [];
   let pendingMode: BtwThreadMode = "contextual";
   let slots: BtwSlot[] = [];
   let widgetStatus: string | null = null;
+  let overlayStatus: string | null = null;
+  let overlayDraft = "";
+  let overlayRuntime: OverlayRuntime | null = null;
+  let lastUiContext: ExtensionContext | ExtensionCommandContext | null = null;
+
+  function syncUi(ctx?: ExtensionContext | ExtensionCommandContext): void {
+    const activeCtx = ctx ?? lastUiContext;
+    if (activeCtx?.hasUI) {
+      renderWidget(activeCtx);
+      overlayRuntime?.refresh?.();
+    }
+  }
+
+  function setOverlayStatus(status: string | null, ctx?: ExtensionContext | ExtensionCommandContext): void {
+    overlayStatus = status;
+    widgetStatus = status;
+    syncUi(ctx);
+  }
+
+  function dismissOverlay(): void {
+    overlayRuntime?.close?.();
+    overlayRuntime = null;
+  }
 
   function abortActiveSlots(): void {
     for (const slot of slots) {
@@ -239,7 +425,7 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    if (slots.length === 0) {
+    if (slots.length === 0 && !widgetStatus) {
       ctx.ui.setWidget("btw", undefined);
       return;
     }
@@ -254,7 +440,7 @@ export default function (pi: ExtensionAPI) {
         const parts: string[] = [];
 
         const title = pendingMode === "tangent" ? " 💭 btw:tangent " : " 💭 btw ";
-        const hint = " /btw:clear dismiss · /btw:inject send ";
+        const hint = " Esc dismiss · /btw:clear reset ";
         const width = Math.max(22, 68 - title.length - hint.length);
         parts.push(dim(`╭${title}${"─".repeat(width)}${hint}╮`));
 
@@ -298,6 +484,101 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
+  async function ensureOverlay(ctx: ExtensionCommandContext | ExtensionContext): Promise<void> {
+    if (!ctx.hasUI) {
+      return;
+    }
+    lastUiContext = ctx;
+
+    if (overlayRuntime?.handle) {
+      overlayRuntime.handle.setHidden(false);
+      overlayRuntime.handle.focus();
+      overlayRuntime.refresh?.();
+      return;
+    }
+
+    const runtime: OverlayRuntime = {};
+    overlayRuntime = runtime;
+
+    runtime.close = () => {
+      runtime.handle?.hide();
+      overlayRuntime = null;
+    };
+
+    const component = await ctx.ui.custom<void>(
+      async (tui, theme, keybindings, done) => {
+        const overlay = new BtwOverlayComponent(
+          tui,
+          theme,
+          keybindings,
+          () => slots,
+          () => overlayStatus,
+          () => pendingMode,
+          (value) => {
+            overlayDraft = value;
+            void submitFromOverlay(ctx, value);
+          },
+          () => {
+            overlayDraft = overlay.getDraft();
+            done();
+          },
+        );
+
+        overlay.setDraft(overlayDraft);
+        runtime.refresh = () => {
+          overlay.refresh();
+          if (!runtime.handle?.isFocused()) {
+            overlay.focused = false;
+          }
+        };
+        runtime.close = () => {
+          overlayDraft = overlay.getDraft();
+          runtime.handle?.hide();
+          overlayRuntime = null;
+        };
+
+        return overlay;
+      },
+      {
+        overlay: true,
+        overlayOptions: {
+          width: "78%",
+          minWidth: 72,
+          maxHeight: "78%",
+          anchor: "center",
+          margin: 1,
+        },
+        onHandle: (handle) => {
+          runtime.handle = handle;
+          handle.focus();
+        },
+      },
+    );
+
+    void component;
+    if (overlayRuntime === runtime) {
+      overlayRuntime = null;
+    }
+  }
+
+  async function submitFromOverlay(ctx: ExtensionCommandContext | ExtensionContext, value: string): Promise<void> {
+    const question = value.trim();
+    if (!question) {
+      setOverlayStatus("Enter a BTW prompt before submitting.", ctx);
+      return;
+    }
+
+    if (!("getSystemPrompt" in ctx)) {
+      setOverlayStatus("BTW overlay submit requires a command context. Reopen BTW from a command.", ctx);
+      return;
+    }
+
+    overlayDraft = "";
+    setOverlayStatus("⏳ streaming...", ctx);
+    syncUi(ctx);
+    await runBtw(ctx, question, false, pendingMode);
+  }
+
   function resetThread(
     ctx: ExtensionContext | ExtensionCommandContext,
     persist = true,
@@ -307,12 +588,13 @@ export default function (pi: ExtensionAPI) {
     pendingThread = [];
     pendingMode = mode;
     slots = [];
-    widgetStatus = null;
+    overlayDraft = "";
+    setOverlayStatus(null, ctx);
     if (persist) {
       const details: BtwResetDetails = { timestamp: Date.now(), mode };
       pi.appendEntry(BTW_RESET_TYPE, details);
     }
-    renderWidget(ctx);
+    syncUi(ctx);
   }
 
   function restoreThread(ctx: ExtensionContext): void {
@@ -320,6 +602,9 @@ export default function (pi: ExtensionAPI) {
     pendingThread = [];
     pendingMode = "contextual";
     slots = [];
+    overlayDraft = "";
+    lastUiContext = ctx;
+    overlayStatus = null;
     widgetStatus = null;
 
     const branch = ctx.sessionManager.getBranch();
@@ -354,7 +639,7 @@ export default function (pi: ExtensionAPI) {
       });
     }
 
-    renderWidget(ctx);
+    syncUi(ctx);
   }
 
   async function runBtw(
@@ -363,15 +648,20 @@ export default function (pi: ExtensionAPI) {
     saveRequested: boolean,
     mode: BtwThreadMode,
   ): Promise<void> {
+    lastUiContext = ctx;
     const model = ctx.model;
     if (!model) {
+      setOverlayStatus("No active model selected.", ctx);
       notify(ctx, "No active model selected.", "error");
       return;
     }
 
     const apiKey = await ctx.modelRegistry.getApiKey(model);
     if (!apiKey) {
-      notify(ctx, `No credentials available for ${model.provider}/${model.id}.`, "error");
+      const message = `No credentials available for ${model.provider}/${model.id}.`;
+      setOverlayStatus(message, ctx);
+      notify(ctx, message, "error");
+      await ensureOverlay(ctx);
       return;
     }
 
@@ -389,7 +679,8 @@ export default function (pi: ExtensionAPI) {
 
     const threadSnapshot = pendingThread.slice();
     slots.push(slot);
-    renderWidget(ctx);
+    setOverlayStatus("⏳ streaming...", ctx);
+    await ensureOverlay(ctx);
 
     try {
       const stream = streamSimple(model, buildBtwContext(ctx, question, threadSnapshot, mode), {
@@ -403,10 +694,10 @@ export default function (pi: ExtensionAPI) {
       for await (const event of stream) {
         if (event.type === "thinking_delta") {
           slot.thinking += event.delta;
-          renderWidget(ctx);
+          syncUi(ctx);
         } else if (event.type === "text_delta") {
           slot.answer += event.delta;
-          renderWidget(ctx);
+          syncUi(ctx);
         } else if (event.type === "done") {
           response = event.message;
         } else if (event.type === "error") {
@@ -421,7 +712,7 @@ export default function (pi: ExtensionAPI) {
         const slotIndex = slots.indexOf(slot);
         if (slotIndex >= 0) {
           slots.splice(slotIndex, 1);
-          renderWidget(ctx);
+          setOverlayStatus("Request aborted.", ctx);
         }
         return;
       }
@@ -434,7 +725,6 @@ export default function (pi: ExtensionAPI) {
       slot.thinking = thinking;
       slot.answer = answer;
       slot.done = true;
-      renderWidget(ctx);
 
       const details: BtwDetails = {
         question,
@@ -453,22 +743,26 @@ export default function (pi: ExtensionAPI) {
       const saveState = saveVisibleBtwNote(pi, details, saveRequested, wasBusy);
       if (saveState === "saved") {
         notify(ctx, "Saved BTW note to the session.", "info");
+        setOverlayStatus("Saved BTW note to the session.", ctx);
       } else if (saveState === "queued") {
         notify(ctx, "BTW note queued to save after the current turn finishes.", "info");
+        setOverlayStatus("BTW note queued to save after the current turn finishes.", ctx);
+      } else {
+        setOverlayStatus("Ready for a follow-up. Hidden BTW thread updated.", ctx);
       }
     } catch (error) {
       if (slot.controller.signal.aborted) {
         const slotIndex = slots.indexOf(slot);
         if (slotIndex >= 0) {
           slots.splice(slotIndex, 1);
-          renderWidget(ctx);
+          setOverlayStatus("Request aborted.", ctx);
         }
         return;
       }
 
       slot.answer = `❌ ${error instanceof Error ? error.message : String(error)}`;
       slot.done = true;
-      renderWidget(ctx);
+      setOverlayStatus("Request failed. Thread preserved for retry or follow-up.", ctx);
       notify(ctx, error instanceof Error ? error.message : String(error), "error");
     }
   }
@@ -565,14 +859,16 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_shutdown", async () => {
     abortActiveSlots();
+    dismissOverlay();
   });
 
   pi.registerCommand("btw", {
-    description: "Continue a side conversation in a widget above the editor. Add --save to also persist a visible note.",
+    description: "Continue a side conversation in a focused BTW modal. Add --save to also persist a visible note.",
     handler: async (args, ctx) => {
       const { question, save } = parseBtwArgs(args);
       if (!question) {
         notify(ctx, "Usage: /btw [--save] <question>", "warning");
+        await ensureOverlay(ctx);
         return;
       }
 
@@ -585,11 +881,12 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("btw:tangent", {
-    description: "Start or continue a contextless BTW tangent that does not inherit the main session context.",
+    description: "Start or continue a contextless BTW tangent in the focused BTW modal.",
     handler: async (args, ctx) => {
       const { question, save } = parseBtwArgs(args);
       if (!question) {
         notify(ctx, "Usage: /btw:tangent [--save] <question>", "warning");
+        await ensureOverlay(ctx);
         return;
       }
 
@@ -609,15 +906,18 @@ export default function (pi: ExtensionAPI) {
       if (question) {
         await runBtw(ctx, question, save, "contextual");
       } else {
+        setOverlayStatus("Started a fresh BTW thread.", ctx);
+        await ensureOverlay(ctx);
         notify(ctx, "Started a fresh BTW thread.", "info");
       }
     },
   });
 
   pi.registerCommand("btw:clear", {
-    description: "Dismiss the BTW widget and clear the current thread.",
+    description: "Dismiss the BTW modal/widget and clear the current thread.",
     handler: async (_args, ctx) => {
       resetThread(ctx);
+      dismissOverlay();
       notify(ctx, "Cleared BTW thread.", "info");
     },
   });
@@ -638,6 +938,7 @@ export default function (pi: ExtensionAPI) {
       sendThreadToMain(ctx, content);
       const count = pendingThread.length;
       resetThread(ctx);
+      dismissOverlay();
       notify(ctx, `Injected BTW thread (${count} exchange${count === 1 ? "" : "s"}).`, "info");
     },
   });
@@ -650,8 +951,8 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      widgetStatus = "⏳ summarizing...";
-      renderWidget(ctx);
+      setOverlayStatus("⏳ summarizing...", ctx);
+      await ensureOverlay(ctx);
 
       try {
         const summary = await summarizeThread(ctx, pendingThread);
@@ -663,10 +964,10 @@ export default function (pi: ExtensionAPI) {
         sendThreadToMain(ctx, content);
         const count = pendingThread.length;
         resetThread(ctx);
+        dismissOverlay();
         notify(ctx, `Injected BTW summary (${count} exchange${count === 1 ? "" : "s"}).`, "info");
       } catch (error) {
-        widgetStatus = null;
-        renderWidget(ctx);
+        setOverlayStatus("Summarize failed. Thread preserved for retry or injection.", ctx);
         notify(ctx, error instanceof Error ? error.message : String(error), "error");
       }
     },

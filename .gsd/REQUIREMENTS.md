@@ -36,17 +36,6 @@ Guidelines:
 - Validation: mapped
 - Notes: Performance and interaction weight matter as much as functionality.
 
-### R003 — BTW remains visually modal over the active main work area
-- Class: differentiator
-- Status: active
-- Description: BTW appears as a modal over the current active work area so the main agent remains visibly behind it.
-- Why it matters: The user wants BTW to remain a tangent, not a replacement for the main workspace.
-- Source: user
-- Primary owning slice: M001/S01
-- Supporting slices: none
-- Validation: mapped
-- Notes: Preserve the visual modal character instead of shifting to an inline pane.
-
 ### R004 — BTW takes keyboard focus while open
 - Class: primary-user-loop
 - Status: active
@@ -90,28 +79,6 @@ Guidelines:
 - Supporting slices: M001/S02
 - Validation: mapped
 - Notes: No automatic save-back on close.
-
-### R008 — Escape dismisses the BTW modal quickly without breaking thread behavior
-- Class: primary-user-loop
-- Status: active
-- Description: The user can hit Escape to get out of BTW quickly, and reopening BTW follows the existing thread semantics rather than inventing new ones.
-- Why it matters: Quick dismissal is central to the disposable feel.
-- Source: user
-- Primary owning slice: M001/S01
-- Supporting slices: M001/S02
-- Validation: mapped
-- Notes: Dismissal should not accidentally clear state unless the current BTW contract says it should.
-
-### R009 — BTW supports continued side-thread interaction in place
-- Class: primary-user-loop
-- Status: active
-- Description: After one BTW answer arrives, the user can immediately ask a follow-up inside the same modal.
-- Why it matters: This is the direct UX gap the user wants removed.
-- Source: user
-- Primary owning slice: M001/S01
-- Supporting slices: none
-- Validation: mapped
-- Notes: This is the practical expression of “actual chat interaction.”
 
 ### R010 — Existing BTW thread state still survives and restores according to the current contract
 - Class: continuity
@@ -170,7 +137,38 @@ Guidelines:
 
 ## Validated
 
-None yet.
+### R003 — BTW remains visually modal over the active main work area
+- Class: differentiator
+- Status: validated
+- Description: BTW appears as a modal over the current active work area so the main agent remains visibly behind it.
+- Why it matters: The user wants BTW to remain a tangent, not a replacement for the main workspace.
+- Source: user
+- Primary owning slice: M001/S01
+- Supporting slices: none
+- Validation: proven by `tests/btw.runtime.test.ts` asserting BTW opens through `ctx.ui.custom(..., { overlay: true })` while preserving the widget mirror.
+- Notes: Live human verification is still useful, but the overlay rendering contract is now executable.
+
+### R008 — Escape dismisses the BTW modal quickly without breaking thread behavior
+- Class: primary-user-loop
+- Status: validated
+- Description: The user can hit Escape to get out of BTW quickly, and reopening BTW follows the existing thread semantics rather than inventing new ones.
+- Why it matters: Quick dismissal is central to the disposable feel.
+- Source: user
+- Primary owning slice: M001/S01
+- Supporting slices: M001/S02
+- Validation: proven by `tests/btw.runtime.test.ts` showing Escape dismissal preserves hidden-thread state and reopen restores the transcript.
+- Notes: Dismissal still does not imply clear unless `/btw:clear` is used.
+
+### R009 — BTW supports continued side-thread interaction in place
+- Class: primary-user-loop
+- Status: validated
+- Description: After one BTW answer arrives, the user can immediately ask a follow-up inside the same modal.
+- Why it matters: This is the direct UX gap the user wants removed.
+- Source: user
+- Primary owning slice: M001/S01
+- Supporting slices: none
+- Validation: proven by `tests/btw.runtime.test.ts` showing an overlay follow-up creates a second BTW thread entry in the same thread.
+- Notes: This is the practical expression of “actual chat interaction.”
 
 ## Deferred
 
@@ -237,13 +235,13 @@ None yet.
 |---|---|---|---|---|---|
 | R001 | primary-user-loop | active | M001/S01 | M001/S02 | mapped |
 | R002 | quality-attribute | active | M001/S01 | M001/S03 | mapped |
-| R003 | differentiator | active | M001/S01 | none | mapped |
+| R003 | differentiator | validated | M001/S01 | none | proven |
 | R004 | primary-user-loop | active | M001/S01 | none | mapped |
 | R005 | continuity | active | M001/S02 | M001/S01 | mapped |
 | R006 | constraint | active | M001/S02 | none | mapped |
 | R007 | integration | active | M001/S03 | M001/S02 | mapped |
-| R008 | primary-user-loop | active | M001/S01 | M001/S02 | mapped |
-| R009 | primary-user-loop | active | M001/S01 | none | mapped |
+| R008 | primary-user-loop | validated | M001/S01 | M001/S02 | proven |
+| R009 | primary-user-loop | validated | M001/S01 | none | proven |
 | R010 | continuity | active | M001/S02 | M001/S03 | mapped |
 | R011 | integration | active | M001/S03 | M001/S01 | mapped |
 | R012 | differentiator | active | M001/S04 | none | mapped |
@@ -257,7 +255,7 @@ None yet.
 
 ## Coverage Summary
 
-- Active requirements: 14
+- Active requirements: 11
 - Mapped to slices: 14
-- Validated: 0
+- Validated: 3
 - Unmapped active requirements: 0
