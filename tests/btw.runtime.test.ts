@@ -665,6 +665,120 @@ describe("btw runtime behavior", () => {
     });
   });
 
+  it("in-modal /btw:new reuses command semantics by resetting the thread and reopening contextual mode", async () => {
+    const harness = createHarness();
+    streamSimpleMock
+      .mockImplementationOnce(() => streamAnswer("First answer"))
+      .mockImplementationOnce(() => streamAnswer("Replacement answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+
+    const overlay = harness.latestOverlayComponent();
+    overlay.input.onSubmit?.("/btw:new replacement question");
+    await flushAsyncWork();
+
+    const resets = getCustomEntries(harness.entries, "btw-thread-reset");
+    expect(resets).toHaveLength(1);
+    expect(resets.at(-1)?.data).toMatchObject({ mode: "contextual" });
+
+    const transcript = transcriptText(overlay);
+    expect(transcript).not.toContain("You  first question");
+    expect(transcript).not.toContain("First answer");
+    expect(transcript).toContain("You  replacement question");
+    expect(transcript).toContain("Replacement answer");
+    expect(overlay['modeText'].text).toContain("BTW");
+  });
+
+  it("in-modal /btw:tangent reuses command semantics by switching modes and dropping inherited main-session context", async () => {
+    const mainRegularUser = {
+      type: "message",
+      role: "user",
+      content: [{ type: "text", text: "main session task" }],
+      timestamp: Date.now(),
+    } as SessionEntry;
+    const harness = createHarness([mainRegularUser]);
+
+    await harness.runSessionStart();
+    await harness.command("btw", "contextual start");
+
+    const overlay = harness.latestOverlayComponent();
+    overlay.input.onSubmit?.("/btw:tangent tangent start");
+    await flushAsyncWork();
+
+    const resets = getCustomEntries(harness.entries, "btw-thread-reset");
+    expect(resets).toHaveLength(1);
+    expect(resets.at(-1)?.data).toMatchObject({ mode: "tangent" });
+
+    const streamCalls = streamSimpleMock.mock.calls as Array<[unknown, StreamContext, unknown]>;
+    const tangentCall = [...streamCalls].reverse().find((call) => {
+      const texts = call[1].messages.map((message) => (message.content[0] as any)?.text ?? "");
+      return texts.at(-1) === "tangent start";
+    });
+    expect(tangentCall).toBeDefined();
+    const tangentTexts = tangentCall![1].messages.map((message) => (message.content[0] as any)?.text ?? "");
+    expect(tangentTexts).not.toContain("main session task");
+
+    const transcript = transcriptText(overlay);
+    expect(transcript).toContain("You  tangent start");
+    expect(transcript).toContain("default:tangent start");
+    expect(transcript).not.toContain("You  contextual start");
+    expect(overlay['modeText'].text).toContain("BTW tangent");
+  });
+
+  it("in-modal /btw:inject reuses command semantics by handing off to the main session and dismissing the overlay", async () => {
+    const harness = createHarness();
+    streamSimpleMock.mockImplementation(() => streamAnswer("First answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+
+    const overlay = harness.latestOverlayComponent();
+    const overlayHandle = harness.overlayHandles.at(-1);
+    overlay.input.onSubmit?.("/btw:inject Use this in the main run.");
+    await flushAsyncWork();
+
+    expect(harness.sentUserMessages).toHaveLength(1);
+    expect(harness.sentUserMessages[0]).toEqual({
+      content: "Here is a side conversation I had. Use this in the main run.\n\nUser: first question\nAssistant: First answer",
+      options: undefined,
+    });
+    expect(getCustomEntries(harness.entries, "btw-thread-reset")).toHaveLength(1);
+    expect(overlayHandle?.hideCalls).toBe(1);
+  });
+
+  it("unsupported slash input in the modal surfaces BTW-local fallback and does not execute a command", async () => {
+    const harness = createHarness();
+    streamSimpleMock.mockImplementation(() => streamAnswer("First answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+
+    const overlay = harness.latestOverlayComponent();
+    const streamCallsBefore = streamSimpleMock.mock.calls.length;
+    const sentUserMessagesBefore = harness.sentUserMessages.length;
+    const resetCountBefore = getCustomEntries(harness.entries, "btw-thread-reset").length;
+    const threadCountBefore = getCustomEntries(harness.entries, "btw-thread-entry").length;
+
+    overlay.input.onSubmit?.("/plan do something else");
+    await flushAsyncWork();
+
+    expect(streamSimpleMock.mock.calls).toHaveLength(streamCallsBefore);
+    expect(harness.sentUserMessages).toHaveLength(sentUserMessagesBefore);
+    expect(getCustomEntries(harness.entries, "btw-thread-reset")).toHaveLength(resetCountBefore);
+    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(threadCountBefore);
+    expect(overlay.statusText.text).toContain(
+      "Unsupported slash input in BTW. Only /btw, /btw:new, /btw:tangent, /btw:clear, /btw:inject, and /btw:summarize run inside the modal.",
+    );
+    expect(harness.notifications.at(-1)).toEqual({
+      message:
+        "Unsupported slash input in BTW. Only /btw, /btw:new, /btw:tangent, /btw:clear, /btw:inject, and /btw:summarize run inside the modal.",
+      type: "warning",
+    });
+    expect(transcriptText(overlay)).toContain("You  first question");
+    expect(transcriptText(overlay)).toContain("First answer");
+  });
+
   it("ordinary BTW follow-up submit and Escape dismissal do not send content to the main session", async () => {
     const harness = createHarness();
     streamSimpleMock

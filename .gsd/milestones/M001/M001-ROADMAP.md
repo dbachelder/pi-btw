@@ -57,8 +57,8 @@ This milestone is complete only when all are true:
 - [x] **S03: Explicit handoff and background-session integration** `risk:low` `depends:[S02]`
   > After this: inject/summarize still work cleanly from the modal, and BTW remains visibly and behaviorally separate from the main session behind it.
 
-- [ ] **S04: Slash-command support and graceful fallback** `risk:high` `depends:[S01,S02]`
-  > After this: BTW supports the cleanest viable slash-command behavior inside the modal, or intentionally degrades while preserving a coherent lightweight chat UX.
+- [x] **S04: Slash-command support and graceful fallback** `risk:high` `depends:[S01,S02]`
+  > After this: BTW supports BTW-scoped slash-command behavior inside the modal, and unsupported slash input intentionally degrades with an explicit lightweight fallback instead of pretending full main-surface parity.
 
 ## Boundary Map
 

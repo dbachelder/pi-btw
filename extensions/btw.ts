@@ -559,6 +559,124 @@ export default function (pi: ExtensionAPI) {
     void component;
   }
 
+  async function dispatchBtwCommand(name: string, args: string, ctx: ExtensionCommandContext): Promise<boolean> {
+    const trimmedArgs = args.trim();
+
+    if (name === "btw") {
+      const { question, save } = parseBtwArgs(trimmedArgs);
+      if (!question) {
+        notify(ctx, "Usage: /btw [--save] <question>", "warning");
+        await ensureOverlay(ctx);
+        return true;
+      }
+
+      if (pendingMode !== "contextual") {
+        resetThread(ctx, true, "contextual");
+      }
+
+      await runBtw(ctx, question, save, "contextual");
+      return true;
+    }
+
+    if (name === "btw:tangent") {
+      const { question, save } = parseBtwArgs(trimmedArgs);
+      if (!question) {
+        notify(ctx, "Usage: /btw:tangent [--save] <question>", "warning");
+        await ensureOverlay(ctx);
+        return true;
+      }
+
+      if (pendingMode !== "tangent") {
+        resetThread(ctx, true, "tangent");
+      }
+
+      await runBtw(ctx, question, save, "tangent");
+      return true;
+    }
+
+    if (name === "btw:new") {
+      resetThread(ctx, true, "contextual");
+      const { question, save } = parseBtwArgs(trimmedArgs);
+      if (question) {
+        await runBtw(ctx, question, save, "contextual");
+      } else {
+        setOverlayStatus("Started a fresh BTW thread.", ctx);
+        await ensureOverlay(ctx);
+        notify(ctx, "Started a fresh BTW thread.", "info");
+      }
+      return true;
+    }
+
+    if (name === "btw:clear") {
+      resetThread(ctx);
+      dismissOverlay();
+      notify(ctx, "Cleared BTW thread.", "info");
+      return true;
+    }
+
+    if (name === "btw:inject") {
+      if (pendingThread.length === 0) {
+        notify(ctx, "No BTW thread to inject.", "warning");
+        return true;
+      }
+
+      const instructions = trimmedArgs;
+      const content = instructions
+        ? `Here is a side conversation I had. ${instructions}\n\n${formatThread(pendingThread)}`
+        : `Here is a side conversation I had for additional context:\n\n${formatThread(pendingThread)}`;
+
+      sendThreadToMain(ctx, content);
+      const count = pendingThread.length;
+      resetThread(ctx);
+      dismissOverlay();
+      notify(ctx, `Injected BTW thread (${count} exchange${count === 1 ? "" : "s"}).`, "info");
+      return true;
+    }
+
+    if (name === "btw:summarize") {
+      if (pendingThread.length === 0) {
+        notify(ctx, "No BTW thread to summarize.", "warning");
+        return true;
+      }
+
+      setOverlayStatus("⏳ summarizing...", ctx);
+      await ensureOverlay(ctx);
+
+      try {
+        const summary = await summarizeThread(ctx, pendingThread);
+        const instructions = trimmedArgs;
+        const content = instructions
+          ? `Here is a summary of a side conversation I had. ${instructions}\n\n${summary}`
+          : `Here is a summary of a side conversation I had:\n\n${summary}`;
+
+        sendThreadToMain(ctx, content);
+        const count = pendingThread.length;
+        resetThread(ctx);
+        dismissOverlay();
+        notify(ctx, `Injected BTW summary (${count} exchange${count === 1 ? "" : "s"}).`, "info");
+      } catch (error) {
+        setOverlayStatus("Summarize failed. Thread preserved for retry or injection.", ctx);
+        notify(ctx, error instanceof Error ? error.message : String(error), "error");
+      }
+      return true;
+    }
+
+    return false;
+  }
+
+  function parseOverlaySlashCommand(value: string): { name: string; args: string } | null {
+    const trimmed = value.trim();
+    const match = trimmed.match(/^\/(btw(?::(?:new|tangent|clear|inject|summarize))?)(?:\s+(.*))?$/);
+    if (!match) {
+      return null;
+    }
+
+    return {
+      name: match[1],
+      args: match[2]?.trim() ?? "",
+    };
+  }
+
   async function submitFromOverlay(ctx: ExtensionCommandContext | ExtensionContext, value: string): Promise<void> {
     const question = value.trim();
     if (!question) {
@@ -571,7 +689,22 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
+    const slashCommand = parseOverlaySlashCommand(question);
     overlayDraft = "";
+
+    if (question.startsWith("/") && !slashCommand) {
+      const message = "Unsupported slash input in BTW. Only /btw, /btw:new, /btw:tangent, /btw:clear, /btw:inject, and /btw:summarize run inside the modal.";
+      setOverlayStatus(message, ctx);
+      notify(ctx, message, "warning");
+      await ensureOverlay(ctx);
+      return;
+    }
+
+    if (slashCommand) {
+      await dispatchBtwCommand(slashCommand.name, slashCommand.args, ctx);
+      return;
+    }
+
     setOverlayStatus("⏳ streaming...", ctx);
     syncUi(ctx);
     await runBtw(ctx, question, false, pendingMode);
@@ -863,111 +996,42 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("btw", {
     description: "Continue a side conversation in a focused BTW modal. Add --save to also persist a visible note.",
     handler: async (args, ctx) => {
-      const { question, save } = parseBtwArgs(args);
-      if (!question) {
-        notify(ctx, "Usage: /btw [--save] <question>", "warning");
-        await ensureOverlay(ctx);
-        return;
-      }
-
-      if (pendingMode !== "contextual") {
-        resetThread(ctx, true, "contextual");
-      }
-
-      await runBtw(ctx, question, save, "contextual");
+      await dispatchBtwCommand("btw", args, ctx);
     },
   });
 
   pi.registerCommand("btw:tangent", {
     description: "Start or continue a contextless BTW tangent in the focused BTW modal.",
     handler: async (args, ctx) => {
-      const { question, save } = parseBtwArgs(args);
-      if (!question) {
-        notify(ctx, "Usage: /btw:tangent [--save] <question>", "warning");
-        await ensureOverlay(ctx);
-        return;
-      }
-
-      if (pendingMode !== "tangent") {
-        resetThread(ctx, true, "tangent");
-      }
-
-      await runBtw(ctx, question, save, "tangent");
+      await dispatchBtwCommand("btw:tangent", args, ctx);
     },
   });
 
   pi.registerCommand("btw:new", {
     description: "Start a fresh BTW thread with main-session context. Optionally ask the first question immediately.",
     handler: async (args, ctx) => {
-      resetThread(ctx, true, "contextual");
-      const { question, save } = parseBtwArgs(args);
-      if (question) {
-        await runBtw(ctx, question, save, "contextual");
-      } else {
-        setOverlayStatus("Started a fresh BTW thread.", ctx);
-        await ensureOverlay(ctx);
-        notify(ctx, "Started a fresh BTW thread.", "info");
-      }
+      await dispatchBtwCommand("btw:new", args, ctx);
     },
   });
 
   pi.registerCommand("btw:clear", {
     description: "Dismiss the BTW modal/widget and clear the current thread.",
-    handler: async (_args, ctx) => {
-      resetThread(ctx);
-      dismissOverlay();
-      notify(ctx, "Cleared BTW thread.", "info");
+    handler: async (args, ctx) => {
+      await dispatchBtwCommand("btw:clear", args, ctx);
     },
   });
 
   pi.registerCommand("btw:inject", {
     description: "Inject the full BTW thread into the main agent as a user message.",
     handler: async (args, ctx) => {
-      if (pendingThread.length === 0) {
-        notify(ctx, "No BTW thread to inject.", "warning");
-        return;
-      }
-
-      const instructions = args.trim();
-      const content = instructions
-        ? `Here is a side conversation I had. ${instructions}\n\n${formatThread(pendingThread)}`
-        : `Here is a side conversation I had for additional context:\n\n${formatThread(pendingThread)}`;
-
-      sendThreadToMain(ctx, content);
-      const count = pendingThread.length;
-      resetThread(ctx);
-      dismissOverlay();
-      notify(ctx, `Injected BTW thread (${count} exchange${count === 1 ? "" : "s"}).`, "info");
+      await dispatchBtwCommand("btw:inject", args, ctx);
     },
   });
 
   pi.registerCommand("btw:summarize", {
     description: "Summarize the BTW thread, then inject the summary into the main agent.",
     handler: async (args, ctx) => {
-      if (pendingThread.length === 0) {
-        notify(ctx, "No BTW thread to summarize.", "warning");
-        return;
-      }
-
-      setOverlayStatus("⏳ summarizing...", ctx);
-      await ensureOverlay(ctx);
-
-      try {
-        const summary = await summarizeThread(ctx, pendingThread);
-        const instructions = args.trim();
-        const content = instructions
-          ? `Here is a summary of a side conversation I had. ${instructions}\n\n${summary}`
-          : `Here is a summary of a side conversation I had:\n\n${summary}`;
-
-        sendThreadToMain(ctx, content);
-        const count = pendingThread.length;
-        resetThread(ctx);
-        dismissOverlay();
-        notify(ctx, `Injected BTW summary (${count} exchange${count === 1 ? "" : "s"}).`, "info");
-      } catch (error) {
-        setOverlayStatus("Summarize failed. Thread preserved for retry or injection.", ctx);
-        notify(ctx, error instanceof Error ? error.message : String(error), "error");
-      }
+      await dispatchBtwCommand("btw:summarize", args, ctx);
     },
   });
 }

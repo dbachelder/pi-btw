@@ -104,24 +104,24 @@ Guidelines:
 
 ### R012 — BTW supports slash commands inside the modal if this can be done cleanly
 - Class: differentiator
-- Status: active
+- Status: validated
 - Description: The BTW composer should support useful slash commands, ideally broad enough to include commands like GSD commands, if the integration can be done without making the surface heavy or messy.
 - Why it matters: This is a desired capability, but not at the expense of the lightweight BTW feel.
 - Source: user
 - Primary owning slice: M001/S04
 - Supporting slices: none
-- Validation: mapped
-- Notes: Feasibility-sensitive requirement.
+- Validation: proven by `tests/btw.runtime.test.ts` asserting overlay-submitted `/btw:new`, `/btw:tangent`, and `/btw:inject` reuse the same reset, mode-switch, and handoff semantics as the registered BTW commands.
+- Notes: Validated as BTW-scoped in-modal slash support, not full main-surface parity.
 
 ### R013 — BTW degrades gracefully if full slash parity is not feasible
 - Class: quality-attribute
-- Status: active
+- Status: validated
 - Description: If full slash-command support cannot be added cleanly, BTW still delivers the core chat experience and makes any command limits coherent rather than awkward.
 - Why it matters: The core UX should not be held hostage by command integration complexity.
 - Source: inferred
 - Primary owning slice: M001/S04
 - Supporting slices: M001/S01
-- Validation: mapped
+- Validation: proven by `tests/btw.runtime.test.ts` asserting unsupported modal slash input surfaces an explicit BTW-local warning and does not execute a command, mutate hidden thread state, or fall through as BTW chat text.
 - Notes: Avoid turning BTW into a huge mess.
 
 ### R014 — BTW preserves separation from main-session context except when explicit handoff is requested
@@ -244,8 +244,8 @@ Guidelines:
 | R009 | primary-user-loop | validated | M001/S01 | none | proven |
 | R010 | continuity | validated | M001/S02 | M001/S03 | proven |
 | R011 | integration | validated | M001/S03 | M001/S01 | proven |
-| R012 | differentiator | active | M001/S04 | none | mapped |
-| R013 | quality-attribute | active | M001/S04 | M001/S01 | mapped |
+| R012 | differentiator | validated | M001/S04 | none | proven |
+| R013 | quality-attribute | validated | M001/S04 | M001/S01 | proven |
 | R014 | constraint | validated | M001/S02 | M001/S03 | proven |
 | R015 | differentiator | deferred | none | none | unmapped |
 | R016 | differentiator | deferred | none | none | unmapped |
