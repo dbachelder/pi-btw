@@ -49,24 +49,24 @@ Guidelines:
 
 ### R005 — BTW preserves current documented thread semantics for core commands
 - Class: continuity
-- Status: active
+- Status: validated
 - Description: `/btw`, `/btw:new`, `/btw:clear`, and `/btw:tangent` keep the same thread behavior documented in the README.
 - Why it matters: The user wants the existing BTW contract preserved, not redesigned.
 - Source: user
 - Primary owning slice: M001/S02
 - Supporting slices: M001/S01
-- Validation: mapped
+- Validation: proven by `tests/btw.runtime.test.ts` asserting reset-marker behavior, fresh-thread reopen semantics, and command-owned mode resets for `/btw:new`, `/btw:clear`, `/btw:tangent`, and `/btw`.
 - Notes: Interaction model changes; contract does not.
 
 ### R006 — BTW keeps contextual mode and tangent mode behavior distinct exactly as documented
 - Class: constraint
-- Status: active
+- Status: validated
 - Description: Normal BTW continues a contextual side thread, while `btw:tangent` uses a fresh contextless tangent thread until mode switches back.
 - Why it matters: This split is a core part of BTW behavior and was explicitly re-emphasized.
 - Source: user
 - Primary owning slice: M001/S02
 - Supporting slices: none
-- Validation: mapped
+- Validation: proven by `tests/btw.runtime.test.ts` asserting mode-switch reset markers and that tangent requests omit inherited main-session conversation while contextual BTW remains a separate preserved thread.
 - Notes: Mode switching must remain truthful to README behavior.
 
 ### R007 — BTW handoff back to main session stays explicit
@@ -82,13 +82,13 @@ Guidelines:
 
 ### R010 — Existing BTW thread state still survives and restores according to the current contract
 - Class: continuity
-- Status: active
+- Status: validated
 - Description: Hidden BTW thread state still survives reloads/restarts and rehydrates according to the documented current behavior.
 - Why it matters: The new UI should not break the extension’s existing persistence model.
 - Source: user
 - Primary owning slice: M001/S02
 - Supporting slices: M001/S03
-- Validation: mapped
+- Validation: proven by `tests/btw.runtime.test.ts` asserting restore behavior across `session_start`, `session_switch`, and `session_tree`, including last-reset-only rehydration.
 - Notes: The README is the contract source.
 
 ### R011 — BTW continues to coexist with main-session work in the background
@@ -126,13 +126,13 @@ Guidelines:
 
 ### R014 — BTW preserves separation from main-session context except when explicit handoff is requested
 - Class: constraint
-- Status: active
+- Status: validated
 - Description: BTW notes and side-thread state stay out of the main agent’s future context unless explicitly handed back.
 - Why it matters: This protects the side-thread workflow from polluting the main session.
 - Source: user
 - Primary owning slice: M001/S02
 - Supporting slices: M001/S03
-- Validation: mapped
+- Validation: proven by `tests/btw.runtime.test.ts` asserting the `context` hook filters BTW notes from main-session context while leaving non-BTW messages intact.
 - Notes: Preserve current hidden-entry behavior.
 
 ## Validated
@@ -237,16 +237,16 @@ Guidelines:
 | R002 | quality-attribute | active | M001/S01 | M001/S03 | mapped |
 | R003 | differentiator | validated | M001/S01 | none | proven |
 | R004 | primary-user-loop | active | M001/S01 | none | mapped |
-| R005 | continuity | active | M001/S02 | M001/S01 | mapped |
-| R006 | constraint | active | M001/S02 | none | mapped |
+| R005 | continuity | validated | M001/S02 | M001/S01 | proven |
+| R006 | constraint | validated | M001/S02 | none | proven |
 | R007 | integration | active | M001/S03 | M001/S02 | mapped |
 | R008 | primary-user-loop | validated | M001/S01 | M001/S02 | proven |
 | R009 | primary-user-loop | validated | M001/S01 | none | proven |
-| R010 | continuity | active | M001/S02 | M001/S03 | mapped |
+| R010 | continuity | validated | M001/S02 | M001/S03 | proven |
 | R011 | integration | active | M001/S03 | M001/S01 | mapped |
 | R012 | differentiator | active | M001/S04 | none | mapped |
 | R013 | quality-attribute | active | M001/S04 | M001/S01 | mapped |
-| R014 | constraint | active | M001/S02 | M001/S03 | mapped |
+| R014 | constraint | validated | M001/S02 | M001/S03 | proven |
 | R015 | differentiator | deferred | none | none | unmapped |
 | R016 | differentiator | deferred | none | none | unmapped |
 | R017 | anti-feature | out-of-scope | none | none | n/a |
@@ -255,7 +255,7 @@ Guidelines:
 
 ## Coverage Summary
 
-- Active requirements: 11
+- Active requirements: 7
 - Mapped to slices: 14
-- Validated: 3
+- Validated: 7
 - Unmapped active requirements: 0

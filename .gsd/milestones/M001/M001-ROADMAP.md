@@ -51,7 +51,7 @@ This milestone is complete only when all are true:
 - [x] **S01: Modal BTW chat shell** `risk:high` `depends:[]`
   > After this: BTW opens as a real modal side-chat with focused input, supports at least one follow-up turn in place, and dismisses via Escape.
 
-- [ ] **S02: BTW contract preservation** `risk:medium` `depends:[S01]`
+- [x] **S02: BTW contract preservation** `risk:medium` `depends:[S01]`
   > After this: the new modal interaction still obeys the current README contract for contextual BTW, `btw:new`, `btw:clear`, `btw:tangent`, and hidden thread restore behavior.
 
 - [ ] **S03: Explicit handoff and background-session integration** `risk:low` `depends:[S02]`

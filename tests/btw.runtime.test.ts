@@ -17,8 +17,12 @@ vi.mock("@mariozechner/pi-ai", async () => {
 });
 
 type CustomEntry = { type: "custom"; customType: string; data?: unknown };
+type SessionEntry = CustomEntry | { type: string; role?: string; customType?: string; content?: unknown; [key: string]: unknown };
 
-type SessionEntry = CustomEntry;
+type StreamContext = {
+  systemPrompt: string;
+  messages: Array<{ role: string; content: Array<{ type: string; text?: string }> }>;
+};
 
 class FakeOverlayHandle {
   hidden = false;
@@ -128,12 +132,25 @@ async function flushAsyncWork() {
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-type Harness = ReturnType<typeof createHarness>;
+function getCustomEntries(entries: SessionEntry[], customType: string): CustomEntry[] {
+  return entries.filter((entry): entry is CustomEntry => entry.type === "custom" && entry.customType === customType);
+}
 
-function createHarness() {
+function transcriptText(overlay: any): string {
+  overlay.refresh();
+  return overlay.transcript.children.map((child: any) => child.text).join("\n");
+}
+
+function findLatest<T>(items: T[], predicate: (item: T) => boolean): T {
+  const match = [...items].reverse().find(predicate);
+  if (!match) throw new Error("Expected matching item");
+  return match;
+}
+
+function createHarness(initialEntries: SessionEntry[] = []) {
   const commands = new Map<string, RegisteredCommand>();
   const handlers = new Map<string, Function[]>();
-  const entries: SessionEntry[] = [];
+  const entries: SessionEntry[] = [...initialEntries];
   const notifications: Array<{ message: string; type?: string }> = [];
   const widgets: Array<{ key: string; content?: unknown; options?: unknown }> = [];
   const sentMessages: Array<{ message: unknown; options?: unknown }> = [];
@@ -171,7 +188,7 @@ function createHarness() {
     },
     custom: async (factory: any, options?: any) => {
       let done!: (result: unknown) => void;
-      const donePromise = new Promise((resolve) => {
+      new Promise((resolve) => {
         done = (result: unknown) => resolve(result);
       });
       const handle = new FakeOverlayHandle();
@@ -247,11 +264,17 @@ function createHarness() {
     isIdle: () => idle,
   };
 
-  async function runSessionStart() {
-    const list = handlers.get("session_start") ?? [];
+  async function runEvent(name: string, event: unknown = {}, ctx: ExtensionContext | ExtensionCommandContext = baseCtx as any) {
+    const list = handlers.get(name) ?? [];
+    const results = [];
     for (const handler of list) {
-      await handler({}, baseCtx);
+      results.push(await handler(event, ctx));
     }
+    return results;
+  }
+
+  async function runSessionStart() {
+    await runEvent("session_start");
   }
 
   async function command(name: string, args = "") {
@@ -283,6 +306,7 @@ function createHarness() {
     overlays,
     baseCtx,
     runSessionStart,
+    runEvent,
     command,
     latestOverlayComponent,
     latestWidgetFactory,
@@ -299,6 +323,9 @@ describe("btw runtime behavior", () => {
   beforeEach(() => {
     streamSimpleMock.mockReset();
     completeSimpleMock.mockReset();
+    streamSimpleMock.mockImplementation((_model: unknown, context: StreamContext) => {
+      return streamAnswer(`default:${(context.messages.at(-1)?.content[0] as any)?.text ?? ""}`);
+    });
   });
 
   it("keeps the thread after Escape dismissal and restores it on reopen", async () => {
@@ -308,7 +335,7 @@ describe("btw runtime behavior", () => {
     await harness.runSessionStart();
     await harness.command("btw", "first question");
 
-    expect(harness.entries.filter((entry) => entry.customType === "btw-thread-entry")).toHaveLength(1);
+    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(1);
     expect(harness.overlayHandles).toHaveLength(1);
 
     const overlay = harness.latestOverlayComponent();
@@ -319,11 +346,10 @@ describe("btw runtime behavior", () => {
     expect(harness.overlayHandles).toHaveLength(2);
 
     const reopened = harness.latestOverlayComponent();
-    reopened.refresh();
-    const transcriptLines = reopened.transcript.children.map((child: any) => child.text);
-    expect(transcriptLines.join("\n")).toContain("You  first question");
-    expect(transcriptLines.join("\n")).toContain("Assistant");
-    expect(transcriptLines.join("\n")).toContain("First answer");
+    const transcript = transcriptText(reopened);
+    expect(transcript).toContain("You  first question");
+    expect(transcript).toContain("Assistant");
+    expect(transcript).toContain("First answer");
     expect(reopened.statusText.text).toContain("Ready for a follow-up");
   });
 
@@ -340,11 +366,10 @@ describe("btw runtime behavior", () => {
     overlay.input.onSubmit?.("follow-up question");
     await flushAsyncWork();
 
-    const threadEntries = harness.entries.filter((entry) => entry.customType === "btw-thread-entry");
+    const threadEntries = getCustomEntries(harness.entries, "btw-thread-entry");
     expect(threadEntries).toHaveLength(2);
 
-    overlay.refresh();
-    const transcript = overlay.transcript.children.map((child: any) => child.text).join("\n");
+    const transcript = transcriptText(overlay);
     expect(transcript).toContain("You  first question");
     expect(transcript).toContain("First answer");
     expect(transcript).toContain("You  follow-up question");
@@ -359,7 +384,7 @@ describe("btw runtime behavior", () => {
     await harness.runSessionStart();
     await harness.command("btw", "why did this fail?");
 
-    expect(harness.entries.filter((entry) => entry.customType === "btw-thread-entry")).toHaveLength(0);
+    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(0);
     const overlay = harness.latestOverlayComponent();
     overlay.refresh();
     expect(overlay.statusText.text).toContain("No credentials available for test-provider/test-model.");
@@ -379,5 +404,174 @@ describe("btw runtime behavior", () => {
     expect(harness.overlays.at(-1)?.factoryOptions).toMatchObject({ overlay: true });
     const widgetFactory = harness.latestWidgetFactory();
     expect(widgetFactory).toBeTypeOf("function");
+  });
+
+  it("/btw:new appends a reset marker, clears prior hidden thread state, stays contextual, and reopens a fresh thread", async () => {
+    const harness = createHarness();
+    streamSimpleMock
+      .mockImplementationOnce((_model: unknown, context: StreamContext) => {
+        expect(context.messages.map((message) => (message.content[0] as any)?.text ?? "")).toContain("first question");
+        return streamAnswer("First answer");
+      })
+      .mockImplementationOnce((_model: unknown, context: StreamContext) => {
+        const texts = context.messages.map((message) => (message.content[0] as any)?.text ?? "");
+        expect(texts).not.toContain("first question");
+        expect(texts).not.toContain("First answer");
+        expect(texts).toContain("replacement question");
+        return streamAnswer("Replacement answer");
+      });
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+    await harness.command("btw:new", "replacement question");
+
+    const postResetOverlay = harness.latestOverlayComponent();
+    const postResetTranscript = transcriptText(postResetOverlay);
+    expect(postResetTranscript).not.toContain("You  first question");
+    expect(postResetTranscript).not.toContain("First answer");
+    expect(postResetTranscript).toContain("You  replacement question");
+    expect(postResetTranscript).toContain("Replacement answer");
+
+    await harness.command("btw:new", "");
+
+    const resets = getCustomEntries(harness.entries, "btw-thread-reset");
+    expect(resets).toHaveLength(2);
+    expect(resets.at(-1)?.data).toMatchObject({ mode: "contextual" });
+
+    const threadEntries = getCustomEntries(harness.entries, "btw-thread-entry");
+    expect(threadEntries).toHaveLength(2);
+
+    const overlay = harness.latestOverlayComponent();
+    const transcript = transcriptText(overlay);
+    expect(transcript).toContain("No BTW thread yet. Ask a side question to start one.");
+    expect(overlay.statusText.text).toContain("Started a fresh BTW thread.");
+  });
+
+  it("switching between /btw:tangent and /btw appends reset markers and tangent requests omit inherited main-session conversation", async () => {
+    const mainVisibleNote = {
+      type: "custom",
+      role: "custom",
+      customType: "btw-note",
+      content: "saved btw note",
+    } as SessionEntry;
+    const mainRegularUser = {
+      type: "message",
+      role: "user",
+      content: [{ type: "text", text: "main session task" }],
+      timestamp: Date.now(),
+    } as SessionEntry;
+    const harness = createHarness([mainVisibleNote, mainRegularUser]);
+
+    await harness.runSessionStart();
+    await harness.command("btw", "contextual start");
+    await harness.command("btw:tangent", "tangent start");
+    await harness.command("btw", "contextual again");
+
+    const resets = getCustomEntries(harness.entries, "btw-thread-reset");
+    expect(resets).toHaveLength(2);
+    expect(resets.map((entry) => (entry.data as any)?.mode)).toEqual(["tangent", "contextual"]);
+
+    const streamCalls = streamSimpleMock.mock.calls as Array<[unknown, StreamContext, unknown]>;
+    expect(streamCalls.length).toBeGreaterThanOrEqual(2);
+
+    const callTexts = streamCalls.map((call) => call[1].messages.map((message) => (message.content[0] as any)?.text ?? ""));
+    const tangentTexts = callTexts.find((texts) => texts.at(-1) === "tangent start");
+    expect(tangentTexts).toBeDefined();
+    expect(tangentTexts).not.toContain("main session task");
+    expect(tangentTexts).not.toContain("saved btw note");
+
+    const contextualTexts = callTexts.find((texts) => texts.at(-1) === "contextual start");
+    if (contextualTexts) {
+      expect(contextualTexts).not.toContain("saved btw note");
+    }
+
+    const overlay = harness.latestOverlayComponent();
+    const transcript = transcriptText(overlay);
+    expect(transcript).toContain("You  contextual again");
+    expect(transcript).toContain("default:contextual again");
+    expect(transcript).not.toContain("You  tangent start");
+    expect(transcript).not.toContain("default:tangent start");
+  });
+
+  it("/btw:clear dismisses the overlay, appends a reset marker, and restore only rehydrates entries after the last reset", async () => {
+    const seedEntries: SessionEntry[] = [
+      { type: "custom", customType: "btw-thread-entry", data: { question: "old q", thinking: "", answer: "old a", provider: "p", model: "m", thinkingLevel: "off", timestamp: 1 } },
+      { type: "custom", customType: "btw-thread-reset", data: { timestamp: 2, mode: "tangent" } },
+      { type: "custom", customType: "btw-thread-entry", data: { question: "new q", thinking: "", answer: "new a", provider: "p", model: "m", thinkingLevel: "off", timestamp: 3 } },
+    ];
+    const harness = createHarness(seedEntries);
+
+    await harness.runEvent("session_start");
+    await harness.command("btw", "");
+    let overlay = harness.latestOverlayComponent();
+    expect(transcriptText(overlay)).toContain("You  new q");
+    expect(transcriptText(overlay)).not.toContain("You  old q");
+
+    await harness.command("btw", "restore-visible");
+    expect(harness.overlayHandles).toHaveLength(2);
+
+    const resetCountBeforeClear = getCustomEntries(harness.entries, "btw-thread-reset").length;
+    await harness.command("btw:clear", "");
+
+    const resets = getCustomEntries(harness.entries, "btw-thread-reset");
+    expect(resets).toHaveLength(resetCountBeforeClear + 1);
+    expect(resets.at(-1)?.data).toMatchObject({ mode: "contextual" });
+    expect(harness.notifications.at(-1)).toEqual({ message: "Cleared BTW thread.", type: "info" });
+
+    await harness.runEvent("session_switch");
+    await harness.command("btw", "");
+    overlay = harness.latestOverlayComponent();
+    expect(transcriptText(overlay)).toContain("No BTW thread yet. Ask a side question to start one.");
+
+    harness.entries.push({
+      type: "custom",
+      customType: "btw-thread-entry",
+      data: { question: "post-clear q", thinking: "", answer: "post-clear a", provider: "p", model: "m", thinkingLevel: "off", timestamp: 4 },
+    });
+
+    await harness.runEvent("session_tree");
+    await harness.command("btw", "");
+    overlay = harness.latestOverlayComponent();
+    const transcript = transcriptText(overlay);
+    expect(transcript).toContain("You  post-clear q");
+    expect(transcript).toContain("post-clear a");
+    expect(transcript).not.toContain("You  new q");
+  });
+
+  it("restore behavior is consistent across session_start, session_switch, and session_tree", async () => {
+    const entries: SessionEntry[] = [
+      { type: "custom", customType: "btw-thread-reset", data: { timestamp: 1, mode: "tangent" } },
+      { type: "custom", customType: "btw-thread-entry", data: { question: "restored q", thinking: "", answer: "restored a", provider: "p", model: "m", thinkingLevel: "off", timestamp: 2 } },
+    ];
+
+    for (const eventName of ["session_start", "session_switch", "session_tree"]) {
+      const harness = createHarness(entries);
+      await harness.runEvent(eventName);
+      await harness.command("btw", "");
+      const overlay = harness.latestOverlayComponent();
+      const transcript = transcriptText(overlay);
+      expect(transcript).toContain("You  restored q");
+      expect(transcript).toContain("restored a");
+      expect(overlay['modeText'].text).toContain("BTW tangent");
+    }
+  });
+
+  it("context filtering excludes BTW notes from main-session context while leaving non-BTW messages intact", async () => {
+    const harness = createHarness();
+    const results = await harness.runEvent("context", {
+      messages: [
+        { role: "user", content: [{ type: "text", text: "keep me" }] },
+        { role: "custom", customType: "btw-note", content: "drop me" },
+        { role: "assistant", content: [{ type: "text", text: "keep assistant" }] },
+      ],
+    });
+
+    expect(results).toHaveLength(1);
+    expect(results[0]).toEqual({
+      messages: [
+        { role: "user", content: [{ type: "text", text: "keep me" }] },
+        { role: "assistant", content: [{ type: "text", text: "keep assistant" }] },
+      ],
+    });
   });
 });
