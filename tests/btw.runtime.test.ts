@@ -508,7 +508,7 @@ describe("btw runtime behavior", () => {
     expect(transcriptText(overlay)).not.toContain("You  old q");
 
     await harness.command("btw", "restore-visible");
-    expect(harness.overlayHandles).toHaveLength(2);
+    expect(harness.overlayHandles).toHaveLength(1);
 
     const resetCountBeforeClear = getCustomEntries(harness.entries, "btw-thread-reset").length;
     await harness.command("btw:clear", "");
@@ -554,6 +554,135 @@ describe("btw runtime behavior", () => {
       expect(transcript).toContain("restored a");
       expect(overlay['modeText'].text).toContain("BTW tangent");
     }
+  });
+
+  it("/btw:inject success sends one main-session message, appends a reset marker, dismisses the overlay, and reopens fresh", async () => {
+    const harness = createHarness();
+    streamSimpleMock.mockImplementation(() => streamAnswer("First answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+
+    const overlayHandle = harness.overlayHandles.at(-1);
+    expect(overlayHandle).toBeDefined();
+    expect(overlayHandle?.isHidden()).toBe(false);
+
+    await harness.command("btw:inject", "Use this as supporting context.");
+
+    expect(harness.sentUserMessages).toHaveLength(1);
+    expect(harness.sentUserMessages[0]).toEqual({
+      content: "Here is a side conversation I had. Use this as supporting context.\n\nUser: first question\nAssistant: First answer",
+      options: undefined,
+    });
+    expect(getCustomEntries(harness.entries, "btw-thread-reset")).toHaveLength(1);
+    expect(overlayHandle?.hideCalls).toBe(1);
+    expect(harness.notifications.at(-1)).toEqual({
+      message: "Injected BTW thread (1 exchange).",
+      type: "info",
+    });
+
+    await harness.command("btw", "");
+    const reopened = harness.latestOverlayComponent();
+    expect(transcriptText(reopened)).toContain("No BTW thread yet. Ask a side question to start one.");
+  });
+
+  it("/btw:inject while the main session is busy delivers to the main session as a follow-up", async () => {
+    const harness = createHarness();
+    streamSimpleMock.mockImplementation(() => streamAnswer("Busy answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "busy question");
+    harness.setIdle(false);
+
+    await harness.command("btw:inject", "Queue this behind the active turn.");
+
+    expect(harness.sentUserMessages).toHaveLength(1);
+    expect(harness.sentUserMessages[0]).toEqual({
+      content: "Here is a side conversation I had. Queue this behind the active turn.\n\nUser: busy question\nAssistant: Busy answer",
+      options: { deliverAs: "followUp" },
+    });
+  });
+
+  it("/btw:summarize success sends summary content, appends a reset marker, dismisses the overlay, and reopens fresh", async () => {
+    const harness = createHarness();
+    streamSimpleMock.mockImplementation(() => streamAnswer("First answer"));
+    completeSimpleMock.mockResolvedValue(makeAssistantMessage("Short summary"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+
+    const overlayHandle = harness.overlayHandles.at(-1);
+    expect(overlayHandle).toBeDefined();
+
+    await harness.command("btw:summarize", "Hand this to the main agent.");
+
+    expect(completeSimpleMock).toHaveBeenCalledTimes(1);
+    expect(harness.sentUserMessages).toHaveLength(1);
+    expect(harness.sentUserMessages[0]).toEqual({
+      content: "Here is a summary of a side conversation I had. Hand this to the main agent.\n\nShort summary",
+      options: undefined,
+    });
+    expect(getCustomEntries(harness.entries, "btw-thread-reset")).toHaveLength(1);
+    expect(overlayHandle?.hideCalls).toBe(1);
+    expect(harness.notifications.at(-1)).toEqual({
+      message: "Injected BTW summary (1 exchange).",
+      type: "info",
+    });
+
+    await harness.command("btw", "");
+    const reopened = harness.latestOverlayComponent();
+    expect(transcriptText(reopened)).toContain("No BTW thread yet. Ask a side question to start one.");
+  });
+
+  it("summarize failure preserves BTW thread state and keeps the overlay recoverable", async () => {
+    const harness = createHarness();
+    streamSimpleMock.mockImplementation(() => streamAnswer("First answer"));
+    completeSimpleMock.mockResolvedValue({
+      ...makeAssistantMessage(""),
+      stopReason: "error",
+      errorMessage: "Summary model exploded",
+    });
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+
+    const overlayHandle = harness.overlayHandles.at(-1);
+    await harness.command("btw:summarize", "retry later");
+
+    expect(harness.sentUserMessages).toHaveLength(0);
+    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(1);
+    expect(getCustomEntries(harness.entries, "btw-thread-reset")).toHaveLength(0);
+    expect(overlayHandle?.isHidden()).toBe(false);
+
+    const overlay = harness.latestOverlayComponent();
+    overlay.refresh();
+    expect(overlay.statusText.text).toContain("Summarize failed. Thread preserved for retry or injection.");
+    expect(transcriptText(overlay)).toContain("You  first question");
+    expect(transcriptText(overlay)).toContain("First answer");
+    expect(harness.notifications.at(-1)).toEqual({
+      message: "Summary model exploded",
+      type: "error",
+    });
+  });
+
+  it("ordinary BTW follow-up submit and Escape dismissal do not send content to the main session", async () => {
+    const harness = createHarness();
+    streamSimpleMock
+      .mockImplementationOnce(() => streamAnswer("First answer"))
+      .mockImplementationOnce(() => streamAnswer("Second answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+
+    const overlay = harness.latestOverlayComponent();
+    overlay.input.onSubmit?.("follow-up question");
+    await flushAsyncWork();
+    overlay.input.onEscape?.();
+    await flushAsyncWork();
+
+    expect(harness.sentUserMessages).toHaveLength(0);
+    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(2);
+    expect(harness.overlayHandles.at(-1)?.hideCalls).toBe(1);
   });
 
   it("context filtering excludes BTW notes from main-session context while leaving non-BTW messages intact", async () => {

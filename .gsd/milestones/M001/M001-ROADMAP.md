@@ -54,7 +54,7 @@ This milestone is complete only when all are true:
 - [x] **S02: BTW contract preservation** `risk:medium` `depends:[S01]`
   > After this: the new modal interaction still obeys the current README contract for contextual BTW, `btw:new`, `btw:clear`, `btw:tangent`, and hidden thread restore behavior.
 
-- [ ] **S03: Explicit handoff and background-session integration** `risk:low` `depends:[S02]`
+- [x] **S03: Explicit handoff and background-session integration** `risk:low` `depends:[S02]`
   > After this: inject/summarize still work cleanly from the modal, and BTW remains visibly and behaviorally separate from the main session behind it.
 
 - [ ] **S04: Slash-command support and graceful fallback** `risk:high` `depends:[S01,S02]`

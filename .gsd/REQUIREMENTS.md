@@ -71,13 +71,13 @@ Guidelines:
 
 ### R007 — BTW handoff back to main session stays explicit
 - Class: integration
-- Status: active
+- Status: validated
 - Description: BTW remains separate from the main session unless the user explicitly injects or summarizes the side thread back into the main agent.
 - Why it matters: The boundary between tangent thinking and main work should stay sharp.
 - Source: user
 - Primary owning slice: M001/S03
 - Supporting slices: M001/S02
-- Validation: mapped
+- Validation: proven by `tests/btw.runtime.test.ts` asserting `/btw:inject` and `/btw:summarize` are the only paths that create `sentUserMessages`, including summarize-failure preservation and ordinary follow-up/Escape non-handoff behavior.
 - Notes: No automatic save-back on close.
 
 ### R010 — Existing BTW thread state still survives and restores according to the current contract
@@ -93,13 +93,13 @@ Guidelines:
 
 ### R011 — BTW continues to coexist with main-session work in the background
 - Class: integration
-- Status: active
+- Status: validated
 - Description: BTW remains a side conversation while the main session and its visible work stay behind the modal.
 - Why it matters: The tangent should not replace or confuse the main work area.
 - Source: user
 - Primary owning slice: M001/S03
 - Supporting slices: M001/S01
-- Validation: mapped
+- Validation: proven by `tests/btw.runtime.test.ts` asserting busy-main-session handoff queues via `deliverAs: "followUp"`, successful handoff clears via reset-marker semantics and dismisses the overlay, and summarize failure leaves the overlay/thread recoverable instead of collapsing the side session boundary.
 - Notes: Preserve the “hardworking session behind it” feel.
 
 ### R012 — BTW supports slash commands inside the modal if this can be done cleanly
@@ -239,11 +239,11 @@ Guidelines:
 | R004 | primary-user-loop | active | M001/S01 | none | mapped |
 | R005 | continuity | validated | M001/S02 | M001/S01 | proven |
 | R006 | constraint | validated | M001/S02 | none | proven |
-| R007 | integration | active | M001/S03 | M001/S02 | mapped |
+| R007 | integration | validated | M001/S03 | M001/S02 | proven |
 | R008 | primary-user-loop | validated | M001/S01 | M001/S02 | proven |
 | R009 | primary-user-loop | validated | M001/S01 | none | proven |
 | R010 | continuity | validated | M001/S02 | M001/S03 | proven |
-| R011 | integration | active | M001/S03 | M001/S01 | mapped |
+| R011 | integration | validated | M001/S03 | M001/S01 | proven |
 | R012 | differentiator | active | M001/S04 | none | mapped |
 | R013 | quality-attribute | active | M001/S04 | M001/S01 | mapped |
 | R014 | constraint | validated | M001/S02 | M001/S03 | proven |
@@ -255,7 +255,7 @@ Guidelines:
 
 ## Coverage Summary
 
-- Active requirements: 7
+- Active requirements: 5
 - Mapped to slices: 14
-- Validated: 7
+- Validated: 9
 - Unmapped active requirements: 0

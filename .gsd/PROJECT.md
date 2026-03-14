@@ -10,7 +10,7 @@ A user can open BTW instantly, ask and continue a side conversation in place wit
 
 ## Current State
 
-The project now ships a real BTW modal shell instead of a widget-only side channel, and S02 has now proven that the modal remains a thin UI over the existing BTW contract. `extensions/btw.ts` opens BTW as a focused overlay with its own composer, transcript, streamed status text, follow-up submission path, and Escape dismissal, while hidden custom session entries and reset markers still authoritatively govern `/btw`, `/btw:new`, `/btw:clear`, `/btw:tangent`, restore behavior, and main-context filtering. The above-editor widget remains as a lightweight mirror, not the primary interaction surface.
+The project now ships a real BTW modal shell instead of a widget-only side channel, and S03 has now proven that explicit handoff and background-session coexistence still hold under that modal. `extensions/btw.ts` opens BTW as a focused overlay with its own composer, transcript, streamed status text, follow-up submission path, inject/summarize handoff commands, and Escape dismissal, while hidden custom session entries and reset markers still authoritatively govern `/btw`, `/btw:new`, `/btw:clear`, `/btw:tangent`, restore behavior, explicit handoff clearing, and main-context filtering. Busy main-session handoff now remains explicitly queued as follow-up work rather than interrupting visible work. The above-editor widget remains as a lightweight mirror, not the primary interaction surface.
 
 ## Architecture / Key Patterns
 
@@ -25,5 +25,5 @@ See `.gsd/REQUIREMENTS.md` for the explicit capability contract, requirement sta
 - [ ] M001: Embedded BTW modal chat — Replace the current widget-only BTW interaction with a lightweight modal multi-turn side chat while preserving BTW semantics.
   - [x] S01: Modal BTW chat shell
   - [x] S02: BTW contract preservation
-  - [ ] S03: Explicit handoff and background-session integration
+  - [x] S03: Explicit handoff and background-session integration
   - [ ] S04: Slash-command support and graceful fallback

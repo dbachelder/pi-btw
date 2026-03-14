@@ -520,6 +520,7 @@ export default function (pi: ExtensionAPI) {
           },
           () => {
             overlayDraft = overlay.getDraft();
+            runtime.close?.();
             done();
           },
         );
@@ -556,9 +557,6 @@ export default function (pi: ExtensionAPI) {
     );
 
     void component;
-    if (overlayRuntime === runtime) {
-      overlayRuntime = null;
-    }
   }
 
   async function submitFromOverlay(ctx: ExtensionCommandContext | ExtensionContext, value: string): Promise<void> {
