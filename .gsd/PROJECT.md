@@ -10,16 +10,16 @@ A user can open BTW instantly, ask and continue a side conversation in place wit
 
 ## Current State
 
-M001 is complete, and M002 is through S03. `extensions/btw.ts` now runs BTW on a real in-memory `AgentSession` sub-session created with `createAgentSession()` + `SessionManager.inMemory()`, reuses the main session's model/model registry, enables `codingTools`, renders the overlay transcript from agent events, routes non-BTW slash input through the sub-session `prompt()` path, and extracts inject/summarize handoff content from real sub-session message history instead of manual pending-thread state. Runtime proof in `tests/btw.runtime.test.ts` now shows the BTW sub-session can keep streaming while the main session accepts new input independently. The remaining M002 work is S04 contract hardening/cleanup and removal of any dead M001-era plumbing.
+M001 and M002 are complete. `extensions/btw.ts` now runs BTW on a real in-memory `AgentSession` sub-session created with `createAgentSession()` + `SessionManager.inMemory()`, reuses the main session's model/model registry, enables `codingTools`, renders the overlay transcript directly from agent events, routes non-BTW slash input through the sub-session `prompt()` path, and extracts inject/summarize handoff content from real sub-session message history. S04 finished the contract hardening work: `tests/btw.runtime.test.ts` now covers incremental streaming, slash failure recovery, empty-thread injection, clear-during-tool disposal, summarize on the AgentSession seam, and dead M001 plumbing removal. `README.md` now matches the shipped sub-session behavior.
 
 ## Architecture / Key Patterns
 
 The extension remains self-contained, but BTW now has a split runtime model:
 
 - the **BTW overlay contract** still lives in the extension UI/hooks and preserves the documented `/btw`, `/btw:new`, `/btw:clear`, `/btw:tangent`, inject, and summarize semantics
-- the **BTW agent loop** now runs on a disposable in-memory `AgentSession` sub-session with coding tools and mode-aware seeded messages
-- the **current overlay transcript** is still a compatibility bridge that compresses `AgentSession` events into simplified BTW slots until S02 replaces it with richer event-native rendering
-- the **lifecycle contract** now centers on a shared dispose helper that unsubscribes listeners, aborts in-flight work, and disposes the sub-session before reset or replacement
+- the **BTW agent loop** runs on a disposable in-memory `AgentSession` sub-session with coding tools and mode-aware seeded messages
+- the **overlay transcript** is event-native: tool calls/results, assistant streaming, failures, and persisted restore state all flow through `BtwTranscriptEntry` mapping built from `AgentSessionEvent`s
+- the **lifecycle contract** centers on shared dispose/reset helpers that unsubscribe listeners, abort in-flight work, and dispose both interactive and summarize-only sub-sessions before reset or replacement
 
 ## Capability Contract
 
@@ -32,8 +32,8 @@ See `.gsd/REQUIREMENTS.md` for the explicit capability contract, requirement sta
   - [x] S02: BTW contract preservation
   - [x] S03: Explicit handoff and background-session integration
   - [x] S04: Slash-command support and graceful fallback
-- [ ] M002: BTW sub-session — Replace BTW's manual stream/context plumbing with a real `AgentSession` sub-session backed by `createAgentSession()`, giving BTW full tools, native slash commands, and parallel execution.
+- [x] M002: BTW sub-session — Replace BTW's manual stream/context plumbing with a real `AgentSession` sub-session backed by `createAgentSession()`, giving BTW full tools, native slash commands, and parallel execution.
   - [x] S01: Sub-session lifecycle and agent loop
   - [x] S02: Overlay transcript rendering from agent events
   - [x] S03: Slash commands, handoff, and parallel execution
-  - [ ] S04: Contract hardening and cleanup
+  - [x] S04: Contract hardening and cleanup

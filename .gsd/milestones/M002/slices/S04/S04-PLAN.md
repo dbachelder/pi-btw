@@ -14,26 +14,35 @@
 ## Verification
 
 - `npm test -- tests/btw.runtime.test.ts` — all assertions pass
+- `npm test -- tests/btw.runtime.test.ts -t "preserves BTW overlay recoverability after agent prompt failure|transcript inspection exposes streaming and failure state|summarize failure preserves BTW thread state and keeps the overlay recoverable"` — inspectable failure-path proof that overlay status/transcript state stays diagnostic and recoverable across prompt and handoff failures
 - `rg "streamSimple|completeSimple|BtwSlot|buildBtwContext" extensions/btw.ts` returns no hits (dead code removed)
 - Manual: full BTW workflow in live pi — open, ask with tool use, slash command, inject, dismiss
 
+## Observability / Diagnostics
+
+- The BTW overlay status line is the first-line runtime signal for sub-session creation, tool execution, handoff progress, disposal, and failure recovery.
+- `BtwOverlayComponent.getTranscriptEntries()` is the inspectable diagnostic surface for event-driven transcript state; prefer it over rendered-text scraping when proving streaming, tool activity, reset behavior, and preserved failure state.
+- The fake `AgentSession` records in `tests/btw.runtime.test.ts` (`subSessionRecords`, `promptCalls`, `getIsStreaming()`, `getListenerCount()`) are the contract-grade inspection surface for sub-session lifecycle, mode recreation, and disposal.
+- Failure paths must remain recoverable and inspectable: prompt/summarize failures surface through overlay status, transcript entries, and notifications without silently dropping the BTW thread.
+- Do not add diagnostics that echo secrets beyond the existing tool-result truncation and transcript redaction boundaries.
+
 ## Tasks
 
-- [ ] **T01: Update test harness for sub-session model** `est:1h`
+- [x] **T01: Update test harness for sub-session model** `est:1h`
   - Why: The M001 test harness mocks `streamSimple`/`completeSimple` — it needs to mock `createAgentSession` or the Agent layer instead, and assert on sub-session lifecycle events.
   - Files: `tests/btw.runtime.test.ts`
   - Do: Replace `streamSimpleMock`/`completeSimpleMock` with a mock `createAgentSession` that returns a controllable fake `AgentSession` (with `prompt()`, `subscribe()`, `dispose()`, `messages`, `isStreaming`, `state`). Update existing M001 assertions to work against the sub-session model. Add new assertions for: sub-session created on BTW open, tools include read/bash/edit/write, dispose called on Escape, dispose called on /btw:clear, /btw:new disposes old and creates new, mode switch disposes and recreates with correct context. Preserve all M001 contract assertions that still apply (handoff, mode semantics, context filtering).
   - Verify: `npm test` passes with updated and new assertions
   - Done when: test harness exercises sub-session lifecycle and the mock infrastructure supports the new model
 
-- [ ] **T02: Add transcript, slash, and parallel assertions** `est:45m`
+- [x] **T02: Add transcript, slash, and parallel assertions** `est:45m`
   - Why: S02 and S03 introduced event-driven transcript and slash dispatch — these need contract-grade assertions.
   - Files: `tests/btw.runtime.test.ts`
   - Do: Add assertions for: tool-call events produce transcript entries, tool-result events populate results, streaming events update assistant text, slash input routes through prompt, inject extracts from sub-session messages, summarize generates summary from sub-session, main session independence from BTW streaming state. Cover edge cases: dispose during active tool execution, inject with empty sub-session, slash command that fails.
   - Verify: `npm test` passes with all new assertions
   - Done when: transcript rendering, slash dispatch, handoff, and parallel execution have named runtime assertions
 
-- [ ] **T03: Remove dead M001 plumbing and update README** `est:30m`
+- [x] **T03: Remove dead M001 plumbing and update README** `est:30m`
   - Why: The manual stream/context/slash-dispatch code from M001 is dead weight now that the sub-session handles everything. Clean it up.
   - Files: `extensions/btw.ts`, `README.md`
   - Do: Remove: `buildBtwContext()`, `buildMainMessages()`, direct `streamSimple`/`completeSimple` imports and calls, `BtwSlot` type and `slots[]` state, `BtwDetails` for manual thread entries (if fully replaced), the manual `parseOverlaySlashCommand()` + `dispatchBtwCommand()` hand-dispatch path, the unsupported-slash fallback warning. Keep: BTW command registration, overlay component, inject/summarize handoff, context filtering hook, and any hidden-entry persistence that's still needed. Update README to document BTW as a real sub-session with tool access and native slash commands.

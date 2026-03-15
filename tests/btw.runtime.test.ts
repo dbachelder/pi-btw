@@ -2,9 +2,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, RegisteredCommand } from "@mariozechner/pi-coding-agent";
 import btwExtension from "../extensions/btw";
 
-const { streamSimpleMock, completeSimpleMock, createAgentSessionMock, sessionManagerInMemoryMock, subSessionRecords } = vi.hoisted(() => ({
-  streamSimpleMock: vi.fn(),
-  completeSimpleMock: vi.fn(),
+const { promptStreamMock, createAgentSessionMock, sessionManagerInMemoryMock, subSessionRecords } = vi.hoisted(() => ({
+  promptStreamMock: vi.fn(),
   createAgentSessionMock: vi.fn(),
   sessionManagerInMemoryMock: vi.fn(() => ({ type: "in-memory-session" })),
   subSessionRecords: [] as Array<{
@@ -17,15 +16,6 @@ const { streamSimpleMock, completeSimpleMock, createAgentSessionMock, sessionMan
     getIsStreaming: () => boolean;
   }>,
 }));
-
-vi.mock("@mariozechner/pi-ai", async () => {
-  const actual = await vi.importActual<typeof import("@mariozechner/pi-ai")>("@mariozechner/pi-ai");
-  return {
-    ...actual,
-    streamSimple: streamSimpleMock,
-    completeSimple: completeSimpleMock,
-  };
-});
 
 vi.mock("@mariozechner/pi-coding-agent", async () => {
   const actual = await vi.importActual<typeof import("@mariozechner/pi-coding-agent")>("@mariozechner/pi-coding-agent");
@@ -240,6 +230,27 @@ function createStreamingFailureStream() {
   };
 }
 
+function createBlockingAnswerStream(answer: string) {
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const firstChunkLength = Math.max(1, Math.floor(answer.length / 2));
+
+  return {
+    release,
+    stream: async function* () {
+      yield { type: "text_delta" as const, delta: answer.slice(0, firstChunkLength) };
+      await blocked;
+      yield { type: "text_delta" as const, delta: answer.slice(firstChunkLength) };
+      yield {
+        type: "done" as const,
+        message: makeAssistantMessage(answer),
+      };
+    },
+  };
+}
+
 function buildAssistantContent(thinking: string, answer: string) {
   const content: Array<{ type: "thinking"; thinking: string } | { type: "text"; text: string }> = [];
   if (thinking) {
@@ -320,7 +331,7 @@ function createMockAgentSession(options: any) {
       emit({ type: "message_start", message: userMessage });
       emit({ type: "message_end", message: userMessage });
 
-      const stream = streamSimpleMock(options.model, context, { session: "btw-sub-session" }) as AsyncIterable<PromptStreamEvent>;
+      const stream = promptStreamMock(record, text, context) as AsyncIterable<PromptStreamEvent>;
       let assistantStarted = false;
       let thinking = "";
       let answer = "";
@@ -626,14 +637,13 @@ function createHarness(
 
 describe("btw runtime behavior", () => {
   beforeEach(() => {
-    streamSimpleMock.mockReset();
-    completeSimpleMock.mockReset();
+    promptStreamMock.mockReset();
     createAgentSessionMock.mockReset();
     sessionManagerInMemoryMock.mockClear();
     subSessionRecords.length = 0;
 
     createAgentSessionMock.mockImplementation(async (options: any) => createMockAgentSession(options));
-    streamSimpleMock.mockImplementation((_model: unknown, context: StreamContext) => {
+    promptStreamMock.mockImplementation((_record: unknown, _text: string, context: StreamContext) => {
       return streamAnswer(`default:${(context.messages.at(-1)?.content[0] as any)?.text ?? ""}`);
     });
   });
@@ -723,7 +733,7 @@ describe("btw runtime behavior", () => {
 
   it("preserves BTW overlay recoverability after agent prompt failure", async () => {
     const harness = createHarness();
-    streamSimpleMock
+    promptStreamMock
       .mockImplementationOnce(async function* () {
         yield {
           type: "error" as const,
@@ -771,7 +781,7 @@ describe("btw runtime behavior", () => {
   it("aborts, disposes, and unsubscribes the active BTW sub-session when Escape dismisses mid-stream", async () => {
     const harness = createHarness();
     const blocking = createBlockingToolStream();
-    streamSimpleMock.mockImplementation(() => blocking.stream());
+    promptStreamMock.mockImplementation(() => blocking.stream());
 
     await harness.runSessionStart();
     const pendingCommand = harness.command("btw", "first question");
@@ -801,7 +811,7 @@ describe("btw runtime behavior", () => {
   it("allows main-session input to proceed while the BTW sub-session is streaming", async () => {
     const harness = createHarness();
     const blocking = createBlockingSuccessStream("Long-running answer");
-    streamSimpleMock.mockImplementation(() => blocking.stream());
+    promptStreamMock.mockImplementation(() => blocking.stream());
 
     await harness.runSessionStart();
     await harness.command("btw", "");
@@ -867,7 +877,7 @@ describe("btw runtime behavior", () => {
 
   it("keeps the thread after Escape dismissal and restores it on reopen", async () => {
     const harness = createHarness();
-    streamSimpleMock.mockImplementation(() => streamAnswer("First answer"));
+    promptStreamMock.mockImplementation(() => streamAnswer("First answer"));
 
     await harness.runSessionStart();
     await harness.command("btw", "first question");
@@ -897,7 +907,7 @@ describe("btw runtime behavior", () => {
 
   it("supports an in-place follow-up and preserves both turns in one thread", async () => {
     const harness = createHarness();
-    streamSimpleMock
+    promptStreamMock
       .mockImplementationOnce(() => streamAnswer("First answer"))
       .mockImplementationOnce(() => streamAnswer("Second answer"));
 
@@ -921,7 +931,7 @@ describe("btw runtime behavior", () => {
 
   it("maps turn, tool, thinking, and assistant events into transcript entries", async () => {
     const harness = createHarness();
-    streamSimpleMock.mockImplementation(async function* () {
+    promptStreamMock.mockImplementation(async function* () {
       yield { type: "thinking_delta" as const, delta: "Inspecting package.json" };
       yield { type: "tool_execution_start" as const, toolName: "read", args: { path: "package.json" } };
       yield {
@@ -981,7 +991,7 @@ describe("btw runtime behavior", () => {
     });
     const longToolResult = ["line 1", "line 2", "x".repeat(420)].join("\n");
 
-    streamSimpleMock
+    promptStreamMock
       .mockImplementationOnce(async function* () {
         yield { type: "thinking_delta" as const, delta: "Inspecting package.json" };
         yield { type: "tool_execution_start" as const, toolName: "read", args: { path: "package.json" } };
@@ -1026,7 +1036,7 @@ describe("btw runtime behavior", () => {
   it("transcript inspection exposes streaming and failure state", async () => {
     const harness = createHarness();
     const failing = createStreamingFailureStream();
-    streamSimpleMock.mockImplementation(() => failing.stream());
+    promptStreamMock.mockImplementation(() => failing.stream());
 
     await harness.runSessionStart();
     const pendingCommand = harness.command("btw", "read package metadata");
@@ -1062,9 +1072,35 @@ describe("btw runtime behavior", () => {
     expect(overlay.statusText.text).toContain("Request failed. Thread preserved for retry or follow-up.");
   });
 
+  it("updates assistant transcript text incrementally while the BTW response streams", async () => {
+    const harness = createHarness();
+    const blocking = createBlockingAnswerStream("Partial answer");
+    promptStreamMock.mockImplementation(() => blocking.stream());
+
+    await harness.runSessionStart();
+    const pendingCommand = harness.command("btw", "stream it");
+    await flushAsyncWork();
+
+    const overlay = harness.latestOverlayComponent();
+    expect(findLatest(transcriptEntries(overlay), (entry: any) => entry.type === "assistant-text")).toMatchObject({
+      text: "Partial",
+      streaming: true,
+    });
+    expect(overlay.statusText.text).toContain("streaming");
+
+    blocking.release();
+    await pendingCommand;
+
+    expect(findLatest(transcriptEntries(overlay), (entry: any) => entry.type === "assistant-text")).toMatchObject({
+      text: "Partial answer",
+      streaming: false,
+    });
+    expect(overlay.statusText.text).toContain("Ready for a follow-up");
+  });
+
   it("clears the modal composer after a follow-up is submitted", async () => {
     const harness = createHarness();
-    streamSimpleMock
+    promptStreamMock
       .mockImplementationOnce(() => streamAnswer("First answer"))
       .mockImplementationOnce(() => streamAnswer("Second answer"));
 
@@ -1088,7 +1124,7 @@ describe("btw runtime behavior", () => {
         bold: (text: string) => `<bold>${text}</bold>`,
       },
     });
-    streamSimpleMock.mockImplementation(() => streamAnswer("First answer"));
+    promptStreamMock.mockImplementation(() => streamAnswer("First answer"));
 
     await harness.runSessionStart();
     await harness.command("btw", "first question");
@@ -1119,7 +1155,7 @@ describe("btw runtime behavior", () => {
 
   it("keeps BTW in an overlay and does not leave a persistent widget above the main input", async () => {
     const harness = createHarness();
-    streamSimpleMock.mockImplementation(() => streamAnswer("Overlay answer"));
+    promptStreamMock.mockImplementation(() => streamAnswer("Overlay answer"));
 
     await harness.runSessionStart();
     await harness.command("btw", "overlay question");
@@ -1146,7 +1182,7 @@ describe("btw runtime behavior", () => {
     const harness = createHarness();
     const longAnswer = Array.from({ length: 24 }, (_, index) => `line ${index + 1} of a long answer`).join("\n");
 
-    streamSimpleMock
+    promptStreamMock
       .mockImplementationOnce(() => streamAnswer(longAnswer))
       .mockImplementationOnce(() => streamAnswer(longAnswer));
 
@@ -1170,12 +1206,12 @@ describe("btw runtime behavior", () => {
 
   it("/btw:new appends a reset marker, disposes the old sub-session, clears prior hidden thread state, stays contextual, and reopens a fresh thread", async () => {
     const harness = createHarness();
-    streamSimpleMock
-      .mockImplementationOnce((_model: unknown, context: StreamContext) => {
+    promptStreamMock
+      .mockImplementationOnce((_record: unknown, _text: string, context: StreamContext) => {
         expect(context.messages.map((message) => (message.content[0] as any)?.text ?? "")).toContain("first question");
         return streamAnswer("First answer");
       })
-      .mockImplementationOnce((_model: unknown, context: StreamContext) => {
+      .mockImplementationOnce((_record: unknown, _text: string, context: StreamContext) => {
         const texts = context.messages.map((message) => (message.content[0] as any)?.text ?? "");
         expect(texts).not.toContain("first question");
         expect(texts).not.toContain("First answer");
@@ -1240,10 +1276,10 @@ describe("btw runtime behavior", () => {
     expect(resets).toHaveLength(2);
     expect(resets.map((entry) => (entry.data as any)?.mode)).toEqual(["tangent", "contextual"]);
 
-    const streamCalls = streamSimpleMock.mock.calls as Array<[unknown, StreamContext, unknown]>;
+    const streamCalls = promptStreamMock.mock.calls as Array<[unknown, string, StreamContext]>;
     expect(streamCalls.length).toBeGreaterThanOrEqual(2);
 
-    const callTexts = streamCalls.map((call) => call[1].messages.map((message) => (message.content[0] as any)?.text ?? ""));
+    const callTexts = streamCalls.map((call) => call[2].messages.map((message) => (message.content[0] as any)?.text ?? ""));
     const tangentTexts = callTexts.find((texts) => texts.at(-1) === "tangent start");
     expect(tangentTexts).toBeDefined();
     expect(tangentTexts).not.toContain("main session task");
@@ -1312,6 +1348,42 @@ describe("btw runtime behavior", () => {
     expect(transcript).not.toContain("You  new q");
   });
 
+  it("/btw:clear during active tool execution aborts the prompt, disposes the sub-session, and leaves no partial thread", async () => {
+    const harness = createHarness();
+    const blocking = createBlockingToolStream();
+    promptStreamMock.mockImplementation(() => blocking.stream());
+
+    await harness.runSessionStart();
+    const pendingCommand = harness.command("btw", "long running tool");
+    await flushAsyncWork();
+
+    const overlay = harness.latestOverlayComponent();
+    const overlayHandle = harness.overlayHandles.at(-1);
+    const activeRecord = subSessionRecords[0];
+    expect(overlay.statusText.text).toContain("running tool: read");
+    expect(activeRecord.getIsStreaming()).toBe(true);
+
+    await harness.command("btw:clear", "");
+    await flushAsyncWork();
+
+    expect(activeRecord.session.abort).toHaveBeenCalledTimes(1);
+    expect(activeRecord.session.dispose).toHaveBeenCalledTimes(1);
+    expect(activeRecord.getListenerCount()).toBe(0);
+    expect(activeRecord.getIsStreaming()).toBe(false);
+    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(0);
+    expect(getCustomEntries(harness.entries, "btw-thread-reset")).toHaveLength(1);
+    expect(harness.notifications.at(-1)).toEqual({ message: "Cleared BTW thread.", type: "info" });
+    expect(overlayHandle?.hideCalls).toBe(1);
+
+    blocking.release();
+    await pendingCommand;
+
+    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(0);
+
+    await harness.command("btw", "");
+    expect(transcriptText(harness.latestOverlayComponent())).toContain("No BTW thread yet. Ask a side question to start one.");
+  });
+
   it("restore behavior is consistent across session_start, session_switch, and session_tree", async () => {
     const entries: SessionEntry[] = [
       { type: "custom", customType: "btw-thread-reset", data: { timestamp: 1, mode: "tangent" } },
@@ -1332,7 +1404,7 @@ describe("btw runtime behavior", () => {
 
   it("/btw:inject success extracts the active sub-session thread, disposes it, dismisses the overlay, and reopens fresh", async () => {
     const harness = createHarness();
-    streamSimpleMock.mockImplementation(() => streamAnswer("First answer"));
+    promptStreamMock.mockImplementation(() => streamAnswer("First answer"));
 
     await harness.runSessionStart();
     await harness.command("btw", "first question");
@@ -1374,7 +1446,7 @@ describe("btw runtime behavior", () => {
 
   it("/btw:inject while the main session is busy delivers to the main session as a follow-up", async () => {
     const harness = createHarness();
-    streamSimpleMock.mockImplementation(() => streamAnswer("Busy answer"));
+    promptStreamMock.mockImplementation(() => streamAnswer("Busy answer"));
 
     await harness.runSessionStart();
     await harness.command("btw", "busy question");
@@ -1389,10 +1461,41 @@ describe("btw runtime behavior", () => {
     });
   });
 
+  it("/btw:inject with an empty sub-session warns without disposing the ready BTW session", async () => {
+    const harness = createHarness();
+
+    await harness.runSessionStart();
+    await harness.command("btw", "");
+
+    const overlay = harness.latestOverlayComponent();
+    const overlayHandle = harness.overlayHandles.at(-1);
+    const record = subSessionRecords[0];
+
+    await harness.command("btw:inject", "");
+
+    expect(harness.sentUserMessages).toHaveLength(0);
+    expect(record.session.dispose).not.toHaveBeenCalled();
+    expect(record.session.abort).not.toHaveBeenCalled();
+    expect(record.getListenerCount()).toBe(1);
+    expect(overlayHandle?.isHidden()).toBe(false);
+    expect(overlay.statusText.text).toContain("Ready. Enter submits; Escape dismisses without clearing.");
+    expect(transcriptText(overlay)).toContain("No BTW thread yet. Ask a side question to start one.");
+    expect(harness.notifications.at(-1)).toEqual({
+      message: "No BTW thread to inject.",
+      type: "warning",
+    });
+  });
+
   it("/btw:summarize success summarizes the active sub-session thread, disposes it, dismisses the overlay, and reopens fresh", async () => {
     const harness = createHarness();
-    streamSimpleMock.mockImplementation(() => streamAnswer("First answer"));
-    completeSimpleMock.mockResolvedValue(makeAssistantMessage("Short summary"));
+    promptStreamMock
+      .mockImplementationOnce(() => streamAnswer("First answer"))
+      .mockImplementationOnce((_record: unknown, text: string) => {
+        expect(text).toBe(
+          "User: first question\nAssistant: First answer\n\n---\n\nUser: second question\nAssistant: Second answer",
+        );
+        return streamAnswer("Short summary");
+      });
 
     await harness.runSessionStart();
     await harness.command("btw", "first question");
@@ -1412,8 +1515,11 @@ describe("btw runtime behavior", () => {
 
     await harness.command("btw:summarize", "Hand this to the main agent.");
 
-    expect(completeSimpleMock).toHaveBeenCalledTimes(1);
-    expect((completeSimpleMock.mock.calls[0]?.[1] as any)?.messages?.[0]?.content?.[0]?.text).toBe(
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(2);
+    const summaryRecord = subSessionRecords[1];
+    expect(summaryRecord).toBeDefined();
+    expect(summaryRecord.options.tools).toEqual([]);
+    expect(summaryRecord.promptCalls[0]?.text).toBe(
       "User: first question\nAssistant: First answer\n\n---\n\nUser: second question\nAssistant: Second answer",
     );
     expect(harness.sentUserMessages).toHaveLength(1);
@@ -1423,6 +1529,7 @@ describe("btw runtime behavior", () => {
     });
     expect(getCustomEntries(harness.entries, "btw-thread-reset")).toHaveLength(1);
     expect(record.session.dispose).toHaveBeenCalledTimes(1);
+    expect(summaryRecord.session.dispose).toHaveBeenCalledTimes(1);
     expect(overlayHandle?.hideCalls).toBe(1);
     expect(harness.notifications.at(-1)).toEqual({
       message: "Injected BTW summary (2 exchanges).",
@@ -1436,12 +1543,18 @@ describe("btw runtime behavior", () => {
 
   it("summarize failure preserves BTW thread state and keeps the overlay recoverable", async () => {
     const harness = createHarness();
-    streamSimpleMock.mockImplementation(() => streamAnswer("First answer"));
-    completeSimpleMock.mockResolvedValue({
-      ...makeAssistantMessage(""),
-      stopReason: "error",
-      errorMessage: "Summary model exploded",
-    });
+    promptStreamMock
+      .mockImplementationOnce(() => streamAnswer("First answer"))
+      .mockImplementationOnce(async function* () {
+        yield {
+          type: "error" as const,
+          error: {
+            ...makeAssistantMessage(""),
+            stopReason: "error" as const,
+            errorMessage: "Summary model exploded",
+          },
+        };
+      });
 
     await harness.runSessionStart();
     await harness.command("btw", "first question");
@@ -1453,6 +1566,7 @@ describe("btw runtime behavior", () => {
     expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(1);
     expect(getCustomEntries(harness.entries, "btw-thread-reset")).toHaveLength(0);
     expect(overlayHandle?.isHidden()).toBe(false);
+    expect(subSessionRecords[1]?.session.dispose).toHaveBeenCalledTimes(1);
 
     const overlay = harness.latestOverlayComponent();
     overlay.refresh();
@@ -1467,7 +1581,7 @@ describe("btw runtime behavior", () => {
 
   it("in-modal /btw:new reuses command semantics by resetting the thread and reopening contextual mode", async () => {
     const harness = createHarness();
-    streamSimpleMock
+    promptStreamMock
       .mockImplementationOnce(() => streamAnswer("First answer"))
       .mockImplementationOnce(() => streamAnswer("Replacement answer"));
 
@@ -1510,13 +1624,13 @@ describe("btw runtime behavior", () => {
     expect(resets).toHaveLength(1);
     expect(resets.at(-1)?.data).toMatchObject({ mode: "tangent" });
 
-    const streamCalls = streamSimpleMock.mock.calls as Array<[unknown, StreamContext, unknown]>;
+    const streamCalls = promptStreamMock.mock.calls as Array<[unknown, string, StreamContext]>;
     const tangentCall = [...streamCalls].reverse().find((call) => {
-      const texts = call[1].messages.map((message) => (message.content[0] as any)?.text ?? "");
+      const texts = call[2].messages.map((message) => (message.content[0] as any)?.text ?? "");
       return texts.at(-1) === "tangent start";
     });
     expect(tangentCall).toBeDefined();
-    const tangentTexts = tangentCall![1].messages.map((message) => (message.content[0] as any)?.text ?? "");
+    const tangentTexts = tangentCall![2].messages.map((message) => (message.content[0] as any)?.text ?? "");
     expect(tangentTexts).not.toContain("main session task");
 
     const transcript = transcriptText(overlay);
@@ -1528,7 +1642,7 @@ describe("btw runtime behavior", () => {
 
   it("in-modal /btw:inject reuses command semantics by handing off to the main session and dismissing the overlay", async () => {
     const harness = createHarness();
-    streamSimpleMock.mockImplementation(() => streamAnswer("First answer"));
+    promptStreamMock.mockImplementation(() => streamAnswer("First answer"));
 
     await harness.runSessionStart();
     await harness.command("btw", "first question");
@@ -1549,7 +1663,7 @@ describe("btw runtime behavior", () => {
 
   it("routes non-BTW slash input in the modal through the BTW sub-session prompt without fallback warnings", async () => {
     const harness = createHarness();
-    streamSimpleMock
+    promptStreamMock
       .mockImplementationOnce(() => streamAnswer("First answer"))
       .mockImplementationOnce(() => streamAnswer("Slash answer"));
 
@@ -1569,7 +1683,7 @@ describe("btw runtime behavior", () => {
     expect(((record.promptCalls.at(-1)?.context.messages.at(-1)?.content[0] as any)?.text) ?? "").toBe(
       "/plan do something else",
     );
-    expect(streamSimpleMock.mock.calls).toHaveLength(2);
+    expect(promptStreamMock.mock.calls).toHaveLength(2);
     expect(harness.sentUserMessages).toHaveLength(sentUserMessagesBefore);
     expect(getCustomEntries(harness.entries, "btw-thread-reset")).toHaveLength(resetCountBefore);
     expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(2);
@@ -1579,9 +1693,47 @@ describe("btw runtime behavior", () => {
     expect(transcriptText(overlay)).toContain("Slash answer");
   });
 
+  it("preserves the BTW thread and recoverability when routed slash input fails", async () => {
+    const harness = createHarness();
+    promptStreamMock
+      .mockImplementationOnce(() => streamAnswer("First answer"))
+      .mockImplementationOnce(async function* () {
+        yield {
+          type: "error" as const,
+          error: {
+            ...makeAssistantMessage(""),
+            stopReason: "error" as const,
+            errorMessage: "Slash dispatch exploded",
+          },
+        };
+      });
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+
+    const overlay = harness.latestOverlayComponent();
+    const record = subSessionRecords[0];
+    overlay.input.onSubmit?.("/plan fail loudly");
+    await flushAsyncWork();
+
+    expect(record.session.prompt).toHaveBeenLastCalledWith("/plan fail loudly", { source: "extension" });
+    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(1);
+    expect(getCustomEntries(harness.entries, "btw-thread-reset")).toHaveLength(0);
+    expect(harness.sentUserMessages).toHaveLength(0);
+    expect(overlay.statusText.text).toContain("Request failed. Thread preserved for retry or follow-up.");
+    expect(transcriptText(overlay)).toContain("You  first question");
+    expect(transcriptText(overlay)).toContain("First answer");
+    expect(transcriptText(overlay)).toContain("You  /plan fail loudly");
+    expect(transcriptText(overlay)).toContain("❌ Slash dispatch exploded");
+    expect(harness.notifications.at(-1)).toEqual({
+      message: "Slash dispatch exploded",
+      type: "error",
+    });
+  });
+
   it("ordinary BTW follow-up submit and Escape dismissal do not send content to the main session", async () => {
     const harness = createHarness();
-    streamSimpleMock
+    promptStreamMock
       .mockImplementationOnce(() => streamAnswer("First answer"))
       .mockImplementationOnce(() => streamAnswer("Second answer"));
 

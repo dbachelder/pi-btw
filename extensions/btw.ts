@@ -11,12 +11,7 @@ import {
   type ExtensionContext,
   type ResourceLoader,
 } from "@mariozechner/pi-coding-agent";
-import {
-  completeSimple,
-  type AssistantMessage,
-  type Message,
-  type ThinkingLevel as AiThinkingLevel,
-} from "@mariozechner/pi-ai";
+import { type AssistantMessage, type Message, type ThinkingLevel as AiThinkingLevel } from "@mariozechner/pi-ai";
 import {
   Box,
   Container,
@@ -44,6 +39,9 @@ const BTW_SYSTEM_PROMPT = [
   "Focus on answering the user's side questions, helping them think through ideas, or planning next steps.",
   "Do not act as if you need to continue unfinished work from the main session unless the user explicitly asks you to prepare something for injection back to it.",
 ].join(" ");
+
+const BTW_SUMMARIZE_SYSTEM_PROMPT =
+  "Summarize the side conversation concisely. Preserve key decisions, plans, insights, risks, and action items. Output only the summary.";
 
 const BTW_CONTINUE_THREAD_USER_TEXT = "[The following is a separate side conversation. Continue this thread.]";
 const BTW_CONTINUE_THREAD_ASSISTANT_TEXT = "Understood, continuing our side conversation.";
@@ -134,7 +132,10 @@ function stripDynamicSystemPromptFooter(systemPrompt: string): string {
     .trim();
 }
 
-function createBtwResourceLoader(ctx: ExtensionCommandContext): ResourceLoader {
+function createBtwResourceLoader(
+  ctx: ExtensionCommandContext,
+  appendSystemPrompt: string[] = [BTW_SYSTEM_PROMPT],
+): ResourceLoader {
   const extensionsResult = { extensions: [], errors: [], runtime: createExtensionRuntime() };
   const systemPrompt = stripDynamicSystemPromptFooter(ctx.getSystemPrompt());
 
@@ -145,7 +146,7 @@ function createBtwResourceLoader(ctx: ExtensionCommandContext): ResourceLoader {
     getThemes: () => ({ themes: [], diagnostics: [] }),
     getAgentsFiles: () => ({ agentsFiles: [] }),
     getSystemPrompt: () => systemPrompt,
-    getAppendSystemPrompt: () => [BTW_SYSTEM_PROMPT],
+    getAppendSystemPrompt: () => appendSystemPrompt,
     getPathMetadata: () => new Map(),
     extendResources: () => {},
     reload: async () => {},
@@ -180,35 +181,39 @@ function parseBtwArgs(args: string): ParsedBtwArgs {
   return { question, save };
 }
 
-function buildMainMessages(ctx: ExtensionCommandContext): Message[] {
-  try {
-    const sessionContext = buildSessionContext(ctx.sessionManager.getEntries(), ctx.sessionManager.getLeafId());
-    return sessionContext.messages.filter((message) => !isVisibleBtwMessage(message));
-  } catch {
-    return ctx.sessionManager
-      .getEntries()
-      .flatMap((entry) => {
-        if (!entry || typeof entry !== "object") {
-          return [];
-        }
-
-        const message = entry as Partial<Message> & { role?: string; customType?: string; content?: unknown };
-        if (typeof message.role !== "string" || !Array.isArray(message.content)) {
-          return [];
-        }
-
-        return isVisibleBtwMessage({ role: message.role, customType: message.customType }) ? [] : [message as Message];
-      });
-  }
-}
-
 function buildBtwSeedState(
   ctx: ExtensionCommandContext,
   thread: BtwDetails[],
   mode: BtwThreadMode,
 ): { messages: Message[]; sideThreadStartIndex: number } {
-  const mainMessages = mode === "contextual" ? buildMainMessages(ctx) : [];
-  const messages: Message[] = [...mainMessages];
+  const messages: Message[] = [];
+
+  if (mode === "contextual") {
+    try {
+      messages.push(
+        ...buildSessionContext(ctx.sessionManager.getEntries(), ctx.sessionManager.getLeafId()).messages.filter(
+          (message) => !isVisibleBtwMessage(message),
+        ),
+      );
+    } catch {
+      messages.push(
+        ...ctx.sessionManager.getEntries().flatMap((entry) => {
+          if (!entry || typeof entry !== "object") {
+            return [];
+          }
+
+          const message = entry as Partial<Message> & { role?: string; customType?: string; content?: unknown };
+          if (typeof message.role !== "string" || !Array.isArray(message.content)) {
+            return [];
+          }
+
+          return isVisibleBtwMessage({ role: message.role, customType: message.customType }) ? [] : [message as Message];
+        }),
+      );
+    }
+  }
+
+  const sideThreadStartIndex = messages.length;
 
   if (thread.length > 0) {
     messages.push(
@@ -267,7 +272,7 @@ function buildBtwSeedState(
 
   return {
     messages,
-    sideThreadStartIndex: mainMessages.length,
+    sideThreadStartIndex,
   };
 }
 
@@ -1720,32 +1725,38 @@ export default function (pi: ExtensionAPI) {
       throw new Error(`No credentials available for ${model.provider}/${model.id}.`);
     }
 
-    const response = await completeSimple(
+    const { session } = await createAgentSession({
+      sessionManager: SessionManager.inMemory(),
       model,
-      {
-        systemPrompt: "Summarize the side conversation concisely. Preserve key decisions, plans, insights, risks, and action items. Output only the summary.",
-        messages: [
-          {
-            role: "user",
-            content: [{ type: "text", text: formatThread(thread) }],
-            timestamp: Date.now(),
-          },
-        ],
-      },
-      {
-        apiKey,
-        reasoning: "low",
-      },
-    );
+      modelRegistry: ctx.modelRegistry as AgentSession["modelRegistry"],
+      thinkingLevel: "off",
+      tools: [],
+      resourceLoader: createBtwResourceLoader(ctx, [BTW_SUMMARIZE_SYSTEM_PROMPT]),
+    });
 
-    if (response.stopReason === "error") {
-      throw new Error(response.errorMessage || "Failed to summarize BTW thread.");
-    }
-    if (response.stopReason === "aborted") {
-      throw new Error("BTW summarize aborted.");
-    }
+    try {
+      await session.prompt(formatThread(thread), { source: "extension" });
 
-    return extractAnswer(response);
+      const response = getLastAssistantMessage(session);
+      if (!response) {
+        throw new Error("BTW summarize finished without a response.");
+      }
+      if (response.stopReason === "error") {
+        throw new Error(response.errorMessage || "Failed to summarize BTW thread.");
+      }
+      if (response.stopReason === "aborted") {
+        throw new Error("BTW summarize aborted.");
+      }
+
+      return extractAnswer(response);
+    } finally {
+      try {
+        await session.abort();
+      } catch {
+        // Ignore abort errors during summarize session shutdown.
+      }
+      session.dispose();
+    }
   }
 
   function sendThreadToMain(ctx: ExtensionCommandContext, content: string): void {

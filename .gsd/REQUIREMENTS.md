@@ -157,8 +157,8 @@ Guidelines:
 - Source: inferred
 - Primary owning slice: M001/S04
 - Supporting slices: M001/S01
-- Validation: proven by `tests/btw.runtime.test.ts` asserting unsupported modal slash input surfaces an explicit BTW-local warning and does not execute a command, mutate hidden thread state, or fall through as BTW chat text.
-- Notes: Avoid turning BTW into a huge mess.
+- Validation: superseded in practice by `tests/btw.runtime.test.ts` proving full overlay slash parity through the BTW sub-session `prompt()` path in M002/S03; S04 then removed the old unsupported-slash fallback plumbing because the stronger parity path shipped cleanly.
+- Notes: Avoid turning BTW into a huge mess; the shipped outcome is stronger than the fallback requirement.
 
 ### R014 — BTW preserves separation from main-session context except when explicit handoff is requested
 - Class: constraint

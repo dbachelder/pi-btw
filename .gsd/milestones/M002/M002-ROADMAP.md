@@ -62,7 +62,7 @@ This milestone is complete only when all are true:
 - [x] **S03: Slash commands, handoff, and parallel execution** `risk:medium` `depends:[S01]`
   > After this: user can type slash commands in BTW that route through the sub-session, use inject/summarize to hand content back to the main session, and the main session continues working while BTW runs in parallel.
 
-- [ ] **S04: Contract hardening and cleanup** `risk:low` `depends:[S01,S02,S03]`
+- [x] **S04: Contract hardening and cleanup** `risk:low` `depends:[S01,S02,S03]`
   > After this: runtime test suite covers sub-session lifecycle, event rendering, slash dispatch, handoff, and parallel execution — all M001 contract assertions are updated for the sub-session model, and dead M001 plumbing (manual streamSimple, hand-built context, custom slash dispatch) is removed.
 
 ## Boundary Map

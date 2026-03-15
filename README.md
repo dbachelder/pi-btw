@@ -2,13 +2,14 @@
 
 A small [pi](https://github.com/badlogic/pi-mono) extension that adds a `/btw` side conversation channel.
 
-`/btw` runs immediately, even while the main agent is still busy.
+`/btw` opens a real pi sub-session with coding-tool access, and it runs immediately even while the main agent is still busy.
 
 ![BTW overlay example](docs/btw-overlay.png)
 
 ## What it does
 
 - opens a parallel side conversation without interrupting the main run
+- runs that side conversation as a real pi sub-session with `read` / `bash` / `edit` / `write` tool access
 - keeps a continuous BTW thread by default
 - supports `/btw:tangent` for a contextless side thread that does not inherit the current main-session conversation
 - opens a focused BTW modal shell with its own composer and transcript
@@ -61,6 +62,7 @@ pi install /absolute/path/to/pi-btw
 
 - runs right away
 - works while pi is busy
+- creates or reuses a real BTW sub-session instead of a one-off completion call
 - continues the current BTW thread
 - opens or refreshes the focused BTW modal shell
 - streams into the BTW modal transcript/status surface
@@ -101,6 +103,15 @@ pi install /absolute/path/to/pi-btw
 - clears the BTW thread after sending
 
 ## Behavior
+
+### Real sub-session model
+
+BTW is implemented as an actual pi sub-session with its own in-memory session state, transcript events, and tool surface.
+
+- contextual `/btw` threads seed that sub-session from the current main-session branch while filtering out BTW-visible notes from the parent context
+- `/btw:tangent` starts the same BTW UI in a contextless mode with no inherited main-session conversation
+- the overlay transcript/status line is driven from sub-session events, so tool activity, streaming deltas, failures, and recovery are all visible without scraping rendered output
+- handoff commands (`/btw:inject` and `/btw:summarize`) read from the BTW sub-session thread rather than maintaining a separate manual transcript model
 
 ### In-modal slash behavior
 
