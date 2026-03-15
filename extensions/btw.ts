@@ -45,6 +45,9 @@ const BTW_SYSTEM_PROMPT = [
   "Do not act as if you need to continue unfinished work from the main session unless the user explicitly asks you to prepare something for injection back to it.",
 ].join(" ");
 
+const BTW_CONTINUE_THREAD_USER_TEXT = "[The following is a separate side conversation. Continue this thread.]";
+const BTW_CONTINUE_THREAD_ASSISTANT_TEXT = "Understood, continuing our side conversation.";
+
 type SessionThinkingLevel = "off" | AiThinkingLevel;
 type BtwThreadMode = "contextual" | "tangent";
 
@@ -104,6 +107,7 @@ type BtwSessionRuntime = {
   session: AgentSession;
   mode: BtwThreadMode;
   subscriptions: Set<() => void>;
+  sideThreadStartIndex: number;
 };
 
 type OverlayRuntime = {
@@ -198,23 +202,24 @@ function buildMainMessages(ctx: ExtensionCommandContext): Message[] {
   }
 }
 
-function buildBtwSeedMessages(
+function buildBtwSeedState(
   ctx: ExtensionCommandContext,
   thread: BtwDetails[],
   mode: BtwThreadMode,
-): Message[] {
-  const messages: Message[] = mode === "contextual" ? [...buildMainMessages(ctx)] : [];
+): { messages: Message[]; sideThreadStartIndex: number } {
+  const mainMessages = mode === "contextual" ? buildMainMessages(ctx) : [];
+  const messages: Message[] = [...mainMessages];
 
   if (thread.length > 0) {
     messages.push(
       {
         role: "user",
-        content: [{ type: "text", text: "[The following is a separate side conversation. Continue this thread.]" }],
+        content: [{ type: "text", text: BTW_CONTINUE_THREAD_USER_TEXT }],
         timestamp: Date.now(),
       },
       {
         role: "assistant",
-        content: [{ type: "text", text: "Understood, continuing our side conversation." }],
+        content: [{ type: "text", text: BTW_CONTINUE_THREAD_ASSISTANT_TEXT }],
         provider: ctx.model?.provider ?? "unknown",
         model: ctx.model?.id ?? "unknown",
         api: ctx.model?.api ?? "openai-responses",
@@ -260,7 +265,10 @@ function buildBtwSeedMessages(
     }
   }
 
-  return messages;
+  return {
+    messages,
+    sideThreadStartIndex: mainMessages.length,
+  };
 }
 
 function formatToolPreview(value: unknown): string {
@@ -803,12 +811,71 @@ function getLastAssistantMessage(session: AgentSession): AssistantMessage | null
   return null;
 }
 
+type BtwHandoffExchange = {
+  user: string;
+  assistant: string;
+};
+
 function buildBtwMessageContent(question: string, answer: string): string {
   return `Q: ${question}\n\nA: ${answer}`;
 }
 
-function formatThread(thread: BtwDetails[]): string {
-  return thread.map((entry) => `User: ${entry.question.trim()}\nAssistant: ${entry.answer.trim()}`).join("\n\n---\n\n");
+function formatThread(thread: BtwHandoffExchange[]): string {
+  return thread.map((entry) => `User: ${entry.user.trim()}\nAssistant: ${entry.assistant.trim()}`).join("\n\n---\n\n");
+}
+
+function isThreadContinuationMarker(messages: Message[], index: number): boolean {
+  const userMessage = messages[index];
+  const assistantMessage = messages[index + 1];
+  return (
+    userMessage?.role === "user" &&
+    extractMessageText(userMessage) === BTW_CONTINUE_THREAD_USER_TEXT &&
+    assistantMessage?.role === "assistant" &&
+    extractMessageText(assistantMessage) === BTW_CONTINUE_THREAD_ASSISTANT_TEXT
+  );
+}
+
+function extractBtwHandoffThread(sessionRuntime: BtwSessionRuntime): BtwHandoffExchange[] {
+  const handoffMessages = sessionRuntime.session.state.messages.slice(sessionRuntime.sideThreadStartIndex);
+  const threadMessages = isThreadContinuationMarker(handoffMessages, 0) ? handoffMessages.slice(2) : handoffMessages;
+  const exchanges: BtwHandoffExchange[] = [];
+  let currentUser = "";
+  let currentAssistant = "";
+
+  const pushCurrent = () => {
+    if (!currentUser && !currentAssistant) {
+      return;
+    }
+
+    exchanges.push({
+      user: currentUser.trim() || "(No user prompt)",
+      assistant: currentAssistant.trim() || "(No assistant response)",
+    });
+    currentUser = "";
+    currentAssistant = "";
+  };
+
+  for (const message of threadMessages) {
+    if (message.role !== "user" && message.role !== "assistant") {
+      continue;
+    }
+
+    const text = extractMessageText(message).trim();
+    if (!text) {
+      continue;
+    }
+
+    if (message.role === "user") {
+      pushCurrent();
+      currentUser = text;
+      continue;
+    }
+
+    currentAssistant = currentAssistant ? `${currentAssistant}\n\n${text}` : text;
+  }
+
+  pushCurrent();
+  return exchanges;
 }
 
 function saveVisibleBtwNote(
@@ -1194,12 +1261,12 @@ export default function (pi: ExtensionAPI) {
       resourceLoader: createBtwResourceLoader(ctx),
     });
 
-    const seedMessages = buildBtwSeedMessages(ctx, pendingThread, mode);
+    const { messages: seedMessages, sideThreadStartIndex } = buildBtwSeedState(ctx, pendingThread, mode);
     if (seedMessages.length > 0) {
       session.agent.replaceMessages(seedMessages as typeof session.state.messages);
     }
 
-    return { session, mode, subscriptions: new Set() };
+    return { session, mode, subscriptions: new Set(), sideThreadStartIndex };
   }
 
   async function ensureBtwSession(ctx: ExtensionCommandContext, mode: BtwThreadMode): Promise<BtwSessionRuntime | null> {
@@ -1382,16 +1449,25 @@ export default function (pi: ExtensionAPI) {
         return true;
       }
 
-      const instructions = trimmedArgs;
-      const content = instructions
-        ? `Here is a side conversation I had. ${instructions}\n\n${formatThread(pendingThread)}`
-        : `Here is a side conversation I had for additional context:\n\n${formatThread(pendingThread)}`;
+      setOverlayStatus("⏳ injecting into the main session...", ctx);
+      await ensureOverlay(ctx);
 
-      sendThreadToMain(ctx, content);
-      const count = pendingThread.length;
-      await resetThread(ctx);
-      dismissOverlay();
-      notify(ctx, `Injected BTW thread (${count} exchange${count === 1 ? "" : "s"}).`, "info");
+      try {
+        const { thread } = await getBtwHandoffThread(ctx);
+        const instructions = trimmedArgs;
+        const content = instructions
+          ? `Here is a side conversation I had. ${instructions}\n\n${formatThread(thread)}`
+          : `Here is a side conversation I had for additional context:\n\n${formatThread(thread)}`;
+
+        sendThreadToMain(ctx, content);
+        const count = thread.length;
+        await resetThread(ctx);
+        dismissOverlay();
+        notify(ctx, `Injected BTW thread (${count} exchange${count === 1 ? "" : "s"}).`, "info");
+      } catch (error) {
+        setOverlayStatus("Inject failed. Thread preserved for retry or summarize.", ctx);
+        notify(ctx, error instanceof Error ? error.message : String(error), "error");
+      }
       return true;
     }
 
@@ -1405,14 +1481,15 @@ export default function (pi: ExtensionAPI) {
       await ensureOverlay(ctx);
 
       try {
-        const summary = await summarizeThread(ctx, pendingThread);
+        const { thread } = await getBtwHandoffThread(ctx);
+        const summary = await summarizeThread(ctx, thread);
         const instructions = trimmedArgs;
         const content = instructions
           ? `Here is a summary of a side conversation I had. ${instructions}\n\n${summary}`
           : `Here is a summary of a side conversation I had:\n\n${summary}`;
 
         sendThreadToMain(ctx, content);
-        const count = pendingThread.length;
+        const count = thread.length;
         await resetThread(ctx);
         dismissOverlay();
         notify(ctx, `Injected BTW summary (${count} exchange${count === 1 ? "" : "s"}).`, "info");
@@ -1426,9 +1503,9 @@ export default function (pi: ExtensionAPI) {
     return false;
   }
 
-  function parseOverlaySlashCommand(value: string): { name: string; args: string } | null {
+  function parseOverlayBtwCommand(value: string): { name: string; args: string } | null {
     const trimmed = value.trim();
-    const match = trimmed.match(/^\/(btw(?::(?:new|tangent|clear|inject|summarize))?)(?:\s+(.*))?$/);
+    const match = trimmed.match(/^\/(btw:(?:new|tangent|clear|inject|summarize))(?:\s+(.*))?$/);
     if (!match) {
       return null;
     }
@@ -1451,19 +1528,10 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    const slashCommand = parseOverlaySlashCommand(question);
-
-    if (question.startsWith("/") && !slashCommand) {
-      const message = "Unsupported slash input in BTW. Only /btw, /btw:new, /btw:tangent, /btw:clear, /btw:inject, and /btw:summarize run inside the modal.";
-      setOverlayStatus(message, ctx);
-      notify(ctx, message, "warning");
-      await ensureOverlay(ctx);
-      return;
-    }
-
-    if (slashCommand) {
+    const btwCommand = parseOverlayBtwCommand(question);
+    if (btwCommand) {
       setOverlayDraft("");
-      await dispatchBtwCommand(slashCommand.name, slashCommand.args, ctx);
+      await dispatchBtwCommand(btwCommand.name, btwCommand.args, ctx);
       return;
     }
 
@@ -1623,7 +1691,25 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  async function summarizeThread(ctx: ExtensionCommandContext, thread: BtwDetails[]): Promise<string> {
+  function getPendingThreadForHandoff(): BtwHandoffExchange[] {
+    return pendingThread.map((entry) => ({ user: entry.question, assistant: entry.answer }));
+  }
+
+  async function getBtwHandoffThread(
+    ctx: ExtensionCommandContext,
+  ): Promise<{ sessionRuntime: BtwSessionRuntime | null; thread: BtwHandoffExchange[] }> {
+    const sessionRuntime = activeBtwSession ?? (await ensureBtwSession(ctx, pendingMode));
+    const thread = sessionRuntime ? extractBtwHandoffThread(sessionRuntime) : [];
+    const resolvedThread = thread.length > 0 ? thread : getPendingThreadForHandoff();
+
+    if (resolvedThread.length === 0) {
+      throw new Error("No BTW thread available for handoff.");
+    }
+
+    return { sessionRuntime, thread: resolvedThread };
+  }
+
+  async function summarizeThread(ctx: ExtensionCommandContext, thread: BtwHandoffExchange[]): Promise<string> {
     const model = ctx.model;
     if (!model) {
       throw new Error("No active model selected.");

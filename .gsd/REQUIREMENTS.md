@@ -47,38 +47,6 @@ Guidelines:
 - Validation: mapped
 - Notes: Escape must still dismiss quickly.
 
-### R015 — Full parity with all main-session slash commands inside BTW
-- Class: differentiator
-- Status: active
-- Description: BTW behaves like a complete second command surface with parity to the main input for all slash commands.
-- Why it matters: This could make BTW more powerful for advanced workflows.
-- Source: user
-- Primary owning slice: M002
-- Supporting slices: none
-- Validation: mapped
-- Notes: Sub-session backed by AgentSession.prompt() routes all slash commands through the same dispatch path as the main session.
-
-### R021 — BTW runs parallel to the main session
-- Class: differentiator
-- Status: active
-- Description: The main session continues accepting input and streaming while BTW is open and actively running tools.
-- Why it matters: True parallel execution lets the user keep working without pausing for BTW.
-- Source: user
-- Primary owning slice: M002
-- Supporting slices: none
-- Validation: mapped
-- Notes: No guardrails for concurrent file access — user's responsibility.
-
-### R022 — BTW overlay renders full tool-call/result transcript
-- Class: primary-user-loop
-- Status: active
-- Description: The BTW overlay shows tool calls and their results inline, like a real mini-session transcript, not just question/answer text.
-- Why it matters: With full tools, the user needs visibility into what BTW is doing.
-- Source: user
-- Primary owning slice: M002
-- Supporting slices: none
-- Validation: mapped
-- Notes: Compact rendering appropriate for overlay size.
 
 ## Validated
 
@@ -225,6 +193,39 @@ Guidelines:
 - Validation: proven by `tests/btw.runtime.test.ts` asserting BTW calls `createAgentSession()` with `SessionManager.inMemory()` and by lifecycle assertions showing Escape, `/btw:clear`, and replacement flows abort/dispose the live sub-session instead of leaving durable session artifacts behind.
 - Notes: Within a single pi run, sub-session state lives in memory. Dismiss and reopen creates a fresh sub-session.
 
+### R015 — Full parity with all main-session slash commands inside BTW
+- Class: differentiator
+- Status: validated
+- Description: BTW behaves like a complete second command surface with parity to the main input for all slash commands.
+- Why it matters: This could make BTW more powerful for advanced workflows.
+- Source: user
+- Primary owning slice: M002/S03
+- Supporting slices: none
+- Validation: proven by `tests/btw.runtime.test.ts` asserting non-BTW slash input in the overlay routes through the BTW sub-session `prompt()` path without modal-local fallback warnings, while BTW-owned lifecycle/handoff commands keep their documented interception semantics.
+- Notes: BTW-owned lifecycle and handoff commands remain intercepted in the overlay because they control BTW state or cross the session boundary.
+
+### R021 — BTW runs parallel to the main session
+- Class: differentiator
+- Status: validated
+- Description: The main session continues accepting input and streaming while BTW is open and actively running tools.
+- Why it matters: True parallel execution lets the user keep working without pausing for BTW.
+- Source: user
+- Primary owning slice: M002/S03
+- Supporting slices: none
+- Validation: proven by `tests/btw.runtime.test.ts` asserting the overlay submit path is fire-and-forget, the BTW sub-session remains streaming, and a simulated main-session input flips its own idle state independently before the BTW turn completes.
+- Notes: No guardrails for concurrent file access — user's responsibility.
+
+### R022 — BTW overlay renders full tool-call/result transcript
+- Class: primary-user-loop
+- Status: validated
+- Description: The BTW overlay shows tool calls and their results inline, like a real mini-session transcript, not just question/answer text.
+- Why it matters: With full tools, the user needs visibility into what BTW is doing.
+- Source: user
+- Primary owning slice: M002/S02
+- Supporting slices: M002/S03
+- Validation: proven by `tests/btw.runtime.test.ts` assertions that inspect `BtwOverlayComponent.getTranscriptEntries()` for streaming text, tool calls/results, and failure state, rechecked in S03 by the transcript-inspection/failure-path verification commands.
+- Notes: Compact rendering appropriate for overlay size.
+
 ## Deferred
 
 ### R016 — BTW becomes a true embedded second session/workspace
@@ -291,19 +292,19 @@ Guidelines:
 | R012 | differentiator | validated | M001/S04 | none | proven |
 | R013 | quality-attribute | validated | M001/S04 | M001/S01 | proven |
 | R014 | constraint | validated | M001/S02 | M001/S03 | proven |
-| R015 | differentiator | active | M002 | none | mapped |
+| R015 | differentiator | validated | M002/S03 | none | proven |
 | R016 | differentiator | deferred | none | none | unmapped |
 | R017 | anti-feature | out-of-scope | none | none | n/a |
 | R018 | anti-feature | out-of-scope | none | none | n/a |
 | R019 | anti-feature | out-of-scope | none | none | n/a |
 | R020 | primary-user-loop | validated | M002/S01 | none | proven |
-| R021 | differentiator | active | M002 | none | mapped |
-| R022 | primary-user-loop | active | M002 | none | mapped |
+| R021 | differentiator | validated | M002/S03 | none | proven |
+| R022 | primary-user-loop | validated | M002/S02 | M002/S03 | proven |
 | R023 | quality-attribute | validated | M002/S01 | none | proven |
 
 ## Coverage Summary
 
-- Active requirements: 6
-- Mapped to slices: 18
-- Validated: 13
+- Active requirements: 3
+- Mapped to slices: 19
+- Validated: 16
 - Unmapped active requirements: 0

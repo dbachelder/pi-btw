@@ -104,14 +104,14 @@ pi install /absolute/path/to/pi-btw
 
 ### In-modal slash behavior
 
-Inside the BTW modal composer, slash handling is intentionally narrow:
+Inside the BTW modal composer, slash handling is split at the BTW/session boundary:
 
-- `/btw`, `/btw:new`, `/btw:tangent`, `/btw:clear`, `/btw:inject`, and `/btw:summarize` run inside the modal
-- those in-modal slash commands reuse the same BTW command semantics as the registered slash commands
-- unsupported slash input does **not** run as a main-session command and is **not** sent to the BTW model as chat text
-- instead, BTW surfaces a warning that only BTW-scoped slash commands run inside the modal
+- `/btw:new`, `/btw:tangent`, `/btw:clear`, `/btw:inject`, and `/btw:summarize` stay owned by BTW because they control BTW lifecycle or handoff behavior
+- any other slash-prefixed input is routed through the BTW sub-session's normal `prompt()` path
+- this means ordinary pi slash commands like `/help` are handled by the sub-session instead of being rejected by a modal-only fallback
+- if the sub-session cannot handle a slash command, BTW surfaces the real sub-session failure through the transcript/status state instead of inventing an "unsupported slash input" warning
 
-This keeps the modal lightweight without pretending it has full parity with the main pi command surface.
+This keeps BTW-owned lifecycle commands explicit while giving the side conversation the same slash-command surface as the underlying sub-session.
 
 ## Behavior
 

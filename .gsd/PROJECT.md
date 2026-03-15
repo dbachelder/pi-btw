@@ -10,7 +10,7 @@ A user can open BTW instantly, ask and continue a side conversation in place wit
 
 ## Current State
 
-M001 is complete, and M002/S01 is now complete. `extensions/btw.ts` no longer drives BTW through manual `streamSimple()` / `completeSimple()` calls; it now opens BTW on a real in-memory `AgentSession` sub-session created with `createAgentSession()` + `SessionManager.inMemory()`, reusing the main session's model/model registry and enabling `codingTools`. BTW prompts now route through `session.prompt()`, contextual mode seeds main-session messages into the sub-session, tangent mode recreates a clean sub-session, and Escape / `/btw:clear` / replacement flows abort and dispose the live sub-session cleanly. The overlay still renders through a simplified text bridge fed by `session.subscribe()` events; rich event-transcript rendering, broader slash dispatch, and explicit parallel-execution proof are the next M002 slices.
+M001 is complete, and M002 is through S03. `extensions/btw.ts` now runs BTW on a real in-memory `AgentSession` sub-session created with `createAgentSession()` + `SessionManager.inMemory()`, reuses the main session's model/model registry, enables `codingTools`, renders the overlay transcript from agent events, routes non-BTW slash input through the sub-session `prompt()` path, and extracts inject/summarize handoff content from real sub-session message history instead of manual pending-thread state. Runtime proof in `tests/btw.runtime.test.ts` now shows the BTW sub-session can keep streaming while the main session accepts new input independently. The remaining M002 work is S04 contract hardening/cleanup and removal of any dead M001-era plumbing.
 
 ## Architecture / Key Patterns
 
@@ -34,6 +34,6 @@ See `.gsd/REQUIREMENTS.md` for the explicit capability contract, requirement sta
   - [x] S04: Slash-command support and graceful fallback
 - [ ] M002: BTW sub-session — Replace BTW's manual stream/context plumbing with a real `AgentSession` sub-session backed by `createAgentSession()`, giving BTW full tools, native slash commands, and parallel execution.
   - [x] S01: Sub-session lifecycle and agent loop
-  - [ ] S02: Overlay transcript rendering from agent events
-  - [ ] S03: Slash commands, handoff, and parallel execution
+  - [x] S02: Overlay transcript rendering from agent events
+  - [x] S03: Slash commands, handoff, and parallel execution
   - [ ] S04: Contract hardening and cleanup

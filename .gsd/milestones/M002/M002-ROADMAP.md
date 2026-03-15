@@ -59,7 +59,7 @@ This milestone is complete only when all are true:
 - [x] **S02: Overlay transcript rendering from agent events** `risk:medium` `depends:[S01]`
   > After this: user sees tool calls, tool results, thinking, and assistant streaming rendered inline in the BTW overlay as the sub-session executes — a real mini-session transcript instead of simple Q&A slots.
 
-- [ ] **S03: Slash commands, handoff, and parallel execution** `risk:medium` `depends:[S01]`
+- [x] **S03: Slash commands, handoff, and parallel execution** `risk:medium` `depends:[S01]`
   > After this: user can type slash commands in BTW that route through the sub-session, use inject/summarize to hand content back to the main session, and the main session continues working while BTW runs in parallel.
 
 - [ ] **S04: Contract hardening and cleanup** `risk:low` `depends:[S01,S02,S03]`
