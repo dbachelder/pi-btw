@@ -708,7 +708,7 @@ function buildOverlayTranscript(entries: BtwTranscript, theme: ExtensionContext[
   const assistantBadge = buildTranscriptBadge(theme, "Assistant", "customMessageBg", "success");
   const separator = theme.fg("borderMuted", "────────────────────────────────────────");
   const blockIndent = "    ";
-  const resultIndent = "      ";
+  const resultIndent = blockIndent;
 
   const pushBlankLine = () => {
     if (lines.length > 0 && lines[lines.length - 1] !== "") {
@@ -788,7 +788,7 @@ function buildOverlayTranscript(entries: BtwTranscript, theme: ExtensionContext[
           ? theme.fg("warning", "↳ streaming result")
           : theme.fg("dim", "↳ result");
       const truncationLabel = entry.truncated ? theme.fg("dim", " (truncated)") : "";
-      pushStackedBlock(`${blockIndent}${resultHeaderLabel}${truncationLabel}`, entry.content, {
+      pushStackedBlock(`${resultHeaderLabel}${truncationLabel}`, entry.content, {
         blankBefore: false,
         indent: resultIndent,
         style: (line) => (entry.isError ? theme.fg("error", line) : theme.fg("dim", line)),
@@ -1007,11 +1007,17 @@ class BtwOverlayComponent extends Container implements Focusable {
   private frameLine(content: string, innerWidth: number): string {
     const truncated = truncateToWidth(content, innerWidth, "");
     const padding = Math.max(0, innerWidth - visibleWidth(truncated));
-    return `${this.theme.fg("borderMuted", "│")} ${truncated}${" ".repeat(padding)} ${this.theme.fg("borderMuted", "│")}`;
+    return `${this.theme.fg("borderMuted", "│")}${truncated}${" ".repeat(padding)}${this.theme.fg("borderMuted", "│")}`;
   }
 
   private ruleLine(innerWidth: number): string {
-    return this.theme.fg("borderMuted", `├${"─".repeat(innerWidth + 2)}┤`);
+    return this.theme.fg("borderMuted", `├${"─".repeat(innerWidth)}┤`);
+  }
+
+  private borderLine(innerWidth: number, edge: "top" | "bottom"): string {
+    const left = edge === "top" ? "┌" : "└";
+    const right = edge === "top" ? "┐" : "┘";
+    return this.theme.fg("borderMuted", `${left}${"─".repeat(innerWidth)}${right}`);
   }
 
   private wrapTranscript(innerWidth: number): string[] {
@@ -1048,14 +1054,31 @@ class BtwOverlayComponent extends Container implements Focusable {
     this.input.handleInput(data);
   }
 
+  private inputFrameLine(dialogWidth: number): string {
+    const targetWidth = Math.max(1, dialogWidth - 2);
+    const previousFocused = this.input.focused;
+    // Input.render() emits CURSOR_MARKER when focused. In overlay mode that APC marker
+    // can skew width/composition on this one row before the TUI strips it, producing a
+    // right-edge notch and shifted border. Render the embedded input unfocused here so
+    // the row stays geometrically stable while the overlay still owns keyboard input.
+    this.input.focused = false;
+    try {
+      const inputLine = this.input.render(targetWidth)[0] ?? "";
+      return `${this.theme.fg("borderMuted", "│")}${inputLine}${this.theme.fg("borderMuted", "│")}`;
+    } finally {
+      this.input.focused = previousFocused;
+    }
+  }
+
   override render(width: number): string[] {
     const dialogWidth = Math.max(24, width);
-    const innerWidth = Math.max(20, dialogWidth - 4);
+    const innerWidth = Math.max(22, dialogWidth - 2);
+    const transcriptLines = this.wrapTranscript(innerWidth);
     const dialogHeight = this.getDialogHeight();
-    const transcriptHeight = Math.max(6, dialogHeight - 8);
+    const chromeHeight = 8;
+    const transcriptHeight = Math.max(6, dialogHeight - chromeHeight);
     this.transcriptViewportHeight = transcriptHeight;
 
-    const transcriptLines = this.wrapTranscript(innerWidth);
     const maxScroll = Math.max(0, transcriptLines.length - transcriptHeight);
     if (this.followTranscript) {
       this.transcriptScrollOffset = maxScroll;
@@ -1078,8 +1101,7 @@ class BtwOverlayComponent extends Container implements Focusable {
         ? `${this.summaryText.text.trim()} · ↑${hiddenAbove} ↓${hiddenBelow}`
         : this.summaryText.text.trim();
 
-    const inputLine = this.input.render(innerWidth)[0] ?? "";
-    const lines = [this.theme.fg("accent", `┌${"─".repeat(innerWidth + 2)}┐`)];
+    const lines = [this.borderLine(innerWidth, "top")];
 
     lines.push(this.frameLine(this.theme.fg("accent", this.theme.bold(this.modeText.text.trim())), innerWidth));
     lines.push(this.frameLine(this.theme.fg("dim", summary), innerWidth));
@@ -1094,9 +1116,9 @@ class BtwOverlayComponent extends Container implements Focusable {
 
     lines.push(this.ruleLine(innerWidth));
     lines.push(this.frameLine(this.theme.fg("warning", this.statusText.text.trim()), innerWidth));
-    lines.push(this.frameLine(inputLine, innerWidth));
+    lines.push(this.inputFrameLine(dialogWidth));
     lines.push(this.frameLine(this.theme.fg("dim", this.hintsText.text.trim()), innerWidth));
-    lines.push(this.theme.fg("accent", `└${"─".repeat(innerWidth + 2)}┘`));
+    lines.push(this.borderLine(innerWidth, "bottom"));
 
     return lines;
   }
@@ -1343,15 +1365,14 @@ export default function (pi: ExtensionAPI) {
             },
           );
 
+          overlay.focused = runtime.handle?.isFocused() ?? true;
           overlay.setDraft(overlayDraft);
           runtime.setDraft = (value) => {
             overlay.setDraft(value);
           };
           runtime.refresh = () => {
+            overlay.focused = runtime.handle?.isFocused() ?? false;
             overlay.refresh();
-            if (!runtime.handle?.isFocused()) {
-              overlay.focused = false;
-            }
           };
           runtime.close = () => {
             overlayDraft = overlay.getDraft();

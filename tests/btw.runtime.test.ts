@@ -1026,6 +1026,7 @@ describe("btw runtime behavior", () => {
     expect(transcript).toContain("↳ result");
     expect(transcript).toContain("(truncated)");
     expect(transcript).toContain("line 1");
+    expect(transcript).toContain("    <fg:dim>line 1</fg:dim>");
     expect(transcript).toContain("────────────────");
     expect(transcript).toContain("second question");
     expect(transcript).toContain("Second answer");
@@ -1164,6 +1165,18 @@ describe("btw runtime behavior", () => {
     expect(harness.widgets.some((entry) => entry.key === "btw" && typeof entry.content === "function")).toBe(false);
   });
 
+  it("marks the overlay input focused when BTW opens so the cursor stays in the composer", async () => {
+    const harness = createHarness();
+
+    await harness.runSessionStart();
+    await harness.command("btw", "");
+
+    const overlay = harness.latestOverlayComponent();
+    expect(harness.overlayHandles.at(-1)?.isFocused()).toBe(true);
+    expect(overlay.focused).toBe(true);
+    expect(overlay.input.focused).toBe(true);
+  });
+
   it("forwards terminal input from the focused overlay to the embedded BTW input", async () => {
     const harness = createHarness();
 
@@ -1178,7 +1191,7 @@ describe("btw runtime behavior", () => {
     expect(inputHandleSpy).toHaveBeenCalledWith("abc");
   });
 
-  it("renders BTW as a bordered fixed-height dialog with an internal transcript viewport", async () => {
+  it("renders BTW as a bordered dialog with an internal transcript viewport", async () => {
     const harness = createHarness();
     const longAnswer = Array.from({ length: 24 }, (_, index) => `line ${index + 1} of a long answer`).join("\n");
 
@@ -1202,6 +1215,43 @@ describe("btw runtime behavior", () => {
     expect(secondRender[0]).toContain("┌");
     expect(secondRender.at(-1)).toContain("└");
     expect(firstRender.length).toBe(secondRender.length);
+  });
+
+  it("keeps the BTW modal at a fixed reading height, uses one frame color, and preserves stacked body indentation", async () => {
+    const harness = createHarness([], {
+      theme: {
+        fg: (name: string, text: string) => `<fg:${name}>${text}</fg:${name}>`,
+        bg: (name: string, text: string) => `<bg:${name}>${text}</bg:${name}>`,
+        italic: (text: string) => `<italic>${text}</italic>`,
+        bold: (text: string) => `<bold>${text}</bold>`,
+      },
+    });
+    promptStreamMock.mockImplementationOnce(() => streamAnswer("First answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "");
+
+    const overlay = harness.latestOverlayComponent();
+    const emptyLines = overlay.render(80);
+
+    overlay.input.onSubmit?.("first question");
+    await flushAsyncWork();
+
+    const populatedLines = overlay.render(80);
+    const emptyStateLine = emptyLines.find((line: string) => line.includes("No BTW thread yet."));
+    const inputLine = populatedLines.at(-3);
+    const assistantBodyLine = populatedLines.find((line: string) => line.includes("First answer"));
+
+    expect(emptyLines.length).toBe(populatedLines.length);
+    expect(emptyLines[0]).toContain("<fg:borderMuted>┌");
+    expect(emptyLines[0]).not.toContain("<fg:accent>┌");
+    expect(emptyLines.at(-1)).toContain("<fg:borderMuted>└");
+    expect(emptyLines.at(-1)).not.toContain("<fg:accent>└");
+    expect(emptyStateLine).toContain("<fg:borderMuted>│</fg:borderMuted><fg:dim>No BTW thread yet.");
+    expect(emptyStateLine).not.toContain("<fg:borderMuted>│</fg:borderMuted> <fg:dim>No BTW thread yet.");
+    expect(assistantBodyLine).toContain("<fg:borderMuted>│</fg:borderMuted>    First answer");
+    expect(inputLine).toContain("<fg:borderMuted>│</fg:borderMuted>> ");
+    expect(inputLine).not.toContain("\x1b_pi:c\x07");
   });
 
   it("/btw:new appends a reset marker, disposes the old sub-session, clears prior hidden thread state, stays contextual, and reopens a fresh thread", async () => {
