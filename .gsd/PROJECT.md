@@ -2,7 +2,7 @@
 
 ## What This Is
 
-pi-btw is a pi extension that adds a BTW side-conversation workflow. It now ships a lightweight embedded BTW modal chat that lets the user hold a real multi-turn side conversation over the active session while keeping the hidden BTW thread separate from the main session context.
+pi-btw is a pi extension that adds a BTW side-conversation workflow. It now ships a lightweight embedded BTW modal chat that lets the user hold a real side conversation over the active session while keeping BTW separate from the main session.
 
 ## Core Value
 
@@ -10,11 +10,16 @@ A user can open BTW instantly, ask and continue a side conversation in place wit
 
 ## Current State
 
-M001 is complete. `extensions/btw.ts` now opens BTW as a focused overlay with its own composer, transcript, streamed status text, follow-up submission path, inject/summarize handoff commands, Escape dismissal, and BTW-scoped in-modal slash support for `/btw`, `/btw:new`, `/btw:tangent`, `/btw:clear`, `/btw:inject`, and `/btw:summarize`. Unsupported slash input inside the modal degrades intentionally with a BTW-local warning instead of pretending full main-input parity. Hidden custom session entries and reset markers still authoritatively govern `/btw`, `/btw:new`, `/btw:clear`, `/btw:tangent`, restore behavior, explicit handoff clearing, and main-context filtering, while busy main-session handoff remains explicitly queued as follow-up work rather than interrupting visible work. The above-editor widget remains as a lightweight mirror, not the primary interaction surface.
+M001 is complete, and M002/S01 is now complete. `extensions/btw.ts` no longer drives BTW through manual `streamSimple()` / `completeSimple()` calls; it now opens BTW on a real in-memory `AgentSession` sub-session created with `createAgentSession()` + `SessionManager.inMemory()`, reusing the main session's model/model registry and enabling `codingTools`. BTW prompts now route through `session.prompt()`, contextual mode seeds main-session messages into the sub-session, tangent mode recreates a clean sub-session, and Escape / `/btw:clear` / replacement flows abort and dispose the live sub-session cleanly. The overlay still renders through a simplified text bridge fed by `session.subscribe()` events; rich event-transcript rendering, broader slash dispatch, and explicit parallel-execution proof are the next M002 slices.
 
 ## Architecture / Key Patterns
 
-The extension is self-contained. BTW state is persisted via hidden custom session entries and rendered through extension UI hooks. Commands like `/btw`, `/btw:new`, `/btw:tangent`, `/btw:inject`, and `/btw:summarize` define the user contract. The main architectural constraint is to preserve the current BTW contract while replacing the interaction surface with a faster, more interactive modal chat flow.
+The extension remains self-contained, but BTW now has a split runtime model:
+
+- the **BTW overlay contract** still lives in the extension UI/hooks and preserves the documented `/btw`, `/btw:new`, `/btw:clear`, `/btw:tangent`, inject, and summarize semantics
+- the **BTW agent loop** now runs on a disposable in-memory `AgentSession` sub-session with coding tools and mode-aware seeded messages
+- the **current overlay transcript** is still a compatibility bridge that compresses `AgentSession` events into simplified BTW slots until S02 replaces it with richer event-native rendering
+- the **lifecycle contract** now centers on a shared dispose helper that unsubscribes listeners, aborts in-flight work, and disposes the sub-session before reset or replacement
 
 ## Capability Contract
 
@@ -27,4 +32,8 @@ See `.gsd/REQUIREMENTS.md` for the explicit capability contract, requirement sta
   - [x] S02: BTW contract preservation
   - [x] S03: Explicit handoff and background-session integration
   - [x] S04: Slash-command support and graceful fallback
-- [ ] M002: BTW sub-session — Replace BTW's manual stream/context plumbing with a real AgentSession sub-session backed by createAgentSession(), giving BTW full tools, native slash commands, and parallel execution.
+- [ ] M002: BTW sub-session — Replace BTW's manual stream/context plumbing with a real `AgentSession` sub-session backed by `createAgentSession()`, giving BTW full tools, native slash commands, and parallel execution.
+  - [x] S01: Sub-session lifecycle and agent loop
+  - [ ] S02: Overlay transcript rendering from agent events
+  - [ ] S03: Slash commands, handoff, and parallel execution
+  - [ ] S04: Contract hardening and cleanup

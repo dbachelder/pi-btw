@@ -2,9 +2,19 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, RegisteredCommand } from "@mariozechner/pi-coding-agent";
 import btwExtension from "../extensions/btw";
 
-const { streamSimpleMock, completeSimpleMock } = vi.hoisted(() => ({
+const { streamSimpleMock, completeSimpleMock, createAgentSessionMock, sessionManagerInMemoryMock, subSessionRecords } = vi.hoisted(() => ({
   streamSimpleMock: vi.fn(),
   completeSimpleMock: vi.fn(),
+  createAgentSessionMock: vi.fn(),
+  sessionManagerInMemoryMock: vi.fn(() => ({ type: "in-memory-session" })),
+  subSessionRecords: [] as Array<{
+    options: any;
+    session: any;
+    seedMessages: any[];
+    promptCalls: Array<{ text: string; context: StreamContext }>;
+    getListenerCount: () => number;
+    getIsStreaming: () => boolean;
+  }>,
 }));
 
 vi.mock("@mariozechner/pi-ai", async () => {
@@ -16,13 +26,33 @@ vi.mock("@mariozechner/pi-ai", async () => {
   };
 });
 
+vi.mock("@mariozechner/pi-coding-agent", async () => {
+  const actual = await vi.importActual<typeof import("@mariozechner/pi-coding-agent")>("@mariozechner/pi-coding-agent");
+  return {
+    ...actual,
+    createAgentSession: createAgentSessionMock,
+    SessionManager: {
+      ...actual.SessionManager,
+      inMemory: sessionManagerInMemoryMock,
+    },
+  };
+});
+
 type CustomEntry = { type: "custom"; customType: string; data?: unknown };
 type SessionEntry = CustomEntry | { type: string; role?: string; customType?: string; content?: unknown; [key: string]: unknown };
 
 type StreamContext = {
   systemPrompt: string;
-  messages: Array<{ role: string; content: Array<{ type: string; text?: string }> }>;
+  messages: Array<{ role: string; content: Array<{ type: string; text?: string; thinking?: string }> }>;
 };
+
+type PromptStreamEvent =
+  | { type: "thinking_delta"; delta: string }
+  | { type: "text_delta"; delta: string }
+  | { type: "tool_execution_start"; toolName: string; args?: unknown }
+  | { type: "tool_execution_end"; toolName: string; result?: unknown; isError?: boolean }
+  | { type: "done"; message: ReturnType<typeof makeAssistantMessage> }
+  | { type: "error"; error: ReturnType<typeof makeAssistantMessage> };
 
 class FakeOverlayHandle {
   hidden = false;
@@ -127,6 +157,185 @@ async function* streamAnswer(answer: string) {
   yield { type: "text_delta" as const, delta: answer.slice(0, Math.max(1, Math.floor(answer.length / 2))) };
   yield { type: "text_delta" as const, delta: answer.slice(Math.max(1, Math.floor(answer.length / 2))) };
   yield { type: "done" as const, message: makeAssistantMessage(answer) };
+}
+
+function createBlockingToolStream() {
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+
+  return {
+    release,
+    stream: async function* () {
+      yield { type: "tool_execution_start" as const, toolName: "read", args: { path: "package.json" } };
+      await blocked;
+      yield {
+        type: "error" as const,
+        error: {
+          ...makeAssistantMessage(""),
+          stopReason: "aborted" as const,
+        },
+      };
+    },
+  };
+}
+
+function buildAssistantContent(thinking: string, answer: string) {
+  const content: Array<{ type: "thinking"; thinking: string } | { type: "text"; text: string }> = [];
+  if (thinking) {
+    content.push({ type: "thinking", thinking });
+  }
+  if (answer) {
+    content.push({ type: "text", text: answer });
+  }
+  return content;
+}
+
+function buildMockSystemPrompt(options: any): string {
+  const systemPrompt = options.resourceLoader?.getSystemPrompt?.();
+  const appendSystemPrompt = options.resourceLoader?.getAppendSystemPrompt?.() ?? [];
+  return [systemPrompt, ...appendSystemPrompt].filter(Boolean).join("\n\n");
+}
+
+function createMockAgentSession(options: any) {
+  const listeners = new Set<(event: any) => void>();
+  let seedMessages: any[] = [];
+  let stateMessages: any[] = [];
+  let isStreaming = false;
+
+  const emit = (event: any) => {
+    for (const listener of listeners) {
+      listener(event);
+    }
+  };
+
+  const record = {
+    options,
+    seedMessages,
+    promptCalls: [] as Array<{ text: string; context: StreamContext }>,
+    getListenerCount: () => listeners.size,
+    getIsStreaming: () => isStreaming,
+    session: null as any,
+  };
+
+  const session = {
+    agent: {
+      replaceMessages: vi.fn((messages: any[]) => {
+        seedMessages = messages.map((message) => structuredClone(message));
+        stateMessages = seedMessages.map((message) => structuredClone(message));
+        record.seedMessages = seedMessages;
+      }),
+    },
+    state: {
+      get messages() {
+        return stateMessages;
+      },
+      model: options.model,
+      tools: (options.tools ?? []).map((tool: any) => ({ name: tool.name })),
+    },
+    get model() {
+      return options.model;
+    },
+    get isStreaming() {
+      return isStreaming;
+    },
+    subscribe: vi.fn((listener: (event: any) => void) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    }),
+    prompt: vi.fn(async (text: string) => {
+      const userMessage = {
+        role: "user",
+        content: [{ type: "text" as const, text }],
+        timestamp: Date.now(),
+      };
+      const context: StreamContext = {
+        systemPrompt: buildMockSystemPrompt(options),
+        messages: [...stateMessages.map((message) => structuredClone(message)), userMessage],
+      };
+      record.promptCalls.push({ text, context });
+
+      emit({ type: "message_start", message: userMessage });
+      emit({ type: "message_end", message: userMessage });
+
+      const stream = streamSimpleMock(options.model, context, { session: "btw-sub-session" }) as AsyncIterable<PromptStreamEvent>;
+      let assistantStarted = false;
+      let thinking = "";
+      let answer = "";
+      let finalMessage: ReturnType<typeof makeAssistantMessage> | null = null;
+
+      const emitAssistantUpdate = (assistantMessageEvent: PromptStreamEvent) => {
+        const assistantMessage = {
+          ...makeAssistantMessage(answer),
+          content: buildAssistantContent(thinking, answer),
+        };
+
+        if (!assistantStarted) {
+          assistantStarted = true;
+          emit({ type: "message_start", message: assistantMessage });
+        }
+
+        emit({ type: "message_update", message: assistantMessage, assistantMessageEvent });
+      };
+
+      isStreaming = true;
+      for await (const event of stream) {
+        if (event.type === "thinking_delta") {
+          thinking += event.delta;
+          emitAssistantUpdate(event);
+          continue;
+        }
+
+        if (event.type === "text_delta") {
+          answer += event.delta;
+          emitAssistantUpdate(event);
+          continue;
+        }
+
+        if (event.type === "tool_execution_start") {
+          emit({ type: "tool_execution_start", toolCallId: `call-${record.promptCalls.length}`, toolName: event.toolName, args: event.args ?? {} });
+          continue;
+        }
+
+        if (event.type === "tool_execution_end") {
+          emit({
+            type: "tool_execution_end",
+            toolCallId: `call-${record.promptCalls.length}`,
+            toolName: event.toolName,
+            result: event.result,
+            isError: event.isError ?? false,
+          });
+          continue;
+        }
+
+        finalMessage = event.type === "done" ? event.message : event.error;
+      }
+      isStreaming = false;
+
+      if (!finalMessage) {
+        finalMessage = makeAssistantMessage(answer);
+      }
+
+      if (!assistantStarted) {
+        emit({ type: "message_start", message: finalMessage });
+      }
+      emit({ type: "message_end", message: finalMessage });
+      stateMessages = [...context.messages.map((message) => structuredClone(message)), structuredClone(finalMessage)];
+    }),
+    abort: vi.fn(async () => {
+      isStreaming = false;
+    }),
+    dispose: vi.fn(() => {
+      listeners.clear();
+    }),
+    bindExtensions: vi.fn(),
+    getActiveToolNames: vi.fn(() => (options.tools ?? []).map((tool: any) => tool.name)),
+  };
+
+  record.session = session;
+  subSessionRecords.push(record);
+  return { session, extensionsResult: { extensions: [], errors: [], runtime: {} } };
 }
 
 async function flushAsyncWork() {
@@ -336,9 +545,162 @@ describe("btw runtime behavior", () => {
   beforeEach(() => {
     streamSimpleMock.mockReset();
     completeSimpleMock.mockReset();
+    createAgentSessionMock.mockReset();
+    sessionManagerInMemoryMock.mockClear();
+    subSessionRecords.length = 0;
+
+    createAgentSessionMock.mockImplementation(async (options: any) => createMockAgentSession(options));
     streamSimpleMock.mockImplementation((_model: unknown, context: StreamContext) => {
       return streamAnswer(`default:${(context.messages.at(-1)?.content[0] as any)?.text ?? ""}`);
     });
+  });
+
+  it("creates a BTW sub-session with an in-memory session manager, coding tools, and BTW system prompt", async () => {
+    const harness = createHarness();
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(1);
+    expect(sessionManagerInMemoryMock).toHaveBeenCalledTimes(1);
+
+    const options = createAgentSessionMock.mock.calls[0][0];
+    expect(options.model).toBe(harness.baseCtx.model);
+    expect(options.modelRegistry).toBe(harness.baseCtx.modelRegistry);
+    expect(options.tools.map((tool: any) => tool.name)).toEqual(["read", "bash", "edit", "write"]);
+    expect(options.resourceLoader.getAppendSystemPrompt()[0]).toContain(
+      "You are having an aside conversation with the user, separate from their main working session.",
+    );
+
+    const subSession = subSessionRecords[0]?.session;
+    expect(subSession).toBeDefined();
+    expect(subSession.bindExtensions).not.toHaveBeenCalled();
+    expect(subSession.getActiveToolNames()).toEqual(["read", "bash", "edit", "write"]);
+    expect(subSession.prompt).toHaveBeenCalledWith("first question", { source: "extension" });
+  });
+
+  it("contextual BTW seeds the sub-session with main-session messages but excludes visible BTW notes", async () => {
+    const harness = createHarness([
+      {
+        type: "custom",
+        role: "custom",
+        customType: "btw-note",
+        content: "saved btw note",
+      } as SessionEntry,
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "text", text: "main session task" }],
+        timestamp: Date.now(),
+      } as SessionEntry,
+      {
+        type: "message",
+        role: "assistant",
+        content: [{ type: "text", text: "main session answer" }],
+        timestamp: Date.now(),
+      } as SessionEntry,
+    ]);
+
+    await harness.runSessionStart();
+    await harness.command("btw", "contextual start");
+
+    const seedTexts = subSessionRecords[0].seedMessages.map((message) => (message.content[0] as any)?.text ?? "");
+    expect(seedTexts).toContain("main session task");
+    expect(seedTexts).toContain("main session answer");
+    expect(seedTexts).not.toContain("saved btw note");
+  });
+
+  it("switching to tangent recreates the sub-session without inherited main-session context", async () => {
+    const harness = createHarness([
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "text", text: "main session task" }],
+        timestamp: Date.now(),
+      } as SessionEntry,
+    ]);
+
+    await harness.runSessionStart();
+    await harness.command("btw", "contextual start");
+    const contextualRecord = subSessionRecords[0];
+    expect(contextualRecord.seedMessages.map((message) => (message.content[0] as any)?.text ?? "")).toContain(
+      "main session task",
+    );
+
+    await harness.command("btw:tangent", "tangent start");
+
+    const tangentRecord = subSessionRecords[1];
+    expect(tangentRecord.session).not.toBe(contextualRecord.session);
+    expect(contextualRecord.session.abort).toHaveBeenCalledTimes(1);
+    expect(contextualRecord.session.dispose).toHaveBeenCalledTimes(1);
+    expect(tangentRecord.seedMessages.map((message) => (message.content[0] as any)?.text ?? "")).not.toContain(
+      "main session task",
+    );
+  });
+
+  it("preserves BTW overlay recoverability after agent prompt failure", async () => {
+    const harness = createHarness();
+    streamSimpleMock
+      .mockImplementationOnce(async function* () {
+        yield {
+          type: "error" as const,
+          error: {
+            ...makeAssistantMessage(""),
+            stopReason: "error" as const,
+            errorMessage: "Sub-session prompt exploded",
+          },
+        };
+      })
+      .mockImplementationOnce(() => streamAnswer("Recovered answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "broken question");
+
+    const overlay = harness.latestOverlayComponent();
+    expect(overlay.statusText.text).toContain("Request failed. Thread preserved for retry or follow-up.");
+    expect(transcriptText(overlay)).toContain("❌ Sub-session prompt exploded");
+    expect(harness.notifications.at(-1)).toEqual({
+      message: "Sub-session prompt exploded",
+      type: "error",
+    });
+    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(0);
+
+    overlay.input.onSubmit?.("retry question");
+    await flushAsyncWork();
+
+    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(1);
+    expect(transcriptText(overlay)).toContain("Recovered answer");
+    expect(overlay.statusText.text).toContain("Ready for a follow-up. Hidden BTW thread updated.");
+  });
+
+  it("aborts, disposes, and unsubscribes the active BTW sub-session when Escape dismisses mid-stream", async () => {
+    const harness = createHarness();
+    const blocking = createBlockingToolStream();
+    streamSimpleMock.mockImplementation(() => blocking.stream());
+
+    await harness.runSessionStart();
+    const pendingCommand = harness.command("btw", "first question");
+    await flushAsyncWork();
+
+    const overlay = harness.latestOverlayComponent();
+    expect(overlay.statusText.text).toContain("running tool: read");
+
+    const firstRecord = subSessionRecords[0];
+    expect(firstRecord).toBeDefined();
+    expect(firstRecord.getIsStreaming()).toBe(true);
+    expect(firstRecord.getListenerCount()).toBe(1);
+
+    overlay.input.onEscape?.();
+    await flushAsyncWork();
+
+    expect(firstRecord.session.abort).toHaveBeenCalledTimes(1);
+    expect(firstRecord.session.dispose).toHaveBeenCalledTimes(1);
+    expect(firstRecord.getIsStreaming()).toBe(false);
+    expect(firstRecord.getListenerCount()).toBe(0);
+    expect(harness.overlayHandles.at(-1)?.hideCalls).toBe(1);
+
+    blocking.release();
+    await pendingCommand;
   });
 
   it("keeps the thread after Escape dismissal and restores it on reopen", async () => {
@@ -351,9 +713,14 @@ describe("btw runtime behavior", () => {
     expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(1);
     expect(harness.overlayHandles).toHaveLength(1);
 
+    const firstRecord = subSessionRecords[0];
     const overlay = harness.latestOverlayComponent();
     overlay.input.onEscape?.();
     await flushAsyncWork();
+
+    expect(firstRecord.session.abort).toHaveBeenCalledTimes(1);
+    expect(firstRecord.session.dispose).toHaveBeenCalledTimes(1);
+    expect(firstRecord.getListenerCount()).toBe(0);
 
     await harness.command("btw", "");
     expect(harness.overlayHandles).toHaveLength(2);
@@ -496,7 +863,7 @@ describe("btw runtime behavior", () => {
     expect(firstRender.length).toBe(secondRender.length);
   });
 
-  it("/btw:new appends a reset marker, clears prior hidden thread state, stays contextual, and reopens a fresh thread", async () => {
+  it("/btw:new appends a reset marker, disposes the old sub-session, clears prior hidden thread state, stays contextual, and reopens a fresh thread", async () => {
     const harness = createHarness();
     streamSimpleMock
       .mockImplementationOnce((_model: unknown, context: StreamContext) => {
@@ -513,7 +880,14 @@ describe("btw runtime behavior", () => {
 
     await harness.runSessionStart();
     await harness.command("btw", "first question");
+    const firstRecord = subSessionRecords[0];
+
     await harness.command("btw:new", "replacement question");
+
+    expect(firstRecord.session.abort).toHaveBeenCalledTimes(1);
+    expect(firstRecord.session.dispose).toHaveBeenCalledTimes(1);
+    expect(firstRecord.getListenerCount()).toBe(0);
+    expect(subSessionRecords[1]?.session).not.toBe(firstRecord.session);
 
     const postResetOverlay = harness.latestOverlayComponent();
     const postResetTranscript = transcriptText(postResetOverlay);
@@ -583,7 +957,7 @@ describe("btw runtime behavior", () => {
     expect(transcript).not.toContain("default:tangent start");
   });
 
-  it("/btw:clear dismisses the overlay, appends a reset marker, and restore only rehydrates entries after the last reset", async () => {
+  it("/btw:clear dismisses the overlay, disposes the active sub-session, appends a reset marker, and restore only rehydrates entries after the last reset", async () => {
     const seedEntries: SessionEntry[] = [
       { type: "custom", customType: "btw-thread-entry", data: { question: "old q", thinking: "", answer: "old a", provider: "p", model: "m", thinkingLevel: "off", timestamp: 1 } },
       { type: "custom", customType: "btw-thread-reset", data: { timestamp: 2, mode: "tangent" } },
@@ -600,8 +974,13 @@ describe("btw runtime behavior", () => {
     await harness.command("btw", "restore-visible");
     expect(harness.overlayHandles).toHaveLength(1);
 
+    const activeRecord = subSessionRecords[0];
     const resetCountBeforeClear = getCustomEntries(harness.entries, "btw-thread-reset").length;
     await harness.command("btw:clear", "");
+
+    expect(activeRecord.session.abort).toHaveBeenCalledTimes(1);
+    expect(activeRecord.session.dispose).toHaveBeenCalledTimes(1);
+    expect(activeRecord.getListenerCount()).toBe(0);
 
     const resets = getCustomEntries(harness.entries, "btw-thread-reset");
     expect(resets).toHaveLength(resetCountBeforeClear + 1);

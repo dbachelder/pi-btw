@@ -53,7 +53,7 @@ This milestone is complete only when all are true:
 
 ## Slices
 
-- [ ] **S01: Sub-session lifecycle and agent loop** `risk:high` `depends:[]`
+- [x] **S01: Sub-session lifecycle and agent loop** `risk:high` `depends:[]`
   > After this: user opens BTW and it creates a real `AgentSession` sub-session with tools; submitting a question runs through the agent loop with tool execution, and Escape disposes the sub-session cleanly. Transcript still shows basic text (not yet full tool-call rendering).
 
 - [ ] **S02: Overlay transcript rendering from agent events** `risk:medium` `depends:[S01]`

@@ -1,12 +1,18 @@
 import {
   buildSessionContext,
+  createAgentSession,
+  createExtensionRuntime,
+  codingTools,
+  SessionManager,
+  type AgentSession,
+  type AgentSessionEvent,
   type ExtensionAPI,
   type ExtensionCommandContext,
   type ExtensionContext,
+  type ResourceLoader,
 } from "@mariozechner/pi-coding-agent";
 import {
   completeSimple,
-  streamSimple,
   type AssistantMessage,
   type Message,
   type ThinkingLevel as AiThinkingLevel,
@@ -69,9 +75,15 @@ type BtwSlot = {
   question: string;
   modelLabel: string;
   thinking: string;
+  toolActivity: string[];
   answer: string;
   done: boolean;
-  controller: AbortController;
+};
+
+type BtwSessionRuntime = {
+  session: AgentSession;
+  mode: BtwThreadMode;
+  subscriptions: Set<() => void>;
 };
 
 type OverlayRuntime = {
@@ -91,8 +103,29 @@ function isCustomEntry(entry: unknown, customType: string): entry is { type: "cu
   return !!entry && typeof entry === "object" && (entry as { type?: string }).type === "custom" && (entry as { customType?: string }).customType === customType;
 }
 
-function toReasoning(level: SessionThinkingLevel): AiThinkingLevel | undefined {
-  return level === "off" ? undefined : level;
+function stripDynamicSystemPromptFooter(systemPrompt: string): string {
+  return systemPrompt
+    .replace(/\nCurrent date and time:[^\n]*(?:\nCurrent working directory:[^\n]*)?$/u, "")
+    .replace(/\nCurrent working directory:[^\n]*$/u, "")
+    .trim();
+}
+
+function createBtwResourceLoader(ctx: ExtensionCommandContext): ResourceLoader {
+  const extensionsResult = { extensions: [], errors: [], runtime: createExtensionRuntime() };
+  const systemPrompt = stripDynamicSystemPromptFooter(ctx.getSystemPrompt());
+
+  return {
+    getExtensions: () => extensionsResult,
+    getSkills: () => ({ skills: [], diagnostics: [] }),
+    getPrompts: () => ({ prompts: [], diagnostics: [] }),
+    getThemes: () => ({ themes: [], diagnostics: [] }),
+    getAgentsFiles: () => ({ agentsFiles: [] }),
+    getSystemPrompt: () => systemPrompt,
+    getAppendSystemPrompt: () => [BTW_SYSTEM_PROMPT],
+    getPathMetadata: () => new Map(),
+    extendResources: () => {},
+    reload: async () => {},
+  };
 }
 
 function extractText(parts: AssistantMessage["content"], type: "text" | "thinking"): string {
@@ -124,16 +157,32 @@ function parseBtwArgs(args: string): ParsedBtwArgs {
 }
 
 function buildMainMessages(ctx: ExtensionCommandContext): Message[] {
-  const sessionContext = buildSessionContext(ctx.sessionManager.getEntries(), ctx.sessionManager.getLeafId());
-  return sessionContext.messages.filter((message) => !isVisibleBtwMessage(message));
+  try {
+    const sessionContext = buildSessionContext(ctx.sessionManager.getEntries(), ctx.sessionManager.getLeafId());
+    return sessionContext.messages.filter((message) => !isVisibleBtwMessage(message));
+  } catch {
+    return ctx.sessionManager
+      .getEntries()
+      .flatMap((entry) => {
+        if (!entry || typeof entry !== "object") {
+          return [];
+        }
+
+        const message = entry as Partial<Message> & { role?: string; customType?: string; content?: unknown };
+        if (typeof message.role !== "string" || !Array.isArray(message.content)) {
+          return [];
+        }
+
+        return isVisibleBtwMessage({ role: message.role, customType: message.customType }) ? [] : [message as Message];
+      });
+  }
 }
 
-function buildBtwContext(
+function buildBtwSeedMessages(
   ctx: ExtensionCommandContext,
-  question: string,
   thread: BtwDetails[],
   mode: BtwThreadMode,
-) {
+): Message[] {
   const messages: Message[] = mode === "contextual" ? [...buildMainMessages(ctx)] : [];
 
   if (thread.length > 0) {
@@ -191,16 +240,64 @@ function buildBtwContext(
     }
   }
 
-  messages.push({
-    role: "user",
-    content: [{ type: "text", text: question }],
-    timestamp: Date.now(),
-  });
+  return messages;
+}
 
-  return {
-    systemPrompt: [ctx.getSystemPrompt(), BTW_SYSTEM_PROMPT].filter(Boolean).join("\n\n"),
-    messages,
-  };
+function formatToolPreview(value: unknown): string {
+  if (value === undefined) {
+    return "";
+  }
+
+  try {
+    const preview = JSON.stringify(value);
+    if (!preview || preview === "{}") {
+      return "";
+    }
+    return preview.length > 120 ? `${preview.slice(0, 117)}...` : preview;
+  } catch {
+    return "";
+  }
+}
+
+function appendToolActivity(slot: BtwSlot, line: string): void {
+  if (!line) {
+    return;
+  }
+
+  if (slot.toolActivity.at(-1) === line) {
+    return;
+  }
+
+  slot.toolActivity.push(line);
+}
+
+function applyAssistantMessageToSlot(slot: BtwSlot, message: AgentSessionEvent extends { message: infer T } ? T : never): void {
+  if (!message || typeof message !== "object" || (message as { role?: string }).role !== "assistant") {
+    return;
+  }
+
+  const assistantMessage = message as AssistantMessage;
+  const thinking = extractThinking(assistantMessage);
+  const answer = extractAnswer(assistantMessage);
+
+  if (thinking) {
+    slot.thinking = thinking;
+  }
+
+  if (answer && answer !== "(No text response)") {
+    slot.answer = answer;
+  }
+}
+
+function getLastAssistantMessage(session: AgentSession): AssistantMessage | null {
+  for (let i = session.state.messages.length - 1; i >= 0; i--) {
+    const message = session.state.messages[i];
+    if (message.role === "assistant") {
+      return message as AssistantMessage;
+    }
+  }
+
+  return null;
 }
 
 function buildBtwMessageContent(question: string, answer: string): string {
@@ -280,6 +377,11 @@ function buildOverlayTranscript(slots: BtwSlot[], theme: ExtensionContext["ui"][
         !slot.done && !slot.answer ? `${thinkingBadge} ${theme.fg("warning", "streaming")}` : thinkingBadge,
         theme.fg("warning", slot.thinking),
       );
+    }
+
+    if (slot.toolActivity.length > 0) {
+      const toolBadge = buildTranscriptBadge(theme, "Tool", "toolPendingBg", "warning");
+      lines.push("", toolBadge, ...slot.toolActivity.map((line) => theme.fg("warning", line)));
     }
 
     if (slot.answer) {
@@ -504,6 +606,7 @@ export default function (pi: ExtensionAPI) {
   let overlayDraft = "";
   let overlayRuntime: OverlayRuntime | null = null;
   let lastUiContext: ExtensionContext | ExtensionCommandContext | null = null;
+  let activeBtwSession: BtwSessionRuntime | null = null;
 
   function syncUi(ctx?: ExtensionContext | ExtensionCommandContext): void {
     const activeCtx = ctx ?? lastUiContext;
@@ -528,15 +631,67 @@ export default function (pi: ExtensionAPI) {
     overlayRuntime = null;
   }
 
-  function abortActiveSlots(): void {
-    for (const slot of slots) {
-      if (!slot.done) {
-        slot.controller.abort();
+  async function disposeBtwSession(): Promise<void> {
+    const current = activeBtwSession;
+    activeBtwSession = null;
+    if (!current) {
+      return;
+    }
+
+    for (const unsubscribe of [...current.subscriptions]) {
+      try {
+        unsubscribe();
+      } catch {
+        // Ignore unsubscribe errors during BTW session replacement/shutdown.
       }
     }
+    current.subscriptions.clear();
+
+    try {
+      await current.session.abort();
+    } catch {
+      // Ignore abort errors during BTW session replacement/shutdown.
+    }
+
+    current.session.dispose();
   }
 
+  async function dismissOverlaySession(): Promise<void> {
+    dismissOverlay();
+    await disposeBtwSession();
+  }
 
+  async function createBtwSubSession(ctx: ExtensionCommandContext, mode: BtwThreadMode): Promise<BtwSessionRuntime> {
+    const { session } = await createAgentSession({
+      sessionManager: SessionManager.inMemory(),
+      model: ctx.model,
+      modelRegistry: ctx.modelRegistry as AgentSession["modelRegistry"],
+      thinkingLevel: pi.getThinkingLevel() as SessionThinkingLevel,
+      tools: codingTools,
+      resourceLoader: createBtwResourceLoader(ctx),
+    });
+
+    const seedMessages = buildBtwSeedMessages(ctx, pendingThread, mode);
+    if (seedMessages.length > 0) {
+      session.agent.replaceMessages(seedMessages as typeof session.state.messages);
+    }
+
+    return { session, mode, subscriptions: new Set() };
+  }
+
+  async function ensureBtwSession(ctx: ExtensionCommandContext, mode: BtwThreadMode): Promise<BtwSessionRuntime | null> {
+    if (!ctx.model) {
+      return null;
+    }
+
+    if (activeBtwSession?.mode === mode) {
+      return activeBtwSession;
+    }
+
+    await disposeBtwSession();
+    activeBtwSession = await createBtwSubSession(ctx, mode);
+    return activeBtwSession;
+  }
 
   async function ensureOverlay(ctx: ExtensionCommandContext | ExtensionContext): Promise<void> {
     if (!ctx.hasUI) {
@@ -585,8 +740,7 @@ export default function (pi: ExtensionAPI) {
               void submitFromOverlay(ctx, value);
             },
             () => {
-              overlayDraft = overlay.getDraft();
-              closeRuntime();
+              void dismissOverlaySession();
             },
           );
 
@@ -643,13 +797,13 @@ export default function (pi: ExtensionAPI) {
     if (name === "btw") {
       const { question, save } = parseBtwArgs(trimmedArgs);
       if (!question) {
-        notify(ctx, "Usage: /btw [--save] <question>", "warning");
+        await ensureBtwSession(ctx, pendingMode);
         await ensureOverlay(ctx);
         return true;
       }
 
       if (pendingMode !== "contextual") {
-        resetThread(ctx, true, "contextual");
+        await resetThread(ctx, true, "contextual");
       }
 
       await runBtw(ctx, question, save, "contextual");
@@ -658,14 +812,14 @@ export default function (pi: ExtensionAPI) {
 
     if (name === "btw:tangent") {
       const { question, save } = parseBtwArgs(trimmedArgs);
-      if (!question) {
-        notify(ctx, "Usage: /btw:tangent [--save] <question>", "warning");
-        await ensureOverlay(ctx);
-        return true;
+      if (pendingMode !== "tangent") {
+        await resetThread(ctx, true, "tangent");
       }
 
-      if (pendingMode !== "tangent") {
-        resetThread(ctx, true, "tangent");
+      if (!question) {
+        await ensureBtwSession(ctx, "tangent");
+        await ensureOverlay(ctx);
+        return true;
       }
 
       await runBtw(ctx, question, save, "tangent");
@@ -673,11 +827,12 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (name === "btw:new") {
-      resetThread(ctx, true, "contextual");
+      await resetThread(ctx, true, "contextual");
       const { question, save } = parseBtwArgs(trimmedArgs);
       if (question) {
         await runBtw(ctx, question, save, "contextual");
       } else {
+        await ensureBtwSession(ctx, "contextual");
         setOverlayStatus("Started a fresh BTW thread.", ctx);
         await ensureOverlay(ctx);
         notify(ctx, "Started a fresh BTW thread.", "info");
@@ -686,7 +841,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (name === "btw:clear") {
-      resetThread(ctx);
+      await resetThread(ctx);
       dismissOverlay();
       notify(ctx, "Cleared BTW thread.", "info");
       return true;
@@ -705,7 +860,7 @@ export default function (pi: ExtensionAPI) {
 
       sendThreadToMain(ctx, content);
       const count = pendingThread.length;
-      resetThread(ctx);
+      await resetThread(ctx);
       dismissOverlay();
       notify(ctx, `Injected BTW thread (${count} exchange${count === 1 ? "" : "s"}).`, "info");
       return true;
@@ -729,7 +884,7 @@ export default function (pi: ExtensionAPI) {
 
         sendThreadToMain(ctx, content);
         const count = pendingThread.length;
-        resetThread(ctx);
+        await resetThread(ctx);
         dismissOverlay();
         notify(ctx, `Injected BTW summary (${count} exchange${count === 1 ? "" : "s"}).`, "info");
       } catch (error) {
@@ -789,12 +944,12 @@ export default function (pi: ExtensionAPI) {
     await runBtw(ctx, question, false, pendingMode);
   }
 
-  function resetThread(
+  async function resetThread(
     ctx: ExtensionContext | ExtensionCommandContext,
     persist = true,
     mode: BtwThreadMode = "contextual",
-  ): void {
-    abortActiveSlots();
+  ): Promise<void> {
+    await disposeBtwSession();
     pendingThread = [];
     pendingMode = mode;
     slots = [];
@@ -807,8 +962,8 @@ export default function (pi: ExtensionAPI) {
     syncUi(ctx);
   }
 
-  function restoreThread(ctx: ExtensionContext): void {
-    abortActiveSlots();
+  async function restoreThread(ctx: ExtensionContext): Promise<void> {
+    await disposeBtwSession();
     pendingThread = [];
     pendingMode = "contextual";
     slots = [];
@@ -842,9 +997,9 @@ export default function (pi: ExtensionAPI) {
         question: details.question,
         modelLabel: `${details.provider}/${details.model}`,
         thinking: details.thinking || "",
+        toolActivity: [],
         answer: details.answer,
         done: true,
-        controller: new AbortController(),
       });
     }
 
@@ -874,6 +1029,14 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
+    const sessionRuntime = await ensureBtwSession(ctx, mode);
+    if (!sessionRuntime) {
+      setOverlayStatus("No active model selected.", ctx);
+      notify(ctx, "No active model selected.", "error");
+      return;
+    }
+
+    const session = sessionRuntime.session;
     const wasBusy = !ctx.isIdle();
     pendingMode = mode;
     const thinkingLevel = pi.getThinkingLevel() as SessionThinkingLevel;
@@ -881,39 +1044,42 @@ export default function (pi: ExtensionAPI) {
       question,
       modelLabel: `${model.provider}/${model.id}`,
       thinking: "",
+      toolActivity: [],
       answer: "",
       done: false,
-      controller: new AbortController(),
     };
 
-    const threadSnapshot = pendingThread.slice();
     slots.push(slot);
     setOverlayStatus("⏳ streaming...", ctx);
     await ensureOverlay(ctx);
 
-    try {
-      const stream = streamSimple(model, buildBtwContext(ctx, question, threadSnapshot, mode), {
-        apiKey,
-        reasoning: toReasoning(thinkingLevel),
-        signal: slot.controller.signal,
-      });
-
-      let response: AssistantMessage | null = null;
-
-      for await (const event of stream) {
-        if (event.type === "thinking_delta") {
-          slot.thinking += event.delta;
-          syncUi(ctx);
-        } else if (event.type === "text_delta") {
-          slot.answer += event.delta;
-          syncUi(ctx);
-        } else if (event.type === "done") {
-          response = event.message;
-        } else if (event.type === "error") {
-          response = event.error;
-        }
+    const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
+      if (event.type === "message_start" || event.type === "message_update" || event.type === "message_end") {
+        applyAssistantMessageToSlot(slot, event.message);
+        syncUi(ctx);
+        return;
       }
 
+      if (event.type === "tool_execution_start") {
+        const preview = formatToolPreview(event.args);
+        appendToolActivity(slot, `→ ${event.toolName}${preview ? ` ${preview}` : ""}`);
+        setOverlayStatus(`⏳ running tool: ${event.toolName}`, ctx);
+        syncUi(ctx);
+        return;
+      }
+
+      if (event.type === "tool_execution_end") {
+        appendToolActivity(slot, `${event.isError ? "✗" : "✓"} ${event.toolName}`);
+        setOverlayStatus(session.isStreaming ? `⏳ running tool: ${event.toolName}` : "⏳ streaming...", ctx);
+        syncUi(ctx);
+      }
+    });
+    sessionRuntime.subscriptions.add(unsubscribe);
+
+    try {
+      await session.prompt(question, { source: "extension" });
+
+      const response = getLastAssistantMessage(session);
       if (!response) {
         throw new Error("BTW request finished without a response.");
       }
@@ -960,19 +1126,15 @@ export default function (pi: ExtensionAPI) {
         setOverlayStatus("Ready for a follow-up. Hidden BTW thread updated.", ctx);
       }
     } catch (error) {
-      if (slot.controller.signal.aborted) {
-        const slotIndex = slots.indexOf(slot);
-        if (slotIndex >= 0) {
-          slots.splice(slotIndex, 1);
-          setOverlayStatus("Request aborted.", ctx);
-        }
-        return;
-      }
-
       slot.answer = `❌ ${error instanceof Error ? error.message : String(error)}`;
       slot.done = true;
       setOverlayStatus("Request failed. Thread preserved for retry or follow-up.", ctx);
       notify(ctx, error instanceof Error ? error.message : String(error), "error");
+      await disposeBtwSession();
+    } finally {
+      sessionRuntime.subscriptions.delete(unsubscribe);
+      unsubscribe();
+      syncUi(ctx);
     }
   }
 
@@ -1055,19 +1217,19 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_start", async (_event, ctx) => {
-    restoreThread(ctx);
+    await restoreThread(ctx);
   });
 
   pi.on("session_switch", async (_event, ctx) => {
-    restoreThread(ctx);
+    await restoreThread(ctx);
   });
 
   pi.on("session_tree", async (_event, ctx) => {
-    restoreThread(ctx);
+    await restoreThread(ctx);
   });
 
   pi.on("session_shutdown", async () => {
-    abortActiveSlots();
+    await disposeBtwSession();
     dismissOverlay();
   });
 

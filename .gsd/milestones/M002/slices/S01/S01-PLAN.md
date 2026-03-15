@@ -23,6 +23,7 @@
 ## Verification
 
 - `npm test -- tests/btw.runtime.test.ts` — updated harness asserting sub-session creation, prompt routing through agent loop, tool activation, Escape dispose, and no leaked resources
+- `npm test -- tests/btw.runtime.test.ts -t "preserves BTW overlay recoverability after agent prompt failure"` — verifies an inspectable failure state surfaces in the overlay/status path and the overlay remains reusable after a sub-session error
 - Manual: open BTW in live pi, verify tool execution appears in the overlay
 
 ## Observability / Diagnostics
@@ -39,21 +40,21 @@
 
 ## Tasks
 
-- [ ] **T01: Create sub-session helper and wire into BTW open** `est:1h`
+- [x] **T01: Create sub-session helper and wire into BTW open** `est:1h`
   - Why: This is the core change — replacing manual LLM calls with a real AgentSession. Everything else depends on this.
   - Files: `extensions/btw.ts`
   - Do: Write `createBtwSubSession(ctx)` that calls `createAgentSession()` with `SessionManager.inMemory()`, the main session's model (from `ctx.model`) and `ctx.modelRegistry`, `codingTools` as tools, a custom BTW system prompt, and no extension binding. Wire this into the BTW open path so `/btw`, `/btw:new`, and `/btw:tangent` create a sub-session instead of calling `streamSimple()` directly. Replace `runBtw()` to call `btwSession.prompt(question)`. Subscribe to the sub-session's event stream and feed simplified text into the existing `BtwSlot` model (bridge — S02 replaces this). Handle contextual mode by injecting main-session messages into the sub-session context via `before_agent_start` or by prepending to the prompt. Handle tangent mode by using a clean sub-session with no main-session context.
   - Verify: `npm test -- tests/btw.runtime.test.ts` passes with updated assertions; `/btw question` creates a sub-session, runs prompt, and produces an answer
   - Done when: BTW questions route through `AgentSession.prompt()` and the agent loop, not through manual `streamSimple`
 
-- [ ] **T02: Sub-session dispose on Escape and /btw:clear** `est:45m`
+- [x] **T02: Sub-session dispose on Escape and /btw:clear** `est:45m`
   - Why: Clean lifecycle is critical — no leaked agent loops, abort controllers, or subscriptions after dismiss.
   - Files: `extensions/btw.ts`
   - Do: Wire Escape dismissal to call `btwSession.abort()` then `btwSession.dispose()`. Wire `/btw:clear` to dispose the sub-session as well. Handle the case where the sub-session is mid-stream (tool executing, LLM streaming) — abort must be clean. Ensure `/btw:new` disposes the old sub-session before creating a fresh one. Track the active sub-session reference and null it on dispose. Verify no event listeners remain subscribed after dispose.
   - Verify: runtime assertions that dispose is called on Escape, `session.isStreaming === false` after abort, no lingering subscriptions
   - Done when: Escape and /btw:clear cleanly dispose the sub-session with no resource leaks
 
-- [ ] **T03: Mode handling and sub-session context** `est:45m`
+- [x] **T03: Mode handling and sub-session context** `est:45m`
   - Why: Contextual mode must feed main-session messages into the sub-session; tangent mode must not. This replaces `buildBtwContext()`.
   - Files: `extensions/btw.ts`
   - Do: For contextual mode, prepend main-session messages (from `buildMainMessages()`) as context before the user's question — either via the sub-session's system prompt or by injecting messages through `session.sendCustomMessage()`. For tangent mode, the sub-session starts clean with only the BTW system prompt. Handle mode switches (`/btw:tangent` after `/btw`) by disposing the old sub-session and creating a new one with the appropriate context. Preserve the BTW system prompt as a preamble in all modes.
