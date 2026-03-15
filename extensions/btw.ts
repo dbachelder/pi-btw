@@ -71,13 +71,33 @@ type BtwResetDetails = {
   mode?: BtwThreadMode;
 };
 
-type BtwSlot = {
-  question: string;
-  modelLabel: string;
-  thinking: string;
-  toolActivity: string[];
-  answer: string;
-  done: boolean;
+type BtwTranscriptEntry =
+  | { id: number; turnId: number; type: "turn-boundary"; phase: "start" | "end" }
+  | { id: number; turnId: number; type: "user-message"; text: string }
+  | { id: number; turnId: number; type: "thinking"; text: string; streaming: boolean }
+  | { id: number; turnId: number; type: "assistant-text"; text: string; streaming: boolean }
+  | { id: number; turnId: number; type: "tool-call"; toolCallId: string; toolName: string; args: string }
+  | {
+      id: number;
+      turnId: number;
+      type: "tool-result";
+      toolCallId: string;
+      toolName: string;
+      content: string;
+      truncated: boolean;
+      isError: boolean;
+      streaming: boolean;
+    };
+
+type BtwTranscript = BtwTranscriptEntry[];
+
+type BtwTranscriptState = {
+  entries: BtwTranscript;
+  nextEntryId: number;
+  nextTurnId: number;
+  currentTurnId: number | null;
+  lastTurnId: number | null;
+  toolCalls: Map<string, { turnId: number; callEntryId: number; resultEntryId?: number }>;
 };
 
 type BtwSessionRuntime = {
@@ -248,6 +268,17 @@ function formatToolPreview(value: unknown): string {
     return "";
   }
 
+  if (typeof value === "string") {
+    return value;
+  }
+
+  if (value && typeof value === "object") {
+    const path = (value as { path?: unknown }).path;
+    if (typeof path === "string") {
+      return path;
+    }
+  }
+
   try {
     const preview = JSON.stringify(value);
     if (!preview || preview === "{}") {
@@ -259,34 +290,506 @@ function formatToolPreview(value: unknown): string {
   }
 }
 
-function appendToolActivity(slot: BtwSlot, line: string): void {
-  if (!line) {
-    return;
-  }
-
-  if (slot.toolActivity.at(-1) === line) {
-    return;
-  }
-
-  slot.toolActivity.push(line);
+function createEmptyTranscriptState(): BtwTranscriptState {
+  return {
+    entries: [],
+    nextEntryId: 1,
+    nextTurnId: 1,
+    currentTurnId: null,
+    lastTurnId: null,
+    toolCalls: new Map(),
+  };
 }
 
-function applyAssistantMessageToSlot(slot: BtwSlot, message: AgentSessionEvent extends { message: infer T } ? T : never): void {
+function appendTranscriptEntry<T extends BtwTranscriptEntry>(
+  state: BtwTranscriptState,
+  entry: Omit<T, "id">,
+): T {
+  const nextEntry = { ...entry, id: state.nextEntryId++ } as T;
+  state.entries.push(nextEntry);
+  return nextEntry;
+}
+
+function ensureTranscriptTurn(state: BtwTranscriptState): number {
+  if (state.currentTurnId !== null) {
+    return state.currentTurnId;
+  }
+
+  const turnId = state.nextTurnId++;
+  state.currentTurnId = turnId;
+  state.lastTurnId = turnId;
+  appendTranscriptEntry(state, { type: "turn-boundary", turnId, phase: "start" });
+  return turnId;
+}
+
+function finishTranscriptTurn(state: BtwTranscriptState, turnId?: number | null): void {
+  const resolvedTurnId = turnId ?? state.currentTurnId;
+  if (resolvedTurnId === null || resolvedTurnId === undefined) {
+    return;
+  }
+
+  const hasEndBoundary = state.entries.some(
+    (entry) => entry.turnId === resolvedTurnId && entry.type === "turn-boundary" && entry.phase === "end",
+  );
+  if (!hasEndBoundary) {
+    appendTranscriptEntry(state, { type: "turn-boundary", turnId: resolvedTurnId, phase: "end" });
+  }
+
+  for (const entry of state.entries) {
+    if (entry.turnId !== resolvedTurnId) {
+      continue;
+    }
+
+    if (entry.type === "thinking" || entry.type === "assistant-text" || entry.type === "tool-result") {
+      entry.streaming = false;
+    }
+  }
+
+  state.lastTurnId = resolvedTurnId;
+  if (state.currentTurnId === resolvedTurnId) {
+    state.currentTurnId = null;
+  }
+}
+
+function removeTranscriptTurn(state: BtwTranscriptState, turnId: number | null): void {
+  if (turnId === null) {
+    return;
+  }
+
+  state.entries = state.entries.filter((entry) => entry.turnId !== turnId);
+  for (const [toolCallId, toolCall] of state.toolCalls.entries()) {
+    if (toolCall.turnId === turnId) {
+      state.toolCalls.delete(toolCallId);
+    }
+  }
+
+  if (state.currentTurnId === turnId) {
+    state.currentTurnId = null;
+  }
+  if (state.lastTurnId === turnId) {
+    state.lastTurnId = null;
+  }
+}
+
+function findLatestTranscriptEntry<TType extends BtwTranscriptEntry["type"]>(
+  state: BtwTranscriptState,
+  turnId: number,
+  type: TType,
+): Extract<BtwTranscriptEntry, { type: TType }> | undefined {
+  for (let i = state.entries.length - 1; i >= 0; i--) {
+    const entry = state.entries[i];
+    if (entry.turnId === turnId && entry.type === type) {
+      return entry as Extract<BtwTranscriptEntry, { type: TType }>;
+    }
+  }
+
+  return undefined;
+}
+
+function ensureTranscriptTurnForUserMessage(state: BtwTranscriptState): number {
+  if (state.currentTurnId !== null) {
+    const currentAssistant = findLatestTranscriptEntry(state, state.currentTurnId, "assistant-text");
+    if (currentAssistant && !currentAssistant.streaming) {
+      finishTranscriptTurn(state, state.currentTurnId);
+    }
+  }
+
+  return ensureTranscriptTurn(state);
+}
+
+function extractMessageText(message: { content?: AssistantMessage["content"] }): string {
+  return Array.isArray(message.content) ? extractText(message.content, "text") : "";
+}
+
+function upsertUserMessageEntry(state: BtwTranscriptState, turnId: number, text: string): void {
+  if (!text) {
+    return;
+  }
+
+  const existing = findLatestTranscriptEntry(state, turnId, "user-message");
+  if (existing) {
+    existing.text = text;
+    return;
+  }
+
+  appendTranscriptEntry(state, { type: "user-message", turnId, text });
+}
+
+function upsertTranscriptTextEntry(
+  state: BtwTranscriptState,
+  turnId: number,
+  type: "thinking" | "assistant-text",
+  text: string,
+  streaming: boolean,
+): void {
+  if (!text) {
+    return;
+  }
+
+  const existing = findLatestTranscriptEntry(state, turnId, type);
+  if (existing) {
+    existing.text = text;
+    existing.streaming = streaming;
+    return;
+  }
+
+  appendTranscriptEntry(state, { type, turnId, text, streaming });
+}
+
+function summarizeToolResult(value: unknown, maxLength = 400): { content: string; truncated: boolean } {
+  let content = "";
+
+  if (value && typeof value === "object") {
+    const toolValue = value as {
+      content?: Array<{ type?: string; text?: string }>;
+      error?: unknown;
+      message?: unknown;
+    };
+
+    if (Array.isArray(toolValue.content)) {
+      content = toolValue.content
+        .filter((part) => part.type === "text" && typeof part.text === "string")
+        .map((part) => part.text ?? "")
+        .join("\n")
+        .trim();
+    }
+
+    if (!content && typeof toolValue.error === "string") {
+      content = toolValue.error;
+    }
+
+    if (!content && typeof toolValue.message === "string") {
+      content = toolValue.message;
+    }
+  }
+
+  if (!content) {
+    if (typeof value === "string") {
+      content = value;
+    } else if (value !== undefined) {
+      try {
+        content = JSON.stringify(value, null, 2);
+      } catch {
+        content = String(value);
+      }
+    }
+  }
+
+  if (!content) {
+    content = "(no tool output)";
+  }
+
+  const truncated = content.length > maxLength;
+  return {
+    content: truncated ? `${content.slice(0, maxLength - 3)}...` : content,
+    truncated,
+  };
+}
+
+function ensureToolCallEntry(
+  state: BtwTranscriptState,
+  turnId: number,
+  toolCallId: string,
+  toolName: string,
+  args: string,
+): { turnId: number; callEntryId: number; resultEntryId?: number } {
+  const existing = state.toolCalls.get(toolCallId);
+  if (existing) {
+    return existing;
+  }
+
+  const callEntry = appendTranscriptEntry(state, {
+    type: "tool-call",
+    turnId,
+    toolCallId,
+    toolName,
+    args,
+  });
+  const record = { turnId, callEntryId: callEntry.id };
+  state.toolCalls.set(toolCallId, record);
+  return record;
+}
+
+function upsertToolResultEntry(
+  state: BtwTranscriptState,
+  turnId: number,
+  toolCallId: string,
+  toolName: string,
+  content: string,
+  truncated: boolean,
+  isError: boolean,
+  streaming: boolean,
+): void {
+  const toolCall = ensureToolCallEntry(state, turnId, toolCallId, toolName, "");
+  const existing =
+    toolCall.resultEntryId !== undefined
+      ? state.entries.find((entry) => entry.id === toolCall.resultEntryId && entry.type === "tool-result")
+      : undefined;
+
+  if (existing && existing.type === "tool-result") {
+    existing.content = content;
+    existing.truncated = truncated;
+    existing.isError = isError;
+    existing.streaming = streaming;
+    return;
+  }
+
+  const resultEntry = appendTranscriptEntry(state, {
+    type: "tool-result",
+    turnId,
+    toolCallId,
+    toolName,
+    content,
+    truncated,
+    isError,
+    streaming,
+  });
+  toolCall.resultEntryId = resultEntry.id;
+}
+
+function applyAssistantMessageToTranscript(
+  state: BtwTranscriptState,
+  turnId: number,
+  message: AgentSessionEvent extends { message: infer T } ? T : never,
+  streaming: boolean,
+): void {
   if (!message || typeof message !== "object" || (message as { role?: string }).role !== "assistant") {
     return;
   }
 
   const assistantMessage = message as AssistantMessage;
   const thinking = extractThinking(assistantMessage);
-  const answer = extractAnswer(assistantMessage);
+  const answer = extractMessageText(assistantMessage);
 
   if (thinking) {
-    slot.thinking = thinking;
+    upsertTranscriptTextEntry(state, turnId, "thinking", thinking, streaming);
   }
 
-  if (answer && answer !== "(No text response)") {
-    slot.answer = answer;
+  if (answer) {
+    upsertTranscriptTextEntry(state, turnId, "assistant-text", answer, streaming);
   }
+}
+
+function applyTranscriptEvent(state: BtwTranscriptState, event: AgentSessionEvent): void {
+  switch (event.type) {
+    case "turn_start": {
+      ensureTranscriptTurn(state);
+      return;
+    }
+    case "message_start": {
+      if (event.message.role === "user") {
+        const turnId = ensureTranscriptTurnForUserMessage(state);
+        upsertUserMessageEntry(state, turnId, extractMessageText(event.message));
+        return;
+      }
+
+      if (event.message.role === "assistant") {
+        const turnId = ensureTranscriptTurn(state);
+        applyAssistantMessageToTranscript(state, turnId, event.message, true);
+      }
+      return;
+    }
+    case "message_update": {
+      if (event.message.role !== "assistant") {
+        return;
+      }
+
+      const turnId = ensureTranscriptTurn(state);
+      applyAssistantMessageToTranscript(state, turnId, event.message, true);
+      return;
+    }
+    case "message_end": {
+      if (event.message.role === "user") {
+        const turnId = ensureTranscriptTurnForUserMessage(state);
+        upsertUserMessageEntry(state, turnId, extractMessageText(event.message));
+        return;
+      }
+
+      if (event.message.role === "assistant") {
+        const turnId = ensureTranscriptTurn(state);
+        applyAssistantMessageToTranscript(state, turnId, event.message, false);
+      }
+      return;
+    }
+    case "tool_execution_start": {
+      const turnId = ensureTranscriptTurn(state);
+      ensureToolCallEntry(state, turnId, event.toolCallId, event.toolName, formatToolPreview(event.args));
+      return;
+    }
+    case "tool_execution_update": {
+      const turnId = state.toolCalls.get(event.toolCallId)?.turnId ?? ensureTranscriptTurn(state);
+      const result = summarizeToolResult(event.partialResult);
+      upsertToolResultEntry(
+        state,
+        turnId,
+        event.toolCallId,
+        event.toolName,
+        result.content,
+        result.truncated,
+        false,
+        true,
+      );
+      return;
+    }
+    case "tool_execution_end": {
+      const turnId = state.toolCalls.get(event.toolCallId)?.turnId ?? ensureTranscriptTurn(state);
+      const result = summarizeToolResult(event.result);
+      upsertToolResultEntry(
+        state,
+        turnId,
+        event.toolCallId,
+        event.toolName,
+        result.content,
+        result.truncated,
+        event.isError,
+        false,
+      );
+      return;
+    }
+    case "turn_end": {
+      finishTranscriptTurn(state);
+      return;
+    }
+    default:
+      return;
+  }
+}
+
+function appendPersistedTranscriptTurn(state: BtwTranscriptState, details: BtwDetails): void {
+  const turnId = ensureTranscriptTurn(state);
+  upsertUserMessageEntry(state, turnId, details.question);
+  if (details.thinking) {
+    upsertTranscriptTextEntry(state, turnId, "thinking", details.thinking, false);
+  }
+  upsertTranscriptTextEntry(state, turnId, "assistant-text", details.answer, false);
+  finishTranscriptTurn(state, turnId);
+}
+
+function setTranscriptFailure(state: BtwTranscriptState, message: string): void {
+  const turnId = state.currentTurnId ?? state.lastTurnId ?? ensureTranscriptTurn(state);
+  upsertTranscriptTextEntry(state, turnId, "assistant-text", `❌ ${message}`, false);
+  finishTranscriptTurn(state, turnId);
+}
+
+function hasStreamingTranscriptEntry(entries: BtwTranscript): boolean {
+  return entries.some(
+    (entry) =>
+      (entry.type === "thinking" || entry.type === "assistant-text" || entry.type === "tool-result") &&
+      entry.streaming,
+  );
+}
+
+function getCompletedExchangeCount(entries: BtwTranscript): number {
+  return entries.filter((entry) => entry.type === "assistant-text" && !entry.streaming).length;
+}
+
+function buildOverlayTranscript(entries: BtwTranscript, theme: ExtensionContext["ui"]["theme"]): string[] {
+  if (entries.length === 0) {
+    return [theme.fg("dim", "No BTW thread yet. Ask a side question to start one.")];
+  }
+
+  const lines: string[] = [];
+  const userBadge = buildTranscriptBadge(theme, "You", "userMessageBg", "accent");
+  const thinkingBadge = buildTranscriptBadge(theme, "Thinking", "toolPendingBg", "warning");
+  const toolBadge = buildTranscriptBadge(theme, "Tool", "toolPendingBg", "warning");
+  const assistantBadge = buildTranscriptBadge(theme, "Assistant", "customMessageBg", "success");
+  const separator = theme.fg("borderMuted", "────────────────────────────────────────");
+  const blockIndent = "    ";
+  const resultIndent = "      ";
+
+  const pushBlankLine = () => {
+    if (lines.length > 0 && lines[lines.length - 1] !== "") {
+      lines.push("");
+    }
+  };
+
+  const pushInlineBlock = (
+    header: string,
+    text: string,
+    options: { blankBefore?: boolean; style?: (value: string) => string } = {},
+  ) => {
+    const bodyLines = text.split("\n");
+    const style = options.style ?? ((value: string) => value);
+    if (options.blankBefore !== false) {
+      pushBlankLine();
+    }
+
+    const firstLine = bodyLines.shift() ?? "";
+    lines.push(`${header}${firstLine ? ` ${style(firstLine)}` : ""}`);
+    for (const line of bodyLines) {
+      lines.push(`${blockIndent}${style(line)}`);
+    }
+  };
+
+  const pushStackedBlock = (
+    header: string,
+    text: string,
+    options: { blankBefore?: boolean; indent?: string; style?: (value: string) => string } = {},
+  ) => {
+    const bodyLines = text.split("\n");
+    const indent = options.indent ?? blockIndent;
+    const style = options.style ?? ((value: string) => value);
+    if (options.blankBefore !== false) {
+      pushBlankLine();
+    }
+
+    lines.push(header);
+    for (const line of bodyLines) {
+      lines.push(`${indent}${style(line)}`);
+    }
+  };
+
+  for (const entry of entries) {
+    if (entry.type === "turn-boundary") {
+      if (entry.phase === "start" && lines.length > 0) {
+        pushBlankLine();
+        lines.push(separator);
+      }
+      continue;
+    }
+
+    if (entry.type === "user-message") {
+      pushInlineBlock(userBadge, entry.text, { blankBefore: false });
+      continue;
+    }
+
+    if (entry.type === "thinking") {
+      const thinkingHeader = entry.streaming ? `${thinkingBadge} ${theme.fg("warning", "▍")}` : thinkingBadge;
+      pushStackedBlock(thinkingHeader, entry.text, {
+        style: (line) => theme.fg("warning", theme.italic(line)),
+      });
+      continue;
+    }
+
+    if (entry.type === "tool-call") {
+      const toolLabel = theme.fg("warning", theme.bold(entry.toolName));
+      const argsLabel = entry.args ? theme.fg("dim", ` · ${entry.args}`) : "";
+      pushInlineBlock(toolBadge, `${toolLabel}${argsLabel}`);
+      continue;
+    }
+
+    if (entry.type === "tool-result") {
+      const resultHeaderLabel = entry.isError
+        ? theme.fg("error", "↳ error")
+        : entry.streaming
+          ? theme.fg("warning", "↳ streaming result")
+          : theme.fg("dim", "↳ result");
+      const truncationLabel = entry.truncated ? theme.fg("dim", " (truncated)") : "";
+      pushStackedBlock(`${blockIndent}${resultHeaderLabel}${truncationLabel}`, entry.content, {
+        blankBefore: false,
+        indent: resultIndent,
+        style: (line) => (entry.isError ? theme.fg("error", line) : theme.fg("dim", line)),
+      });
+      continue;
+    }
+
+    if (entry.type === "assistant-text") {
+      const assistantHeader = entry.streaming ? `${assistantBadge} ${theme.fg("warning", "▍")}` : assistantBadge;
+      pushStackedBlock(assistantHeader, entry.text);
+    }
+  }
+
+  return lines;
 }
 
 function getLastAssistantMessage(session: AgentSession): AssistantMessage | null {
@@ -353,49 +856,6 @@ function buildTranscriptBadge(
   return theme.bg(background, theme.fg(foreground, theme.bold(` ${label} `)));
 }
 
-function buildOverlayTranscript(slots: BtwSlot[], theme: ExtensionContext["ui"]["theme"]): string[] {
-  if (slots.length === 0) {
-    return [theme.fg("dim", "No BTW thread yet. Ask a side question to start one.")];
-  }
-
-  const lines: string[] = [];
-  for (let i = 0; i < slots.length; i++) {
-    const slot = slots[i];
-    if (i > 0) {
-      lines.push("", theme.fg("borderMuted", "────────────────────────────────────────"));
-    }
-
-    const userBadge = buildTranscriptBadge(theme, "You", "userMessageBg", "accent");
-    const thinkingBadge = buildTranscriptBadge(theme, "Thinking", "toolPendingBg", "warning");
-    const assistantBadge = buildTranscriptBadge(theme, "Assistant", "customMessageBg", "success");
-
-    lines.push(`${userBadge} ${slot.question}`);
-
-    if (slot.thinking) {
-      lines.push(
-        "",
-        !slot.done && !slot.answer ? `${thinkingBadge} ${theme.fg("warning", "streaming")}` : thinkingBadge,
-        theme.fg("warning", slot.thinking),
-      );
-    }
-
-    if (slot.toolActivity.length > 0) {
-      const toolBadge = buildTranscriptBadge(theme, "Tool", "toolPendingBg", "warning");
-      lines.push("", toolBadge, ...slot.toolActivity.map((line) => theme.fg("warning", line)));
-    }
-
-    if (slot.answer) {
-      lines.push("", !slot.done ? `${assistantBadge} ${theme.fg("warning", "▍")}` : assistantBadge, slot.answer);
-    } else if (!slot.done) {
-      lines.push("", assistantBadge, theme.fg("warning", "⏳ thinking..."));
-    }
-
-    lines.push("", theme.fg("dim", `model: ${slot.modelLabel}`));
-  }
-
-  return lines;
-}
-
 class BtwOverlayComponent extends Container implements Focusable {
   private readonly input: Input;
   private readonly transcript: Container;
@@ -403,7 +863,7 @@ class BtwOverlayComponent extends Container implements Focusable {
   private readonly modeText: Text;
   private readonly summaryText: Text;
   private readonly hintsText: Text;
-  private readonly getSlots: () => BtwSlot[];
+  private readonly readTranscriptEntries: () => BtwTranscript;
   private readonly getStatus: () => string | null;
   private readonly getMode: () => BtwThreadMode;
   private readonly onSubmitCallback: (value: string) => void;
@@ -429,7 +889,7 @@ class BtwOverlayComponent extends Container implements Focusable {
     tui: TUI,
     theme: ExtensionContext["ui"]["theme"],
     keybindings: KeybindingsManager,
-    getSlots: () => BtwSlot[],
+    readTranscriptEntries: () => BtwTranscript,
     getStatus: () => string | null,
     getMode: () => BtwThreadMode,
     onSubmit: (value: string) => void,
@@ -438,7 +898,7 @@ class BtwOverlayComponent extends Container implements Focusable {
     super();
     this.tui = tui;
     this.theme = theme;
-    this.getSlots = getSlots;
+    this.readTranscriptEntries = readTranscriptEntries;
     this.getStatus = getStatus;
     this.getMode = getMode;
     this.onSubmitCallback = onSubmit;
@@ -578,14 +1038,18 @@ class BtwOverlayComponent extends Container implements Focusable {
     return this.input.getValue();
   }
 
+  getTranscriptEntries(): BtwTranscript {
+    return this.readTranscriptEntries().map((entry) => ({ ...entry }));
+  }
+
   refresh(): void {
     this.modeText.setText(`${getOverlayTitle(this.getMode())} · hidden thread preserved`);
-    const slots = this.getSlots();
-    const exchanges = slots.filter((slot) => slot.done).length;
-    const active = slots.some((slot) => !slot.done) ? " · streaming" : " · idle";
+    const entries = this.readTranscriptEntries();
+    const exchanges = getCompletedExchangeCount(entries);
+    const active = hasStreamingTranscriptEntry(entries) ? " · streaming" : " · idle";
     this.summaryText.setText(`${exchanges} exchange${exchanges === 1 ? "" : "s"}${active}`);
 
-    this.transcriptLines = buildOverlayTranscript(slots, this.theme);
+    this.transcriptLines = buildOverlayTranscript(entries, this.theme);
     this.transcript.clear();
     for (const line of this.transcriptLines) {
       this.transcript.addChild(new Text(line, 1, 0));
@@ -601,7 +1065,7 @@ class BtwOverlayComponent extends Container implements Focusable {
 export default function (pi: ExtensionAPI) {
   let pendingThread: BtwDetails[] = [];
   let pendingMode: BtwThreadMode = "contextual";
-  let slots: BtwSlot[] = [];
+  let transcriptState = createEmptyTranscriptState();
   let overlayStatus: string | null = null;
   let overlayDraft = "";
   let overlayRuntime: OverlayRuntime | null = null;
@@ -631,6 +1095,72 @@ export default function (pi: ExtensionAPI) {
     overlayRuntime = null;
   }
 
+  function removeBtwSessionSubscription(sessionRuntime: BtwSessionRuntime, unsubscribe: () => void): void {
+    if (!sessionRuntime.subscriptions.delete(unsubscribe)) {
+      return;
+    }
+
+    try {
+      unsubscribe();
+    } catch {
+      // Ignore unsubscribe errors during BTW session replacement/shutdown.
+    }
+  }
+
+  function clearBtwSessionSubscriptions(sessionRuntime: BtwSessionRuntime): void {
+    for (const unsubscribe of [...sessionRuntime.subscriptions]) {
+      removeBtwSessionSubscription(sessionRuntime, unsubscribe);
+    }
+  }
+
+  function handleBtwSessionEvent(
+    sessionRuntime: BtwSessionRuntime,
+    event: AgentSessionEvent,
+    ctx?: ExtensionContext | ExtensionCommandContext,
+  ): void {
+    if (activeBtwSession?.session !== sessionRuntime.session || !overlayRuntime) {
+      return;
+    }
+
+    applyTranscriptEvent(transcriptState, event);
+
+    if (event.type === "tool_execution_start") {
+      setOverlayStatus(`⏳ running tool: ${event.toolName}`, ctx);
+      return;
+    }
+
+    if (event.type === "tool_execution_end") {
+      setOverlayStatus(sessionRuntime.session.isStreaming ? `⏳ running tool: ${event.toolName}` : "⏳ streaming...", ctx);
+      return;
+    }
+
+    if (event.type === "turn_end") {
+      setOverlayStatus("⏳ streaming...", ctx);
+      return;
+    }
+
+    if (
+      event.type === "message_start" ||
+      event.type === "message_update" ||
+      event.type === "message_end" ||
+      event.type === "turn_start"
+    ) {
+      syncUi(ctx);
+    }
+  }
+
+  function subscribeOverlayToActiveBtwSession(ctx?: ExtensionContext | ExtensionCommandContext): void {
+    const sessionRuntime = activeBtwSession;
+    if (!sessionRuntime || sessionRuntime.subscriptions.size > 0) {
+      return;
+    }
+
+    const unsubscribe = sessionRuntime.session.subscribe((event: AgentSessionEvent) => {
+      handleBtwSessionEvent(sessionRuntime, event, ctx);
+    });
+    sessionRuntime.subscriptions.add(unsubscribe);
+  }
+
   async function disposeBtwSession(): Promise<void> {
     const current = activeBtwSession;
     activeBtwSession = null;
@@ -638,14 +1168,7 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    for (const unsubscribe of [...current.subscriptions]) {
-      try {
-        unsubscribe();
-      } catch {
-        // Ignore unsubscribe errors during BTW session replacement/shutdown.
-      }
-    }
-    current.subscriptions.clear();
+    clearBtwSessionSubscriptions(current);
 
     try {
       await current.session.abort();
@@ -700,6 +1223,7 @@ export default function (pi: ExtensionAPI) {
     lastUiContext = ctx;
 
     if (overlayRuntime?.handle) {
+      subscribeOverlayToActiveBtwSession(ctx);
       overlayRuntime.handle.setHidden(false);
       overlayRuntime.handle.focus();
       overlayRuntime.refresh?.();
@@ -712,6 +1236,9 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       runtime.closed = true;
+      if (activeBtwSession) {
+        clearBtwSessionSubscriptions(activeBtwSession);
+      }
       runtime.handle?.hide();
       if (overlayRuntime === runtime) {
         overlayRuntime = null;
@@ -733,7 +1260,7 @@ export default function (pi: ExtensionAPI) {
             tui,
             theme,
             keybindings,
-            () => slots,
+            () => transcriptState.entries,
             () => overlayStatus,
             () => pendingMode,
             (value) => {
@@ -758,6 +1285,8 @@ export default function (pi: ExtensionAPI) {
             overlayDraft = overlay.getDraft();
             closeRuntime();
           };
+
+          subscribeOverlayToActiveBtwSession(ctx);
 
           if (runtime.closed) {
             done();
@@ -952,7 +1481,7 @@ export default function (pi: ExtensionAPI) {
     await disposeBtwSession();
     pendingThread = [];
     pendingMode = mode;
-    slots = [];
+    transcriptState = createEmptyTranscriptState();
     setOverlayDraft("");
     setOverlayStatus(null, ctx);
     if (persist) {
@@ -966,7 +1495,7 @@ export default function (pi: ExtensionAPI) {
     await disposeBtwSession();
     pendingThread = [];
     pendingMode = "contextual";
-    slots = [];
+    transcriptState = createEmptyTranscriptState();
     overlayDraft = "";
     lastUiContext = ctx;
     overlayStatus = null;
@@ -993,14 +1522,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       pendingThread.push(details);
-      slots.push({
-        question: details.question,
-        modelLabel: `${details.provider}/${details.model}`,
-        thinking: details.thinking || "",
-        toolActivity: [],
-        answer: details.answer,
-        done: true,
-      });
+      appendPersistedTranscriptTurn(transcriptState, details);
     }
 
     syncUi(ctx);
@@ -1040,41 +1562,9 @@ export default function (pi: ExtensionAPI) {
     const wasBusy = !ctx.isIdle();
     pendingMode = mode;
     const thinkingLevel = pi.getThinkingLevel() as SessionThinkingLevel;
-    const slot: BtwSlot = {
-      question,
-      modelLabel: `${model.provider}/${model.id}`,
-      thinking: "",
-      toolActivity: [],
-      answer: "",
-      done: false,
-    };
 
-    slots.push(slot);
     setOverlayStatus("⏳ streaming...", ctx);
     await ensureOverlay(ctx);
-
-    const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
-      if (event.type === "message_start" || event.type === "message_update" || event.type === "message_end") {
-        applyAssistantMessageToSlot(slot, event.message);
-        syncUi(ctx);
-        return;
-      }
-
-      if (event.type === "tool_execution_start") {
-        const preview = formatToolPreview(event.args);
-        appendToolActivity(slot, `→ ${event.toolName}${preview ? ` ${preview}` : ""}`);
-        setOverlayStatus(`⏳ running tool: ${event.toolName}`, ctx);
-        syncUi(ctx);
-        return;
-      }
-
-      if (event.type === "tool_execution_end") {
-        appendToolActivity(slot, `${event.isError ? "✗" : "✓"} ${event.toolName}`);
-        setOverlayStatus(session.isStreaming ? `⏳ running tool: ${event.toolName}` : "⏳ streaming...", ctx);
-        syncUi(ctx);
-      }
-    });
-    sessionRuntime.subscriptions.add(unsubscribe);
 
     try {
       await session.prompt(question, { source: "extension" });
@@ -1084,22 +1574,19 @@ export default function (pi: ExtensionAPI) {
         throw new Error("BTW request finished without a response.");
       }
       if (response.stopReason === "aborted") {
-        const slotIndex = slots.indexOf(slot);
-        if (slotIndex >= 0) {
-          slots.splice(slotIndex, 1);
-          setOverlayStatus("Request aborted.", ctx);
-        }
+        removeTranscriptTurn(transcriptState, transcriptState.lastTurnId ?? transcriptState.currentTurnId);
+        setOverlayStatus("Request aborted.", ctx);
         return;
       }
       if (response.stopReason === "error") {
         throw new Error(response.errorMessage || "BTW request failed.");
       }
 
+      const completedTurnId = transcriptState.lastTurnId ?? transcriptState.currentTurnId;
+      const streamedThinking =
+        completedTurnId !== null ? findLatestTranscriptEntry(transcriptState, completedTurnId, "thinking")?.text : "";
       const answer = extractAnswer(response);
-      const thinking = extractThinking(response) || slot.thinking;
-      slot.thinking = thinking;
-      slot.answer = answer;
-      slot.done = true;
+      const thinking = extractThinking(response) || streamedThinking || "";
 
       const details: BtwDetails = {
         question,
@@ -1126,14 +1613,12 @@ export default function (pi: ExtensionAPI) {
         setOverlayStatus("Ready for a follow-up. Hidden BTW thread updated.", ctx);
       }
     } catch (error) {
-      slot.answer = `❌ ${error instanceof Error ? error.message : String(error)}`;
-      slot.done = true;
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      setTranscriptFailure(transcriptState, errorMessage);
       setOverlayStatus("Request failed. Thread preserved for retry or follow-up.", ctx);
-      notify(ctx, error instanceof Error ? error.message : String(error), "error");
+      notify(ctx, errorMessage, "error");
       await disposeBtwSession();
     } finally {
-      sessionRuntime.subscriptions.delete(unsubscribe);
-      unsubscribe();
       syncUi(ctx);
     }
   }

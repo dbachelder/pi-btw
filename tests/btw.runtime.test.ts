@@ -12,6 +12,7 @@ const { streamSimpleMock, completeSimpleMock, createAgentSessionMock, sessionMan
     session: any;
     seedMessages: any[];
     promptCalls: Array<{ text: string; context: StreamContext }>;
+    emit: (event: any) => void;
     getListenerCount: () => number;
     getIsStreaming: () => boolean;
   }>,
@@ -181,6 +182,35 @@ function createBlockingToolStream() {
   };
 }
 
+function createStreamingFailureStream() {
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+
+  return {
+    release,
+    stream: async function* () {
+      yield { type: "thinking_delta" as const, delta: "Inspecting package.json" };
+      yield { type: "tool_execution_start" as const, toolName: "read", args: { path: "package.json" } };
+      await blocked;
+      yield {
+        type: "tool_execution_end" as const,
+        toolName: "read",
+        result: { content: [{ type: "text", text: '{"name":"pi-btw"}' }] },
+      };
+      yield {
+        type: "error" as const,
+        error: {
+          ...makeAssistantMessage(""),
+          stopReason: "error" as const,
+          errorMessage: "Sub-session prompt exploded",
+        },
+      };
+    },
+  };
+}
+
 function buildAssistantContent(thinking: string, answer: string) {
   const content: Array<{ type: "thinking"; thinking: string } | { type: "text"; text: string }> = [];
   if (thinking) {
@@ -214,6 +244,7 @@ function createMockAgentSession(options: any) {
     options,
     seedMessages,
     promptCalls: [] as Array<{ text: string; context: StreamContext }>,
+    emit,
     getListenerCount: () => listeners.size,
     getIsStreaming: () => isStreaming,
     session: null as any,
@@ -256,6 +287,7 @@ function createMockAgentSession(options: any) {
       };
       record.promptCalls.push({ text, context });
 
+      emit({ type: "turn_start" });
       emit({ type: "message_start", message: userMessage });
       emit({ type: "message_end", message: userMessage });
 
@@ -264,6 +296,7 @@ function createMockAgentSession(options: any) {
       let thinking = "";
       let answer = "";
       let finalMessage: ReturnType<typeof makeAssistantMessage> | null = null;
+      const toolResults: Array<{ toolName: string; result: unknown; isError: boolean }> = [];
 
       const emitAssistantUpdate = (assistantMessageEvent: PromptStreamEvent) => {
         const assistantMessage = {
@@ -299,6 +332,7 @@ function createMockAgentSession(options: any) {
         }
 
         if (event.type === "tool_execution_end") {
+          toolResults.push({ toolName: event.toolName, result: event.result, isError: event.isError ?? false });
           emit({
             type: "tool_execution_end",
             toolCallId: `call-${record.promptCalls.length}`,
@@ -321,6 +355,7 @@ function createMockAgentSession(options: any) {
         emit({ type: "message_start", message: finalMessage });
       }
       emit({ type: "message_end", message: finalMessage });
+      emit({ type: "turn_end", message: finalMessage, toolResults });
       stateMessages = [...context.messages.map((message) => structuredClone(message)), structuredClone(finalMessage)];
     }),
     abort: vi.fn(async () => {
@@ -351,6 +386,11 @@ function getCustomEntries(entries: SessionEntry[], customType: string): CustomEn
 function transcriptText(overlay: any): string {
   overlay.refresh();
   return overlay.transcript.children.map((child: any) => child.text).join("\n");
+}
+
+function transcriptEntries(overlay: any) {
+  overlay.refresh();
+  return overlay.getTranscriptEntries();
 }
 
 function findLatest<T>(items: T[], predicate: (item: T) => boolean): T {
@@ -673,6 +713,18 @@ describe("btw runtime behavior", () => {
     expect(overlay.statusText.text).toContain("Ready for a follow-up. Hidden BTW thread updated.");
   });
 
+  it("subscribes to the BTW sub-session as soon as the overlay opens", async () => {
+    const harness = createHarness();
+
+    await harness.runSessionStart();
+    await harness.command("btw", "");
+
+    const record = subSessionRecords[0];
+    expect(record).toBeDefined();
+    expect(record.getListenerCount()).toBe(1);
+    expect(record.session.prompt).not.toHaveBeenCalled();
+  });
+
   it("aborts, disposes, and unsubscribes the active BTW sub-session when Escape dismisses mid-stream", async () => {
     const harness = createHarness();
     const blocking = createBlockingToolStream();
@@ -701,6 +753,33 @@ describe("btw runtime behavior", () => {
 
     blocking.release();
     await pendingCommand;
+  });
+
+  it("ignores late session events after overlay dismissal disposes the sub-session", async () => {
+    const harness = createHarness();
+
+    await harness.runSessionStart();
+    await harness.command("btw", "");
+
+    const overlay = harness.latestOverlayComponent();
+    const firstRecord = subSessionRecords[0];
+    expect(firstRecord.getListenerCount()).toBe(1);
+
+    overlay.input.onEscape?.();
+    await flushAsyncWork();
+
+    expect(firstRecord.session.abort).toHaveBeenCalledTimes(1);
+    expect(firstRecord.session.dispose).toHaveBeenCalledTimes(1);
+    expect(firstRecord.getListenerCount()).toBe(0);
+
+    firstRecord.emit({ type: "turn_start" });
+
+    expect(overlay.getTranscriptEntries()).toEqual([]);
+
+    await harness.command("btw", "");
+    const reopened = harness.latestOverlayComponent();
+    expect(transcriptEntries(reopened)).toEqual([]);
+    expect(transcriptText(reopened)).toContain("No BTW thread yet. Ask a side question to start one.");
   });
 
   it("keeps the thread after Escape dismissal and restores it on reopen", async () => {
@@ -755,6 +834,149 @@ describe("btw runtime behavior", () => {
     expect(transcript).toContain("You  follow-up question");
     expect(transcript).toContain("Second answer");
     expect(overlay.statusText.text).toContain("Ready for a follow-up");
+  });
+
+  it("maps turn, tool, thinking, and assistant events into transcript entries", async () => {
+    const harness = createHarness();
+    streamSimpleMock.mockImplementation(async function* () {
+      yield { type: "thinking_delta" as const, delta: "Inspecting package.json" };
+      yield { type: "tool_execution_start" as const, toolName: "read", args: { path: "package.json" } };
+      yield {
+        type: "tool_execution_end" as const,
+        toolName: "read",
+        result: { content: [{ type: "text", text: '{"name":"pi-btw"}' }] },
+      };
+      yield { type: "text_delta" as const, delta: "The package is pi-btw." };
+      yield {
+        type: "done" as const,
+        message: {
+          ...makeAssistantMessage("The package is pi-btw."),
+          content: buildAssistantContent("Inspecting package.json", "The package is pi-btw."),
+        },
+      };
+    });
+
+    await harness.runSessionStart();
+    await harness.command("btw", "read package metadata");
+
+    const overlay = harness.latestOverlayComponent();
+    const entries = transcriptEntries(overlay);
+
+    expect(entries.map((entry: any) => entry.type)).toEqual([
+      "turn-boundary",
+      "user-message",
+      "thinking",
+      "tool-call",
+      "tool-result",
+      "assistant-text",
+      "turn-boundary",
+    ]);
+    expect(entries[0]).toMatchObject({ type: "turn-boundary", phase: "start" });
+    expect(entries[1]).toMatchObject({ type: "user-message", text: "read package metadata" });
+    expect(entries[2]).toMatchObject({ type: "thinking", text: "Inspecting package.json", streaming: false });
+    expect(entries[3]).toMatchObject({ type: "tool-call", toolName: "read", args: "package.json" });
+    expect(entries[4]).toMatchObject({
+      type: "tool-result",
+      toolName: "read",
+      content: '{"name":"pi-btw"}',
+      truncated: false,
+      isError: false,
+      streaming: false,
+    });
+    expect(entries[5]).toMatchObject({ type: "assistant-text", text: "The package is pi-btw.", streaming: false });
+    expect(entries[6]).toMatchObject({ type: "turn-boundary", phase: "end" });
+  });
+
+  it("renders tool, thinking, result, and turn-separator rows in the overlay transcript", async () => {
+    const harness = createHarness([], {
+      theme: {
+        fg: (name: string, text: string) => `<fg:${name}>${text}</fg:${name}>`,
+        bg: (name: string, text: string) => `<bg:${name}>${text}</bg:${name}>`,
+        italic: (text: string) => `<italic>${text}</italic>`,
+        bold: (text: string) => `<bold>${text}</bold>`,
+      },
+    });
+    const longToolResult = ["line 1", "line 2", "x".repeat(420)].join("\n");
+
+    streamSimpleMock
+      .mockImplementationOnce(async function* () {
+        yield { type: "thinking_delta" as const, delta: "Inspecting package.json" };
+        yield { type: "tool_execution_start" as const, toolName: "read", args: { path: "package.json" } };
+        yield {
+          type: "tool_execution_end" as const,
+          toolName: "read",
+          result: { content: [{ type: "text", text: longToolResult }] },
+        };
+        yield { type: "text_delta" as const, delta: "The package is pi-btw." };
+        yield {
+          type: "done" as const,
+          message: {
+            ...makeAssistantMessage("The package is pi-btw."),
+            content: buildAssistantContent("Inspecting package.json", "The package is pi-btw."),
+          },
+        };
+      })
+      .mockImplementationOnce(() => streamAnswer("Second answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "read package metadata");
+
+    const overlay = harness.latestOverlayComponent();
+    overlay.input.onSubmit?.("second question");
+    await flushAsyncWork();
+
+    const transcript = transcriptText(overlay);
+    expect(transcript).toContain("<bg:toolPendingBg>");
+    expect(transcript).toContain("<italic>Inspecting package.json</italic>");
+    expect(transcript).toContain("<bold>read</bold>");
+    expect(transcript).toContain("package.json");
+    expect(transcript).toContain("↳ result");
+    expect(transcript).toContain("(truncated)");
+    expect(transcript).toContain("line 1");
+    expect(transcript).toContain("────────────────");
+    expect(transcript).toContain("second question");
+    expect(transcript).toContain("Second answer");
+    expect(transcript.indexOf("↳ result")).toBeGreaterThan(transcript.indexOf("<bold>read</bold>"));
+    expect(transcript.indexOf("second question")).toBeGreaterThan(transcript.indexOf("────────────────"));
+  });
+
+  it("transcript inspection exposes streaming and failure state", async () => {
+    const harness = createHarness();
+    const failing = createStreamingFailureStream();
+    streamSimpleMock.mockImplementation(() => failing.stream());
+
+    await harness.runSessionStart();
+    const pendingCommand = harness.command("btw", "read package metadata");
+    await flushAsyncWork();
+
+    const overlay = harness.latestOverlayComponent();
+    let entries = transcriptEntries(overlay);
+    expect(findLatest(entries, (entry: any) => entry.type === "thinking")).toMatchObject({
+      text: "Inspecting package.json",
+      streaming: true,
+    });
+    expect(findLatest(entries, (entry: any) => entry.type === "tool-call")).toMatchObject({
+      toolName: "read",
+      args: "package.json",
+    });
+    expect(entries.some((entry: any) => entry.type === "tool-result")).toBe(false);
+
+    failing.release();
+    await pendingCommand;
+
+    entries = transcriptEntries(overlay);
+    expect(findLatest(entries, (entry: any) => entry.type === "tool-result")).toMatchObject({
+      toolName: "read",
+      content: '{"name":"pi-btw"}',
+      truncated: false,
+      isError: false,
+      streaming: false,
+    });
+    expect(findLatest(entries, (entry: any) => entry.type === "assistant-text")).toMatchObject({
+      text: "❌ Sub-session prompt exploded",
+      streaming: false,
+    });
+    expect(overlay.statusText.text).toContain("Request failed. Thread preserved for retry or follow-up.");
   });
 
   it("clears the modal composer after a follow-up is submitted", async () => {

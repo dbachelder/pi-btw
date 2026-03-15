@@ -22,6 +22,7 @@
 ## Verification
 
 - `npm test -- tests/btw.runtime.test.ts` — assertions that tool-call events produce transcript entries, tool-result events populate results, streaming events update assistant text
+- `npm test -- tests/btw.runtime.test.ts -t "transcript inspection exposes streaming and failure state"` — verifies the inspectable transcript surface shows tool/result rows plus preserved failure output when a BTW request aborts or errors
 - Manual: open BTW in live pi, ask it to read a file, verify tool call and result render in the overlay
 
 ## Observability / Diagnostics
@@ -38,21 +39,21 @@
 
 ## Tasks
 
-- [ ] **T01: Define transcript entry model and event-to-transcript mapper** `est:1h`
+- [x] **T01: Define transcript entry model and event-to-transcript mapper** `est:1h`
   - Why: The overlay needs a data model that can represent tool calls, tool results, assistant text, thinking, and user messages — driven by agent events instead of manual slot management.
   - Files: `extensions/btw.ts`
   - Do: Define `BtwTranscriptEntry` types — `user-message`, `tool-call` (name + args), `tool-result` (content, truncated), `assistant-text` (streaming), `thinking` (streaming), `turn-boundary`. Write an event handler that subscribes to the sub-session's event stream and maps events to transcript entries. `tool_execution_start` → `tool-call` entry. `tool_execution_end` → `tool-result` entry. `message_update` → update `assistant-text` or `thinking` entry. `turn_start` / `turn_end` → turn boundaries. Store entries in a `BtwTranscript` array that replaces `slots[]`.
   - Verify: unit/runtime tests that feed agent events and check transcript entries are created with correct types and content
   - Done when: agent events reliably map to typed transcript entries
 
-- [ ] **T02: Render transcript entries in the overlay component** `est:1h`
+- [x] **T02: Render transcript entries in the overlay component** `est:1h`
   - Why: The transcript entries from T01 need to be rendered visually in the overlay with appropriate styling for each entry type.
   - Files: `extensions/btw.ts`
   - Do: Rewrite `buildOverlayTranscript()` to render from `BtwTranscriptEntry[]` instead of `BtwSlot[]`. Tool calls render with a distinct badge and tool name + truncated args. Tool results render as dimmed/indented text with truncation for large outputs. Assistant text renders with the existing assistant badge and streams in-place. Thinking renders with the existing thinking badge. Turn boundaries render as separator lines. Update `BtwOverlayComponent.refresh()` to use the new transcript. Ensure the scrolling/viewport logic still works with variable-height entries.
   - Verify: manual visual check in live pi plus runtime assertions on rendered line content
   - Done when: overlay shows a visually coherent transcript with tool calls, results, and assistant text distinguishable
 
-- [ ] **T03: Wire event subscription lifecycle to overlay** `est:30m`
+- [x] **T03: Wire event subscription lifecycle to overlay** `est:30m`
   - Why: The subscription to the sub-session's event stream must start when the overlay opens and unsubscribe when it closes — no leaked listeners.
   - Files: `extensions/btw.ts`
   - Do: Subscribe to the sub-session's event stream when the overlay is created (in `ensureOverlay`). Store the unsubscribe function. Call it on Escape/dismiss/dispose. Ensure that refresh calls propagate to `tui.requestRender()` so streaming updates appear in real-time. Handle the case where events arrive while the overlay is hidden (buffer or discard).
