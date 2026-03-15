@@ -135,6 +135,61 @@ Guidelines:
 - Validation: proven by `tests/btw.runtime.test.ts` asserting the `context` hook filters BTW notes from main-session context while leaving non-BTW messages intact.
 - Notes: Preserve current hidden-entry behavior.
 
+### R015 — Full parity with all main-session slash commands inside BTW
+- Class: differentiator
+- Status: active
+- Description: BTW behaves like a complete second command surface with parity to the main input for all slash commands.
+- Why it matters: This could make BTW more powerful for advanced workflows.
+- Source: user
+- Primary owning slice: M002 (sub-session dispatch via prompt())
+- Supporting slices: none
+- Validation: mapped
+- Notes: Sub-session backed by AgentSession.prompt() routes all slash commands through the same dispatch path as the main session.
+
+### R020 — BTW has full tool access (read, bash, edit, write)
+- Class: primary-user-loop
+- Status: active
+- Description: BTW's sub-session has access to the standard coding tools so it can read files, run commands, and edit code as a real working side-agent.
+- Why it matters: This is the core upgrade from a thinking tangent to a working tangent.
+- Source: user
+- Primary owning slice: M002
+- Supporting slices: none
+- Validation: mapped
+- Notes: Tools operate in the same cwd as the main session. No write coordination.
+
+### R021 — BTW runs parallel to the main session
+- Class: differentiator
+- Status: active
+- Description: The main session continues accepting input and streaming while BTW is open and actively running tools.
+- Why it matters: True parallel execution lets the user keep working without pausing for BTW.
+- Source: user
+- Primary owning slice: M002
+- Supporting slices: none
+- Validation: mapped
+- Notes: No guardrails for concurrent file access — user's responsibility.
+
+### R022 — BTW overlay renders full tool-call/result transcript
+- Class: primary-user-loop
+- Status: active
+- Description: The BTW overlay shows tool calls and their results inline, like a real mini-session transcript, not just question/answer text.
+- Why it matters: With full tools, the user needs visibility into what BTW is doing.
+- Source: user
+- Primary owning slice: M002
+- Supporting slices: none
+- Validation: mapped
+- Notes: Compact rendering appropriate for overlay size.
+
+### R023 — BTW sub-session is ephemeral
+- Class: quality-attribute
+- Status: active
+- Description: BTW sub-sessions use in-memory session state that does not persist to disk or survive pi restarts.
+- Why it matters: Keeps BTW lightweight and disposable — no session file clutter.
+- Source: user
+- Primary owning slice: M002
+- Supporting slices: none
+- Validation: mapped
+- Notes: Within a single pi run, sub-session state lives in memory. Dismiss and reopen creates a fresh sub-session.
+
 ## Validated
 
 ### R003 — BTW remains visually modal over the active main work area
@@ -171,17 +226,6 @@ Guidelines:
 - Notes: This is the practical expression of “actual chat interaction.”
 
 ## Deferred
-
-### R015 — Full parity with all main-session slash commands inside BTW
-- Class: differentiator
-- Status: deferred
-- Description: BTW behaves like a complete second command surface with parity to the main input for all slash commands.
-- Why it matters: This could make BTW more powerful for advanced workflows.
-- Source: user
-- Primary owning slice: none
-- Supporting slices: none
-- Validation: unmapped
-- Notes: Deferred unless clean feasibility is proven during M001.
 
 ### R016 — BTW becomes a true embedded second session/workspace
 - Class: differentiator
@@ -247,15 +291,19 @@ Guidelines:
 | R012 | differentiator | validated | M001/S04 | none | proven |
 | R013 | quality-attribute | validated | M001/S04 | M001/S01 | proven |
 | R014 | constraint | validated | M001/S02 | M001/S03 | proven |
-| R015 | differentiator | deferred | none | none | unmapped |
+| R015 | differentiator | active | M002 | none | mapped |
 | R016 | differentiator | deferred | none | none | unmapped |
 | R017 | anti-feature | out-of-scope | none | none | n/a |
 | R018 | anti-feature | out-of-scope | none | none | n/a |
 | R019 | anti-feature | out-of-scope | none | none | n/a |
+| R020 | primary-user-loop | active | M002 | none | mapped |
+| R021 | differentiator | active | M002 | none | mapped |
+| R022 | primary-user-loop | active | M002 | none | mapped |
+| R023 | quality-attribute | active | M002 | none | mapped |
 
 ## Coverage Summary
 
-- Active requirements: 5
-- Mapped to slices: 14
+- Active requirements: 9
+- Mapped to slices: 18
 - Validated: 9
 - Unmapped active requirements: 0

@@ -34,7 +34,7 @@
   },
   "pi": {
     "extensions": [
-      "./extensions"
+      "./extensions/btw.ts"
     ],
     "skills": [
       "./skills"

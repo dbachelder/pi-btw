@@ -27,3 +27,4 @@ See `.gsd/REQUIREMENTS.md` for the explicit capability contract, requirement sta
   - [x] S02: BTW contract preservation
   - [x] S03: Explicit handoff and background-session integration
   - [x] S04: Slash-command support and graceful fallback
+- [ ] M002: BTW sub-session — Replace BTW's manual stream/context plumbing with a real AgentSession sub-session backed by createAgentSession(), giving BTW full tools, native slash commands, and parallel execution.

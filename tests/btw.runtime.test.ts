@@ -62,6 +62,9 @@ const tuiMocks = vi.hoisted(() => {
     getValue() {
       return this.value;
     }
+    render(_width: number) {
+      return [`> ${this.value}`];
+    }
     handleInput(_data: string) {}
   }
 
@@ -147,7 +150,17 @@ function findLatest<T>(items: T[], predicate: (item: T) => boolean): T {
   return match;
 }
 
-function createHarness(initialEntries: SessionEntry[] = []) {
+function createHarness(
+  initialEntries: SessionEntry[] = [],
+  options: {
+    theme?: {
+      fg: (name: string, text: string) => string;
+      bg: (name: string, text: string) => string;
+      italic: (text: string) => string;
+      bold: (text: string) => string;
+    };
+  } = {},
+) {
   const commands = new Map<string, RegisteredCommand>();
   const handlers = new Map<string, Function[]>();
   const entries: SessionEntry[] = [...initialEntries];
@@ -158,7 +171,7 @@ function createHarness(initialEntries: SessionEntry[] = []) {
   const overlayHandles: FakeOverlayHandle[] = [];
   const overlays: Array<{ factoryOptions?: unknown; done?: (result: unknown) => void; component?: any }> = [];
   const tui = { requestRender: vi.fn() };
-  const theme = {
+  const theme = options.theme ?? {
     fg: (_name: string, text: string) => text,
     bg: (_name: string, text: string) => text,
     italic: (text: string) => text,
@@ -188,7 +201,7 @@ function createHarness(initialEntries: SessionEntry[] = []) {
     },
     custom: async (factory: any, options?: any) => {
       let done!: (result: unknown) => void;
-      new Promise((resolve) => {
+      const resultPromise = new Promise((resolve) => {
         done = (result: unknown) => resolve(result);
       });
       const handle = new FakeOverlayHandle();
@@ -196,7 +209,7 @@ function createHarness(initialEntries: SessionEntry[] = []) {
       options?.onHandle?.(handle);
       const component = await factory(tui as any, theme as any, keybindings as any, done);
       overlays.push({ factoryOptions: options, done, component });
-      return undefined;
+      return resultPromise;
     },
     onTerminalInput: () => () => {},
     setStatus: () => {},
@@ -377,6 +390,44 @@ describe("btw runtime behavior", () => {
     expect(overlay.statusText.text).toContain("Ready for a follow-up");
   });
 
+  it("clears the modal composer after a follow-up is submitted", async () => {
+    const harness = createHarness();
+    streamSimpleMock
+      .mockImplementationOnce(() => streamAnswer("First answer"))
+      .mockImplementationOnce(() => streamAnswer("Second answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+
+    const overlay = harness.latestOverlayComponent();
+    overlay.input.setValue("follow-up question");
+    overlay.input.onSubmit?.("follow-up question");
+    await flushAsyncWork();
+
+    expect(overlay.getDraft()).toBe("");
+  });
+
+  it("applies distinct theme treatment to user and assistant transcript rows", async () => {
+    const harness = createHarness([], {
+      theme: {
+        fg: (name: string, text: string) => `<fg:${name}>${text}</fg:${name}>`,
+        bg: (name: string, text: string) => `<bg:${name}>${text}</bg:${name}>`,
+        italic: (text: string) => `<italic>${text}</italic>`,
+        bold: (text: string) => `<bold>${text}</bold>`,
+      },
+    });
+    streamSimpleMock.mockImplementation(() => streamAnswer("First answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+
+    const transcript = transcriptText(harness.latestOverlayComponent());
+    expect(transcript).toContain("<bg:userMessageBg>");
+    expect(transcript).toContain("<fg:accent>");
+    expect(transcript).toContain("<bg:customMessageBg>");
+    expect(transcript).toContain("<fg:success>");
+  });
+
   it("surfaces missing credentials as an explicit error without creating a thread entry", async () => {
     const harness = createHarness();
     harness.setCredentials(false);
@@ -394,7 +445,7 @@ describe("btw runtime behavior", () => {
     });
   });
 
-  it("keeps the main session visible by rendering BTW as an overlay, not a replacement widget", async () => {
+  it("keeps BTW in an overlay and does not leave a persistent widget above the main input", async () => {
     const harness = createHarness();
     streamSimpleMock.mockImplementation(() => streamAnswer("Overlay answer"));
 
@@ -402,8 +453,47 @@ describe("btw runtime behavior", () => {
     await harness.command("btw", "overlay question");
 
     expect(harness.overlays.at(-1)?.factoryOptions).toMatchObject({ overlay: true });
-    const widgetFactory = harness.latestWidgetFactory();
-    expect(widgetFactory).toBeTypeOf("function");
+    expect(harness.widgets.some((entry) => entry.key === "btw" && typeof entry.content === "function")).toBe(false);
+  });
+
+  it("forwards terminal input from the focused overlay to the embedded BTW input", async () => {
+    const harness = createHarness();
+
+    await harness.runSessionStart();
+    await harness.command("btw", "");
+
+    const overlay = harness.latestOverlayComponent();
+    const inputHandleSpy = vi.spyOn(overlay.input, "handleInput");
+
+    overlay.handleInput("abc");
+
+    expect(inputHandleSpy).toHaveBeenCalledWith("abc");
+  });
+
+  it("renders BTW as a bordered fixed-height dialog with an internal transcript viewport", async () => {
+    const harness = createHarness();
+    const longAnswer = Array.from({ length: 24 }, (_, index) => `line ${index + 1} of a long answer`).join("\n");
+
+    streamSimpleMock
+      .mockImplementationOnce(() => streamAnswer(longAnswer))
+      .mockImplementationOnce(() => streamAnswer(longAnswer));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+
+    const overlay = harness.latestOverlayComponent();
+    const firstRender = overlay.render(80);
+
+    overlay.input.onSubmit?.("second question");
+    await flushAsyncWork();
+
+    const secondRender = overlay.render(80);
+
+    expect(firstRender[0]).toContain("┌");
+    expect(firstRender.at(-1)).toContain("└");
+    expect(secondRender[0]).toContain("┌");
+    expect(secondRender.at(-1)).toContain("└");
+    expect(firstRender.length).toBe(secondRender.length);
   });
 
   it("/btw:new appends a reset marker, clears prior hidden thread state, stays contextual, and reopens a fresh thread", async () => {

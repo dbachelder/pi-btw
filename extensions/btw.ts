@@ -15,8 +15,12 @@ import {
   Box,
   Container,
   Input,
-  Spacer,
+  Key,
   Text,
+  matchesKey,
+  truncateToWidth,
+  visibleWidth,
+  wrapTextWithAnsi,
   type Focusable,
   type KeybindingsManager,
   type OverlayHandle,
@@ -74,6 +78,9 @@ type OverlayRuntime = {
   handle?: OverlayHandle;
   refresh?: () => void;
   close?: () => void;
+  finish?: () => void;
+  setDraft?: (value: string) => void;
+  closed?: boolean;
 };
 
 function isVisibleBtwMessage(message: { role: string; customType?: string }): boolean {
@@ -240,31 +247,48 @@ function getOverlayTitle(mode: BtwThreadMode): string {
   return mode === "tangent" ? "BTW tangent" : "BTW";
 }
 
-function buildOverlayTranscript(slots: BtwSlot[]): string[] {
+function buildTranscriptBadge(
+  theme: ExtensionContext["ui"]["theme"],
+  label: string,
+  background: string,
+  foreground: string,
+): string {
+  return theme.bg(background, theme.fg(foreground, theme.bold(` ${label} `)));
+}
+
+function buildOverlayTranscript(slots: BtwSlot[], theme: ExtensionContext["ui"]["theme"]): string[] {
   if (slots.length === 0) {
-    return ["No BTW thread yet. Ask a side question to start one."];
+    return [theme.fg("dim", "No BTW thread yet. Ask a side question to start one.")];
   }
 
   const lines: string[] = [];
   for (let i = 0; i < slots.length; i++) {
     const slot = slots[i];
     if (i > 0) {
-      lines.push("", "────────────────────────────────────────");
+      lines.push("", theme.fg("borderMuted", "────────────────────────────────────────"));
     }
 
-    lines.push(`You  ${slot.question}`);
+    const userBadge = buildTranscriptBadge(theme, "You", "userMessageBg", "accent");
+    const thinkingBadge = buildTranscriptBadge(theme, "Thinking", "toolPendingBg", "warning");
+    const assistantBadge = buildTranscriptBadge(theme, "Assistant", "customMessageBg", "success");
+
+    lines.push(`${userBadge} ${slot.question}`);
 
     if (slot.thinking) {
-      lines.push("", `Thinking${!slot.done && !slot.answer ? " ▍" : ""}`, slot.thinking);
+      lines.push(
+        "",
+        !slot.done && !slot.answer ? `${thinkingBadge} ${theme.fg("warning", "streaming")}` : thinkingBadge,
+        theme.fg("warning", slot.thinking),
+      );
     }
 
     if (slot.answer) {
-      lines.push("", `Assistant${!slot.done ? " ▍" : ""}`, slot.answer);
+      lines.push("", !slot.done ? `${assistantBadge} ${theme.fg("warning", "▍")}` : assistantBadge, slot.answer);
     } else if (!slot.done) {
-      lines.push("", "Assistant", "⏳ thinking...");
+      lines.push("", assistantBadge, theme.fg("warning", "⏳ thinking..."));
     }
 
-    lines.push("", `Model  ${slot.modelLabel}`);
+    lines.push("", theme.fg("dim", `model: ${slot.modelLabel}`));
   }
 
   return lines;
@@ -283,6 +307,11 @@ class BtwOverlayComponent extends Container implements Focusable {
   private readonly onSubmitCallback: (value: string) => void;
   private readonly onDismissCallback: () => void;
   private readonly tui: TUI;
+  private readonly theme: ExtensionContext["ui"]["theme"];
+  private transcriptLines: string[] = [];
+  private transcriptScrollOffset = 0;
+  private transcriptViewportHeight = 8;
+  private followTranscript = true;
   private _focused = false;
 
   get focused(): boolean {
@@ -296,7 +325,7 @@ class BtwOverlayComponent extends Container implements Focusable {
 
   constructor(
     tui: TUI,
-    _theme: ExtensionContext["ui"]["theme"],
+    theme: ExtensionContext["ui"]["theme"],
     keybindings: KeybindingsManager,
     getSlots: () => BtwSlot[],
     getStatus: () => string | null,
@@ -306,42 +335,28 @@ class BtwOverlayComponent extends Container implements Focusable {
   ) {
     super();
     this.tui = tui;
+    this.theme = theme;
     this.getSlots = getSlots;
     this.getStatus = getStatus;
     this.getMode = getMode;
     this.onSubmitCallback = onSubmit;
     this.onDismissCallback = onDismiss;
 
-    this.addChild(new Text("", 0, 0));
     this.modeText = new Text("", 1, 0);
-    this.addChild(this.modeText);
-    this.addChild(new Spacer(1));
-
     this.summaryText = new Text("", 1, 0);
-    this.addChild(this.summaryText);
-    this.addChild(new Spacer(1));
-
     this.transcript = new Container();
-    this.addChild(this.transcript);
-    this.addChild(new Spacer(1));
-
     this.statusText = new Text("", 1, 0);
-    this.addChild(this.statusText);
-    this.addChild(new Spacer(1));
 
     this.input = new Input();
     this.input.onSubmit = (value) => {
+      this.followTranscript = true;
       this.onSubmitCallback(value);
     };
     this.input.onEscape = () => {
       this.onDismissCallback();
     };
-    this.addChild(this.input);
-    this.addChild(new Spacer(1));
 
     this.hintsText = new Text("", 1, 0);
-    this.addChild(this.hintsText);
-    this.addChild(new Text("", 0, 0));
 
     const originalHandleInput = this.input.handleInput.bind(this.input);
     this.input.handleInput = (data: string) => {
@@ -355,6 +370,103 @@ class BtwOverlayComponent extends Container implements Focusable {
     this.refresh();
   }
 
+  private frameLine(content: string, innerWidth: number): string {
+    const truncated = truncateToWidth(content, innerWidth, "");
+    const padding = Math.max(0, innerWidth - visibleWidth(truncated));
+    return `${this.theme.fg("borderMuted", "│")} ${truncated}${" ".repeat(padding)} ${this.theme.fg("borderMuted", "│")}`;
+  }
+
+  private ruleLine(innerWidth: number): string {
+    return this.theme.fg("borderMuted", `├${"─".repeat(innerWidth + 2)}┤`);
+  }
+
+  private wrapTranscript(innerWidth: number): string[] {
+    const wrapped: string[] = [];
+    for (const line of this.transcriptLines) {
+      if (!line) {
+        wrapped.push("");
+        continue;
+      }
+      wrapped.push(...wrapTextWithAnsi(line, Math.max(1, innerWidth)));
+    }
+    return wrapped;
+  }
+
+  private getDialogHeight(): number {
+    const terminalRows = process.stdout.rows ?? 30;
+    return Math.max(16, Math.min(24, Math.floor(terminalRows * 0.7)));
+  }
+
+  handleInput(data: string): void {
+    if (matchesKey(data, Key.pageUp)) {
+      this.followTranscript = false;
+      this.transcriptScrollOffset = Math.max(0, this.transcriptScrollOffset - Math.max(1, this.transcriptViewportHeight - 1));
+      this.tui.requestRender();
+      return;
+    }
+
+    if (matchesKey(data, Key.pageDown)) {
+      this.transcriptScrollOffset += Math.max(1, this.transcriptViewportHeight - 1);
+      this.tui.requestRender();
+      return;
+    }
+
+    this.input.handleInput(data);
+  }
+
+  override render(width: number): string[] {
+    const dialogWidth = Math.max(24, width);
+    const innerWidth = Math.max(20, dialogWidth - 4);
+    const dialogHeight = this.getDialogHeight();
+    const transcriptHeight = Math.max(6, dialogHeight - 8);
+    this.transcriptViewportHeight = transcriptHeight;
+
+    const transcriptLines = this.wrapTranscript(innerWidth);
+    const maxScroll = Math.max(0, transcriptLines.length - transcriptHeight);
+    if (this.followTranscript) {
+      this.transcriptScrollOffset = maxScroll;
+    } else {
+      this.transcriptScrollOffset = Math.max(0, Math.min(this.transcriptScrollOffset, maxScroll));
+      if (this.transcriptScrollOffset >= maxScroll) {
+        this.followTranscript = true;
+      }
+    }
+
+    const visibleTranscript = transcriptLines.slice(
+      this.transcriptScrollOffset,
+      this.transcriptScrollOffset + transcriptHeight,
+    );
+    const transcriptPadCount = Math.max(0, transcriptHeight - visibleTranscript.length);
+    const hiddenAbove = this.transcriptScrollOffset;
+    const hiddenBelow = Math.max(0, maxScroll - this.transcriptScrollOffset);
+    const summary =
+      hiddenAbove || hiddenBelow
+        ? `${this.summaryText.text.trim()} · ↑${hiddenAbove} ↓${hiddenBelow}`
+        : this.summaryText.text.trim();
+
+    const inputLine = this.input.render(innerWidth)[0] ?? "";
+    const lines = [this.theme.fg("accent", `┌${"─".repeat(innerWidth + 2)}┐`)];
+
+    lines.push(this.frameLine(this.theme.fg("accent", this.theme.bold(this.modeText.text.trim())), innerWidth));
+    lines.push(this.frameLine(this.theme.fg("dim", summary), innerWidth));
+    lines.push(this.ruleLine(innerWidth));
+
+    for (const line of visibleTranscript) {
+      lines.push(this.frameLine(line, innerWidth));
+    }
+    for (let i = 0; i < transcriptPadCount; i++) {
+      lines.push(this.frameLine("", innerWidth));
+    }
+
+    lines.push(this.ruleLine(innerWidth));
+    lines.push(this.frameLine(this.theme.fg("warning", this.statusText.text.trim()), innerWidth));
+    lines.push(this.frameLine(inputLine, innerWidth));
+    lines.push(this.frameLine(this.theme.fg("dim", this.hintsText.text.trim()), innerWidth));
+    lines.push(this.theme.fg("accent", `└${"─".repeat(innerWidth + 2)}┘`));
+
+    return lines;
+  }
+
   setDraft(value: string): void {
     this.input.setValue(value);
     this.tui.requestRender();
@@ -365,20 +477,21 @@ class BtwOverlayComponent extends Container implements Focusable {
   }
 
   refresh(): void {
-    this.modeText.setText(` ${getOverlayTitle(this.getMode())} · hidden thread preserved `);
+    this.modeText.setText(`${getOverlayTitle(this.getMode())} · hidden thread preserved`);
     const slots = this.getSlots();
     const exchanges = slots.filter((slot) => slot.done).length;
     const active = slots.some((slot) => !slot.done) ? " · streaming" : " · idle";
-    this.summaryText.setText(` ${exchanges} exchange${exchanges === 1 ? "" : "s"}${active}`);
+    this.summaryText.setText(`${exchanges} exchange${exchanges === 1 ? "" : "s"}${active}`);
 
+    this.transcriptLines = buildOverlayTranscript(slots, this.theme);
     this.transcript.clear();
-    for (const line of buildOverlayTranscript(slots)) {
+    for (const line of this.transcriptLines) {
       this.transcript.addChild(new Text(line, 1, 0));
     }
 
     const status = this.getStatus() ?? "Ready. Enter submits; Escape dismisses without clearing.";
-    this.statusText.setText(` ${status}`);
-    this.hintsText.setText(" Enter submit · Escape dismiss · /btw:clear resets thread ");
+    this.statusText.setText(status);
+    this.hintsText.setText("Enter submit · Escape dismiss · PgUp/PgDn scroll · /btw:clear resets thread");
     this.tui.requestRender();
   }
 }
@@ -387,7 +500,6 @@ export default function (pi: ExtensionAPI) {
   let pendingThread: BtwDetails[] = [];
   let pendingMode: BtwThreadMode = "contextual";
   let slots: BtwSlot[] = [];
-  let widgetStatus: string | null = null;
   let overlayStatus: string | null = null;
   let overlayDraft = "";
   let overlayRuntime: OverlayRuntime | null = null;
@@ -396,15 +508,19 @@ export default function (pi: ExtensionAPI) {
   function syncUi(ctx?: ExtensionContext | ExtensionCommandContext): void {
     const activeCtx = ctx ?? lastUiContext;
     if (activeCtx?.hasUI) {
-      renderWidget(activeCtx);
+      activeCtx.ui.setWidget("btw", undefined);
       overlayRuntime?.refresh?.();
     }
   }
 
   function setOverlayStatus(status: string | null, ctx?: ExtensionContext | ExtensionCommandContext): void {
     overlayStatus = status;
-    widgetStatus = status;
     syncUi(ctx);
+  }
+
+  function setOverlayDraft(value: string): void {
+    overlayDraft = value;
+    overlayRuntime?.setDraft?.(value);
   }
 
   function dismissOverlay(): void {
@@ -420,69 +536,7 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  function renderWidget(ctx: ExtensionContext | ExtensionCommandContext): void {
-    if (!ctx.hasUI) {
-      return;
-    }
 
-    if (slots.length === 0 && !widgetStatus) {
-      ctx.ui.setWidget("btw", undefined);
-      return;
-    }
-
-    ctx.ui.setWidget(
-      "btw",
-      (_tui, theme) => {
-        const dim = (text: string) => theme.fg("dim", text);
-        const success = (text: string) => theme.fg("success", text);
-        const italic = (text: string) => theme.fg("dim", theme.italic(text));
-        const warning = (text: string) => theme.fg("warning", text);
-        const parts: string[] = [];
-
-        const title = pendingMode === "tangent" ? " 💭 btw:tangent " : " 💭 btw ";
-        const hint = " Esc dismiss · /btw:clear reset ";
-        const width = Math.max(22, 68 - title.length - hint.length);
-        parts.push(dim(`╭${title}${"─".repeat(width)}${hint}╮`));
-
-        for (let i = 0; i < slots.length; i++) {
-          const slot = slots[i];
-          if (i > 0) {
-            parts.push(dim("│ ───"));
-          }
-
-          parts.push(dim("│ ") + success("› ") + slot.question);
-
-          if (slot.thinking) {
-            const cursor = !slot.answer && !slot.done ? warning(" ▍") : "";
-            parts.push(dim("│ ") + italic(slot.thinking) + cursor);
-          }
-
-          if (slot.answer) {
-            const answerLines = slot.answer.split("\n");
-            parts.push(dim("│ ") + answerLines[0]);
-            if (answerLines.length > 1) {
-              parts.push(answerLines.slice(1).join("\n"));
-            }
-            if (!slot.done) {
-              parts[parts.length - 1] += warning(" ▍");
-            }
-          } else if (!slot.done) {
-            parts.push(dim("│ ") + warning("⏳ thinking..."));
-          }
-
-          parts.push(dim("│ ") + dim(`model: ${slot.modelLabel}`));
-        }
-
-        if (widgetStatus) {
-          parts.push(dim("│ ") + warning(widgetStatus));
-        }
-
-        parts.push(dim(`╰${"─".repeat(68)}╯`));
-        return new Text(parts.join("\n"), 0, 0);
-      },
-      { placement: "aboveEditor" },
-    );
-  }
 
   async function ensureOverlay(ctx: ExtensionCommandContext | ExtensionContext): Promise<void> {
     if (!ctx.hasUI) {
@@ -498,65 +552,89 @@ export default function (pi: ExtensionAPI) {
     }
 
     const runtime: OverlayRuntime = {};
-    overlayRuntime = runtime;
-
-    runtime.close = () => {
+    const closeRuntime = () => {
+      if (runtime.closed) {
+        return;
+      }
+      runtime.closed = true;
       runtime.handle?.hide();
-      overlayRuntime = null;
+      if (overlayRuntime === runtime) {
+        overlayRuntime = null;
+      }
+      runtime.finish?.();
     };
 
-    const component = await ctx.ui.custom<void>(
-      async (tui, theme, keybindings, done) => {
-        const overlay = new BtwOverlayComponent(
-          tui,
-          theme,
-          keybindings,
-          () => slots,
-          () => overlayStatus,
-          () => pendingMode,
-          (value) => {
-            overlayDraft = value;
-            void submitFromOverlay(ctx, value);
-          },
-          () => {
-            overlayDraft = overlay.getDraft();
-            runtime.close?.();
+    runtime.close = closeRuntime;
+    overlayRuntime = runtime;
+
+    void ctx.ui
+      .custom<void>(
+        async (tui, theme, keybindings, done) => {
+          runtime.finish = () => {
             done();
-          },
-        );
+          };
 
-        overlay.setDraft(overlayDraft);
-        runtime.refresh = () => {
-          overlay.refresh();
-          if (!runtime.handle?.isFocused()) {
-            overlay.focused = false;
+          const overlay = new BtwOverlayComponent(
+            tui,
+            theme,
+            keybindings,
+            () => slots,
+            () => overlayStatus,
+            () => pendingMode,
+            (value) => {
+              void submitFromOverlay(ctx, value);
+            },
+            () => {
+              overlayDraft = overlay.getDraft();
+              closeRuntime();
+            },
+          );
+
+          overlay.setDraft(overlayDraft);
+          runtime.setDraft = (value) => {
+            overlay.setDraft(value);
+          };
+          runtime.refresh = () => {
+            overlay.refresh();
+            if (!runtime.handle?.isFocused()) {
+              overlay.focused = false;
+            }
+          };
+          runtime.close = () => {
+            overlayDraft = overlay.getDraft();
+            closeRuntime();
+          };
+
+          if (runtime.closed) {
+            done();
           }
-        };
-        runtime.close = () => {
-          overlayDraft = overlay.getDraft();
-          runtime.handle?.hide();
+
+          return overlay;
+        },
+        {
+          overlay: true,
+          overlayOptions: {
+            width: "78%",
+            minWidth: 72,
+            maxHeight: "78%",
+            anchor: "center",
+            margin: 1,
+          },
+          onHandle: (handle) => {
+            runtime.handle = handle;
+            handle.focus();
+            if (runtime.closed) {
+              closeRuntime();
+            }
+          },
+        },
+      )
+      .catch((error) => {
+        if (overlayRuntime === runtime) {
           overlayRuntime = null;
-        };
-
-        return overlay;
-      },
-      {
-        overlay: true,
-        overlayOptions: {
-          width: "78%",
-          minWidth: 72,
-          maxHeight: "78%",
-          anchor: "center",
-          margin: 1,
-        },
-        onHandle: (handle) => {
-          runtime.handle = handle;
-          handle.focus();
-        },
-      },
-    );
-
-    void component;
+        }
+        notify(ctx, error instanceof Error ? error.message : String(error), "error");
+      });
   }
 
   async function dispatchBtwCommand(name: string, args: string, ctx: ExtensionCommandContext): Promise<boolean> {
@@ -690,7 +768,6 @@ export default function (pi: ExtensionAPI) {
     }
 
     const slashCommand = parseOverlaySlashCommand(question);
-    overlayDraft = "";
 
     if (question.startsWith("/") && !slashCommand) {
       const message = "Unsupported slash input in BTW. Only /btw, /btw:new, /btw:tangent, /btw:clear, /btw:inject, and /btw:summarize run inside the modal.";
@@ -701,10 +778,12 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (slashCommand) {
+      setOverlayDraft("");
       await dispatchBtwCommand(slashCommand.name, slashCommand.args, ctx);
       return;
     }
 
+    setOverlayDraft("");
     setOverlayStatus("⏳ streaming...", ctx);
     syncUi(ctx);
     await runBtw(ctx, question, false, pendingMode);
@@ -719,7 +798,7 @@ export default function (pi: ExtensionAPI) {
     pendingThread = [];
     pendingMode = mode;
     slots = [];
-    overlayDraft = "";
+    setOverlayDraft("");
     setOverlayStatus(null, ctx);
     if (persist) {
       const details: BtwResetDetails = { timestamp: Date.now(), mode };
@@ -736,7 +815,6 @@ export default function (pi: ExtensionAPI) {
     overlayDraft = "";
     lastUiContext = ctx;
     overlayStatus = null;
-    widgetStatus = null;
 
     const branch = ctx.sessionManager.getBranch();
     let lastResetIndex = -1;
