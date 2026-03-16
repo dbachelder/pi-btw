@@ -1,6 +1,8 @@
 node_modules/
 .DS_Store
 *.log
+.bg-shell/
+.gsd/
 
 # ── GSD baseline (auto-generated) ──
 .gsd/activity/
