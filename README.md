@@ -15,6 +15,7 @@ A small [pi](https://github.com/badlogic/pi-mono) extension that adds a `/btw` s
 - opens a focused BTW modal shell with its own composer and transcript
 - keeps the BTW overlay open while you switch focus back to the main editor with `Alt+/`
 - keeps BTW thread entries out of the main agent's future context
+- supports BTW-only model and thinking overrides without changing the main thread settings
 - lets you inject the full thread, or a summary of it, back into the main agent
 - optionally saves an individual BTW exchange as a visible session note with `--save`
 
@@ -52,6 +53,8 @@ pi install /absolute/path/to/pi-btw
 /btw --save summarize the last error in one sentence
 /btw:new let's start a fresh thread about auth
 /btw:tangent brainstorm from first principles without using the current chat context
+/btw:model openai gpt-5-mini openai-responses
+/btw:thinking low
 /btw:inject implement the plan we just discussed
 /btw:summarize turn that side thread into a short handoff
 /btw:clear
@@ -105,10 +108,25 @@ pi install /absolute/path/to/pi-btw
 
 ### `/btw:summarize [instructions]`
 
-- summarizes the BTW thread with the current model
+- summarizes the BTW thread with the current effective BTW model
+- always runs summarize with thinking off, even if BTW chat is using a thinking override
 - injects the summary into the main agent
 - if pi is busy, queues it as a follow-up
 - clears the BTW thread after sending
+
+### `/btw:model [<provider> <model> <api> | clear]`
+
+- with no args, shows the current effective BTW model and whether it is inherited or overridden
+- with values, sets a BTW-only model override
+- `clear` removes the override and returns BTW to inheriting the main thread model
+- if the configured BTW model has no credentials, BTW warns and falls back to the main thread model
+
+### `/btw:thinking [<level> | clear]`
+
+- with no args, shows the current effective BTW thinking level and whether it is inherited or overridden
+- with a value, sets a BTW-only thinking override for normal BTW chat
+- `clear` removes the override and returns BTW to inheriting the main thread thinking level
+- changing `/btw:model` or `/btw:thinking` disposes the current BTW sub-session and applies the new settings on the next BTW prompt while preserving the hidden thread
 
 ## Behavior
 
@@ -118,6 +136,8 @@ BTW is implemented as an actual pi sub-session with its own in-memory session st
 
 - contextual `/btw` threads seed that sub-session from the current main-session branch while filtering out BTW-visible notes from the parent context
 - `/btw:tangent` starts the same BTW UI in a contextless mode with no inherited main-session conversation
+- BTW can inherit the main thread model/thinking settings or use BTW-only overrides via `/btw:model` and `/btw:thinking`
+- `/btw:summarize` uses the current effective BTW model but keeps thinking off
 - the overlay transcript/status line is driven from sub-session events, so tool activity, streaming deltas, failures, and recovery are all visible without scraping rendered output
 - handoff commands (`/btw:inject` and `/btw:summarize`) read from the BTW sub-session thread rather than maintaining a separate manual transcript model
 
@@ -125,7 +145,7 @@ BTW is implemented as an actual pi sub-session with its own in-memory session st
 
 Inside the BTW modal composer, slash handling is split at the BTW/session boundary:
 
-- `/btw:new`, `/btw:tangent`, `/btw:clear`, `/btw:inject`, and `/btw:summarize` stay owned by BTW because they control BTW lifecycle or handoff behavior
+- `/btw:new`, `/btw:tangent`, `/btw:clear`, `/btw:model`, `/btw:thinking`, `/btw:inject`, and `/btw:summarize` stay owned by BTW because they control BTW lifecycle, configuration, or handoff behavior
 - any other slash-prefixed input is routed through the BTW sub-session's normal `prompt()` path
 - this means ordinary pi slash commands like `/help` are handled by the sub-session instead of being rejected by a modal-only fallback
 - if the sub-session cannot handle a slash command, BTW surfaces the real sub-session failure through the transcript/status state instead of inventing an "unsupported slash input" warning
@@ -141,6 +161,7 @@ BTW exchanges are persisted in the session as hidden custom entries so they:
 - survive reloads and restarts
 - rehydrate the BTW modal shell for the current branch
 - preserve whether the current side thread is a normal `/btw` thread or a contextless `/btw:tangent`
+- preserve the current BTW-only model and thinking overrides for that session history
 - stay out of the main agent's LLM context
 
 ### Visible saved notes

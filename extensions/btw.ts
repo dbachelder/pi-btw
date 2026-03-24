@@ -31,6 +31,8 @@ import {
 const BTW_MESSAGE_TYPE = "btw-note";
 const BTW_ENTRY_TYPE = "btw-thread-entry";
 const BTW_RESET_TYPE = "btw-thread-reset";
+const BTW_MODEL_OVERRIDE_TYPE = "btw-model-override";
+const BTW_THINKING_OVERRIDE_TYPE = "btw-thinking-override";
 const BTW_FOCUS_SHORTCUTS = [Key.alt("/"), Key.ctrlAlt("w")] as const;
 
 function matchesBtwFocusShortcut(data: string): boolean {
@@ -53,6 +55,7 @@ const BTW_CONTINUE_THREAD_ASSISTANT_TEXT = "Understood, continuing our side conv
 
 type SessionThinkingLevel = "off" | AiThinkingLevel;
 type BtwThreadMode = "contextual" | "tangent";
+type SessionModel = NonNullable<ExtensionCommandContext["model"]>;
 
 type BtwDetails = {
   question: string;
@@ -60,6 +63,7 @@ type BtwDetails = {
   answer: string;
   provider: string;
   model: string;
+  api: string;
   thinkingLevel: SessionThinkingLevel;
   timestamp: number;
   usage?: AssistantMessage["usage"];
@@ -75,6 +79,30 @@ type SaveState = "not-saved" | "saved" | "queued";
 type BtwResetDetails = {
   timestamp: number;
   mode?: BtwThreadMode;
+};
+
+type BtwModelOverrideDetails =
+  | ({ timestamp: number; action: "set" } & Pick<SessionModel, "provider" | "id" | "api">)
+  | { timestamp: number; action: "clear" };
+
+type BtwThinkingOverrideDetails =
+  | { timestamp: number; action: "set"; thinkingLevel: SessionThinkingLevel }
+  | { timestamp: number; action: "clear" };
+
+type ResolvedBtwModel = {
+  model: SessionModel | null;
+  source: "override" | "main" | "none";
+  configuredOverride: SessionModel | null;
+  fallbackReason?: string;
+};
+
+type ResolvedBtwSettings = {
+  model: SessionModel | null;
+  modelSource: "override" | "main" | "none";
+  configuredModelOverride: SessionModel | null;
+  thinkingLevel: SessionThinkingLevel;
+  thinkingSource: "override" | "main";
+  fallbackReason?: string;
 };
 
 type BtwTranscriptEntry =
@@ -185,10 +213,54 @@ function parseBtwArgs(args: string): ParsedBtwArgs {
   return { question, save };
 }
 
+function parseBtwModelArgs(args: string):
+  | { action: "show" }
+  | { action: "clear" }
+  | { action: "set"; model: SessionModel }
+  | { action: "invalid"; message: string } {
+  const trimmed = args.trim();
+  if (!trimmed) {
+    return { action: "show" };
+  }
+
+  if (trimmed === "clear") {
+    return { action: "clear" };
+  }
+
+  const parts = trimmed.split(/\s+/);
+  if (parts.length !== 3) {
+    return { action: "invalid", message: "Usage: /btw:model <provider> <model> <api> | clear" };
+  }
+
+  const [provider, id, api] = parts;
+  return { action: "set", model: { provider, id, api } };
+}
+
+function parseBtwThinkingArgs(args: string):
+  | { action: "show" }
+  | { action: "clear" }
+  | { action: "set"; thinkingLevel: SessionThinkingLevel } {
+  const trimmed = args.trim();
+  if (!trimmed) {
+    return { action: "show" };
+  }
+
+  if (trimmed === "clear") {
+    return { action: "clear" };
+  }
+
+  return { action: "set", thinkingLevel: trimmed as SessionThinkingLevel };
+}
+
+function formatModelRef(model: Pick<SessionModel, "provider" | "id" | "api">): string {
+  return `${model.provider}/${model.id} (${model.api})`;
+}
+
 function buildBtwSeedState(
   ctx: ExtensionCommandContext,
   thread: BtwDetails[],
   mode: BtwThreadMode,
+  sessionModel: SessionModel | null,
 ): { messages: Message[]; sideThreadStartIndex: number } {
   const messages: Message[] = [];
 
@@ -229,9 +301,9 @@ function buildBtwSeedState(
       {
         role: "assistant",
         content: [{ type: "text", text: BTW_CONTINUE_THREAD_ASSISTANT_TEXT }],
-        provider: ctx.model?.provider ?? "unknown",
-        model: ctx.model?.id ?? "unknown",
-        api: ctx.model?.api ?? "openai-responses",
+        provider: sessionModel?.provider ?? "unknown",
+        model: sessionModel?.id ?? "unknown",
+        api: sessionModel?.api ?? "openai-responses",
         usage: {
           input: 0,
           output: 0,
@@ -257,7 +329,7 @@ function buildBtwSeedState(
           content: [{ type: "text", text: entry.answer }],
           provider: entry.provider,
           model: entry.model,
-          api: ctx.model?.api ?? "openai-responses",
+          api: entry.api || sessionModel?.api || ctx.model?.api || "openai-responses",
           usage:
             entry.usage ?? {
               input: 0,
@@ -1185,6 +1257,8 @@ class BtwOverlayComponent extends Container implements Focusable {
 export default function (pi: ExtensionAPI) {
   let pendingThread: BtwDetails[] = [];
   let pendingMode: BtwThreadMode = "contextual";
+  let btwModelOverride: SessionModel | null = null;
+  let btwThinkingOverride: SessionThinkingLevel | null = null;
   let transcriptState = createEmptyTranscriptState();
   let overlayStatus: string | null = null;
   let overlayDraft = "";
@@ -1330,17 +1404,151 @@ export default function (pi: ExtensionAPI) {
     await disposeBtwSession();
   }
 
+  async function resolveBtwModel(
+    ctx: ExtensionCommandContext,
+    notifyOnFallback = false,
+  ): Promise<ResolvedBtwModel> {
+    if (btwModelOverride) {
+      const auth = await ctx.modelRegistry.getApiKeyAndHeaders(btwModelOverride);
+      if (auth.ok && auth.apiKey) {
+        return {
+          model: btwModelOverride,
+          source: "override",
+          configuredOverride: btwModelOverride,
+        };
+      }
+
+      const fallbackReason = ctx.model
+        ? `Configured BTW model ${formatModelRef(btwModelOverride)} has no credentials. Falling back to main model ${formatModelRef(
+            ctx.model,
+          )}.`
+        : `Configured BTW model ${formatModelRef(btwModelOverride)} has no credentials, and no main model is active.`;
+      if (notifyOnFallback) {
+        notify(ctx, fallbackReason, "warning");
+      }
+
+      if (ctx.model) {
+        return {
+          model: ctx.model,
+          source: "main",
+          configuredOverride: btwModelOverride,
+          fallbackReason,
+        };
+      }
+
+      return {
+        model: null,
+        source: "none",
+        configuredOverride: btwModelOverride,
+        fallbackReason,
+      };
+    }
+
+    if (ctx.model) {
+      return {
+        model: ctx.model,
+        source: "main",
+        configuredOverride: null,
+      };
+    }
+
+    return {
+      model: null,
+      source: "none",
+      configuredOverride: null,
+    };
+  }
+
+  async function resolveBtwSettings(
+    ctx: ExtensionCommandContext,
+    notifyOnFallback = false,
+  ): Promise<ResolvedBtwSettings> {
+    const resolvedModel = await resolveBtwModel(ctx, notifyOnFallback);
+    const thinkingLevel = btwThinkingOverride ?? (pi.getThinkingLevel() as SessionThinkingLevel);
+
+    return {
+      model: resolvedModel.model,
+      modelSource: resolvedModel.source,
+      configuredModelOverride: resolvedModel.configuredOverride,
+      thinkingLevel,
+      thinkingSource: btwThinkingOverride ? "override" : "main",
+      fallbackReason: resolvedModel.fallbackReason,
+    };
+  }
+
+  function describeResolvedModel(settings: ResolvedBtwSettings): string {
+    if (!settings.model) {
+      if (settings.configuredModelOverride && settings.fallbackReason) {
+        return `BTW model unavailable. ${settings.fallbackReason}`;
+      }
+      return "BTW model unavailable. No active model selected.";
+    }
+
+    const source =
+      settings.modelSource === "override"
+        ? "override"
+        : settings.configuredModelOverride
+          ? "inherited fallback"
+          : "inherits main thread";
+    return `BTW model: ${formatModelRef(settings.model)} (${source}).${
+      settings.fallbackReason ? ` ${settings.fallbackReason}` : ""
+    }`;
+  }
+
+  function describeResolvedThinking(settings: ResolvedBtwSettings): string {
+    const source = settings.thinkingSource === "override" ? "override" : "inherits main thread";
+    return `BTW thinking: ${settings.thinkingLevel} (${source}).`;
+  }
+
+  async function setBtwModelOverride(ctx: ExtensionCommandContext, nextModel: SessionModel | null): Promise<void> {
+    btwModelOverride = nextModel;
+    const details: BtwModelOverrideDetails = nextModel
+      ? { action: "set", timestamp: Date.now(), provider: nextModel.provider, id: nextModel.id, api: nextModel.api }
+      : { action: "clear", timestamp: Date.now() };
+    pi.appendEntry(BTW_MODEL_OVERRIDE_TYPE, details);
+    await disposeBtwSession();
+    const settings = await resolveBtwSettings(ctx);
+    const message = nextModel
+      ? `BTW model override set to ${formatModelRef(nextModel)}.`
+      : "BTW model override cleared. BTW now inherits the main thread model.";
+    setOverlayStatus(message, ctx);
+    notify(ctx, `${message} ${describeResolvedModel(settings)}`, "info");
+  }
+
+  async function setBtwThinkingOverride(
+    ctx: ExtensionCommandContext,
+    nextThinkingLevel: SessionThinkingLevel | null,
+  ): Promise<void> {
+    btwThinkingOverride = nextThinkingLevel;
+    const details: BtwThinkingOverrideDetails = nextThinkingLevel
+      ? { action: "set", timestamp: Date.now(), thinkingLevel: nextThinkingLevel }
+      : { action: "clear", timestamp: Date.now() };
+    pi.appendEntry(BTW_THINKING_OVERRIDE_TYPE, details);
+    await disposeBtwSession();
+    const settings = await resolveBtwSettings(ctx);
+    const message = nextThinkingLevel
+      ? `BTW thinking override set to ${nextThinkingLevel}.`
+      : "BTW thinking override cleared. BTW now inherits the main thread thinking level.";
+    setOverlayStatus(message, ctx);
+    notify(ctx, `${message} ${describeResolvedThinking(settings)}`, "info");
+  }
+
   async function createBtwSubSession(ctx: ExtensionCommandContext, mode: BtwThreadMode): Promise<BtwSessionRuntime> {
+    const settings = await resolveBtwSettings(ctx, true);
+    if (!settings.model) {
+      throw new Error(settings.fallbackReason || "No active model selected.");
+    }
+
     const { session } = await createAgentSession({
       sessionManager: SessionManager.inMemory(),
-      model: ctx.model,
+      model: settings.model,
       modelRegistry: ctx.modelRegistry as AgentSession["modelRegistry"],
-      thinkingLevel: pi.getThinkingLevel() as SessionThinkingLevel,
+      thinkingLevel: settings.thinkingLevel,
       tools: codingTools,
       resourceLoader: createBtwResourceLoader(ctx),
     });
 
-    const { messages: seedMessages, sideThreadStartIndex } = buildBtwSeedState(ctx, pendingThread, mode);
+    const { messages: seedMessages, sideThreadStartIndex } = buildBtwSeedState(ctx, pendingThread, mode, settings.model);
     if (seedMessages.length > 0) {
       session.agent.state.messages = seedMessages as typeof session.state.messages;
     }
@@ -1349,7 +1557,8 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function ensureBtwSession(ctx: ExtensionCommandContext, mode: BtwThreadMode): Promise<BtwSessionRuntime | null> {
-    if (!ctx.model) {
+    const settings = await resolveBtwSettings(ctx);
+    if (!settings.model) {
       return null;
     }
 
@@ -1524,6 +1733,40 @@ export default function (pi: ExtensionAPI) {
       return true;
     }
 
+    if (name === "btw:model") {
+      const parsed = parseBtwModelArgs(trimmedArgs);
+      if (parsed.action === "invalid") {
+        setOverlayStatus(parsed.message, ctx);
+        notify(ctx, parsed.message, "error");
+        return true;
+      }
+
+      if (parsed.action === "show") {
+        const settings = await resolveBtwSettings(ctx);
+        const message = describeResolvedModel(settings);
+        setOverlayStatus(message, ctx);
+        notify(ctx, message, settings.model ? "info" : "warning");
+        return true;
+      }
+
+      await setBtwModelOverride(ctx, parsed.action === "clear" ? null : parsed.model);
+      return true;
+    }
+
+    if (name === "btw:thinking") {
+      const parsed = parseBtwThinkingArgs(trimmedArgs);
+      if (parsed.action === "show") {
+        const settings = await resolveBtwSettings(ctx);
+        const message = describeResolvedThinking(settings);
+        setOverlayStatus(message, ctx);
+        notify(ctx, message, "info");
+        return true;
+      }
+
+      await setBtwThinkingOverride(ctx, parsed.action === "clear" ? null : parsed.thinkingLevel);
+      return true;
+    }
+
     if (name === "btw:inject") {
       if (pendingThread.length === 0) {
         notify(ctx, "No BTW thread to inject.", "warning");
@@ -1586,7 +1829,7 @@ export default function (pi: ExtensionAPI) {
 
   function parseOverlayBtwCommand(value: string): { name: string; args: string } | null {
     const trimmed = value.trim();
-    const match = trimmed.match(/^\/(btw:(?:new|tangent|clear|inject|summarize))(?:\s+(.*))?$/);
+    const match = trimmed.match(/^\/(btw:(?:new|tangent|clear|inject|summarize|model|thinking))(?:\s+(.*))?$/);
     if (!match) {
       return null;
     }
@@ -1645,6 +1888,8 @@ export default function (pi: ExtensionAPI) {
     await disposeBtwSession();
     pendingThread = [];
     pendingMode = "contextual";
+    btwModelOverride = null;
+    btwThinkingOverride = null;
     transcriptState = createEmptyTranscriptState();
     overlayDraft = "";
     lastUiContext = ctx;
@@ -1654,6 +1899,26 @@ export default function (pi: ExtensionAPI) {
     let lastResetIndex = -1;
 
     for (let i = 0; i < branch.length; i++) {
+      if (isCustomEntry(branch[i], BTW_MODEL_OVERRIDE_TYPE)) {
+        const details = branch[i].data as BtwModelOverrideDetails | undefined;
+        btwModelOverride =
+          details?.action === "set"
+            ? { provider: details.provider, id: details.id, api: details.api }
+            : details?.action === "clear"
+              ? null
+              : btwModelOverride;
+      }
+
+      if (isCustomEntry(branch[i], BTW_THINKING_OVERRIDE_TYPE)) {
+        const details = branch[i].data as BtwThinkingOverrideDetails | undefined;
+        btwThinkingOverride =
+          details?.action === "set"
+            ? details.thinkingLevel
+            : details?.action === "clear"
+              ? null
+              : btwThinkingOverride;
+      }
+
       if (isCustomEntry(branch[i], BTW_RESET_TYPE)) {
         lastResetIndex = i;
         const details = (branch[i] as unknown as { data?: BtwResetDetails }).data;
@@ -1671,8 +1936,13 @@ export default function (pi: ExtensionAPI) {
         continue;
       }
 
-      pendingThread.push(details);
-      appendPersistedTranscriptTurn(transcriptState, details);
+      const normalizedDetails: BtwDetails = {
+        ...details,
+        api: details.api || ctx.model?.api || "openai-responses",
+      };
+
+      pendingThread.push(normalizedDetails);
+      appendPersistedTranscriptTurn(transcriptState, normalizedDetails);
     }
 
     syncUi(ctx);
@@ -1685,10 +1955,12 @@ export default function (pi: ExtensionAPI) {
     mode: BtwThreadMode,
   ): Promise<void> {
     lastUiContext = ctx;
-    const model = ctx.model;
+    const settings = await resolveBtwSettings(ctx);
+    const model = settings.model;
     if (!model) {
-      setOverlayStatus("No active model selected.", ctx);
-      notify(ctx, "No active model selected.", "error");
+      const message = settings.fallbackReason || "No active model selected.";
+      setOverlayStatus(message, ctx);
+      notify(ctx, message, "error");
       return;
     }
 
@@ -1711,7 +1983,7 @@ export default function (pi: ExtensionAPI) {
     const session = sessionRuntime.session;
     const wasBusy = !ctx.isIdle();
     pendingMode = mode;
-    const thinkingLevel = pi.getThinkingLevel() as SessionThinkingLevel;
+    const thinkingLevel = settings.thinkingLevel;
 
     setOverlayStatus("⏳ streaming...", ctx);
     await ensureOverlay(ctx);
@@ -1744,6 +2016,7 @@ export default function (pi: ExtensionAPI) {
         answer,
         provider: model.provider,
         model: model.id,
+        api: model.api,
         thinkingLevel,
         timestamp: Date.now(),
         usage: response.usage,
@@ -1792,9 +2065,10 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function summarizeThread(ctx: ExtensionCommandContext, thread: BtwHandoffExchange[]): Promise<string> {
-    const model = ctx.model;
+    const settings = await resolveBtwSettings(ctx, true);
+    const model = settings.model;
     if (!model) {
-      throw new Error("No active model selected.");
+      throw new Error(settings.fallbackReason || "No active model selected.");
     }
 
     const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
@@ -1851,7 +2125,10 @@ export default function (pi: ExtensionAPI) {
 
     if (expanded && details) {
       lines.push(
-        theme.fg("dim", `model: ${details.provider}/${details.model} · thinking: ${details.thinkingLevel}`),
+        theme.fg(
+          "dim",
+          `model: ${details.provider}/${details.model} (${details.api ?? "openai-responses"}) · thinking: ${details.thinkingLevel}`,
+        ),
       );
 
       if (details.usage) {
@@ -1936,6 +2213,20 @@ export default function (pi: ExtensionAPI) {
     description: "Summarize the BTW thread, then inject the summary into the main agent.",
     handler: async (args, ctx) => {
       await dispatchBtwCommand("btw:summarize", args, ctx);
+    },
+  });
+
+  pi.registerCommand("btw:model", {
+    description: "Show, set, or clear the BTW-only model override.",
+    handler: async (args, ctx) => {
+      await dispatchBtwCommand("btw:model", args, ctx);
+    },
+  });
+
+  pi.registerCommand("btw:thinking", {
+    description: "Show, set, or clear the BTW-only thinking override.",
+    handler: async (args, ctx) => {
+      await dispatchBtwCommand("btw:thinking", args, ctx);
     },
   });
 }

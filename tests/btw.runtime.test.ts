@@ -292,11 +292,16 @@ function createMockAgentSession(options: any) {
 
   const session = {
     agent: {
-      replaceMessages: vi.fn((messages: any[]) => {
-        seedMessages = messages.map((message) => structuredClone(message));
-        stateMessages = seedMessages.map((message) => structuredClone(message));
-        record.seedMessages = seedMessages;
-      }),
+      state: {
+        get messages() {
+          return stateMessages;
+        },
+        set messages(messages: any[]) {
+          seedMessages = messages.map((message) => structuredClone(message));
+          stateMessages = seedMessages.map((message) => structuredClone(message));
+          record.seedMessages = seedMessages;
+        },
+      },
     },
     state: {
       get messages() {
@@ -480,6 +485,8 @@ function createHarness(
   const model = { provider: "test-provider", id: "test-model", api: "openai-responses" };
   let idle = true;
   let hasCredentials = true;
+  let mainThinkingLevel: string = "off";
+  let credentialResolver: ((model: { provider: string; id: string; api: string }) => string | undefined) | null = null;
   const mainSessionInputs: string[] = [];
 
   const ui = {
@@ -551,7 +558,7 @@ function createHarness(
     setActiveTools: vi.fn() as any,
     getCommands: vi.fn(() => Array.from(commands.values())) as any,
     setModel: vi.fn(async () => true) as any,
-    getThinkingLevel: vi.fn(() => "off") as any,
+    getThinkingLevel: vi.fn(() => mainThinkingLevel) as any,
     setThinkingLevel: vi.fn() as any,
     registerProvider: vi.fn() as any,
   } as unknown as ExtensionAPI;
@@ -563,9 +570,13 @@ function createHarness(
     ui: ui as any,
     sessionManager: sessionManager as any,
     modelRegistry: {
-      getApiKeyAndHeaders: vi.fn(async () =>
-        hasCredentials ? { ok: true, apiKey: "test-key", headers: undefined } : { ok: true, apiKey: undefined, headers: undefined },
-      ),
+      getApiKeyAndHeaders: vi.fn(async (requestedModel: { provider: string; id: string; api: string }) => {
+        if (credentialResolver) {
+          const key = credentialResolver(requestedModel);
+          return key ? { ok: true, apiKey: key, headers: undefined } : { ok: true, apiKey: undefined, headers: undefined };
+        }
+        return hasCredentials ? { ok: true, apiKey: "test-key", headers: undefined } : { ok: true, apiKey: undefined, headers: undefined };
+      }),
     },
     model,
     getSystemPrompt: () => "system",
@@ -644,6 +655,12 @@ function createHarness(
     setCredentials(value: boolean) {
       hasCredentials = value;
     },
+    setCredentialResolver(value: ((model: { provider: string; id: string; api: string }) => string | undefined) | null) {
+      credentialResolver = value;
+    },
+    setMainThinkingLevel(value: string) {
+      mainThinkingLevel = value;
+    },
   };
 }
 
@@ -682,6 +699,174 @@ describe("btw runtime behavior", () => {
     expect(subSession.bindExtensions).not.toHaveBeenCalled();
     expect(subSession.getActiveToolNames()).toEqual(["read", "bash", "edit", "write"]);
     expect(subSession.prompt).toHaveBeenCalledWith("first question", { source: "extension" });
+  });
+
+  it("uses BTW-specific model and thinking overrides for BTW prompts", async () => {
+    const harness = createHarness();
+    harness.setMainThinkingLevel("high");
+
+    await harness.runSessionStart();
+    await harness.command("btw:model", "fast-provider fast-model custom-api");
+    await harness.command("btw:thinking", "low");
+    await harness.command("btw", "first question");
+
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(1);
+    const options = createAgentSessionMock.mock.calls[0][0];
+    expect(options.model).toEqual({ provider: "fast-provider", id: "fast-model", api: "custom-api" });
+    expect(options.thinkingLevel).toBe("low");
+
+    const entry = getCustomEntries(harness.entries, "btw-thread-entry")[0];
+    expect(entry).toBeDefined();
+    expect(entry.data).toMatchObject({
+      provider: "fast-provider",
+      model: "fast-model",
+      api: "custom-api",
+      thinkingLevel: "low",
+    });
+  });
+
+  it("uses the BTW model override but keeps summarize thinking off", async () => {
+    const harness = createHarness();
+    harness.setMainThinkingLevel("high");
+
+    await harness.runSessionStart();
+    await harness.command("btw:model", "fast-provider fast-model custom-api");
+    await harness.command("btw:thinking", "low");
+    await harness.command("btw", "first question");
+    await harness.command("btw:summarize", "handoff this");
+
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(2);
+    const summaryOptions = createAgentSessionMock.mock.calls[1][0];
+    expect(summaryOptions.model).toEqual({ provider: "fast-provider", id: "fast-model", api: "custom-api" });
+    expect(summaryOptions.thinkingLevel).toBe("off");
+    expect(summaryOptions.tools).toEqual([]);
+  });
+
+  it("clearing BTW overrides restores inheritance from the main thread", async () => {
+    const harness = createHarness();
+    harness.setMainThinkingLevel("high");
+
+    await harness.runSessionStart();
+    await harness.command("btw:model", "fast-provider fast-model custom-api");
+    await harness.command("btw:thinking", "low");
+    await harness.command("btw:model", "clear");
+    await harness.command("btw:thinking", "clear");
+    await harness.command("btw", "first question");
+
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(1);
+    const options = createAgentSessionMock.mock.calls[0][0];
+    expect(options.model).toBe(harness.baseCtx.model);
+    expect(options.thinkingLevel).toBe("high");
+  });
+
+  it("restores BTW override state from session history", async () => {
+    const harness = createHarness([
+      {
+        type: "custom",
+        customType: "btw-model-override",
+        data: { action: "set", provider: "saved-provider", id: "saved-model", api: "saved-api", timestamp: 1 },
+      },
+      {
+        type: "custom",
+        customType: "btw-thinking-override",
+        data: { action: "set", thinkingLevel: "low", timestamp: 2 },
+      },
+      {
+        type: "custom",
+        customType: "btw-thread-entry",
+        data: {
+          question: "saved question",
+          thinking: "",
+          answer: "saved answer",
+          provider: "saved-provider",
+          model: "saved-model",
+          api: "saved-api",
+          thinkingLevel: "low",
+          timestamp: 3,
+        },
+      },
+    ]);
+
+    await harness.runSessionStart();
+    await harness.command("btw", "follow-up");
+
+    const options = createAgentSessionMock.mock.calls[0][0];
+    expect(options.model).toEqual({ provider: "saved-provider", id: "saved-model", api: "saved-api" });
+    expect(options.thinkingLevel).toBe("low");
+
+    const seedTexts = subSessionRecords[0].seedMessages.map((message) => (message.content[0] as any)?.text ?? "");
+    expect(seedTexts).toContain("saved question");
+    expect(seedTexts).toContain("saved answer");
+  });
+
+  it("reports inherited and overridden BTW settings from the read-only commands", async () => {
+    const harness = createHarness();
+    harness.setMainThinkingLevel("high");
+
+    await harness.runSessionStart();
+    await harness.command("btw:model", "");
+    expect(harness.notifications.at(-1)?.message).toContain("BTW model: test-provider/test-model (openai-responses) (inherits main thread).");
+
+    await harness.command("btw:thinking", "");
+    expect(harness.notifications.at(-1)).toEqual({
+      message: "BTW thinking: high (inherits main thread).",
+      type: "info",
+    });
+
+    await harness.command("btw:model", "fast-provider fast-model custom-api");
+    await harness.command("btw:thinking", "low");
+
+    await harness.command("btw:model", "");
+    expect(harness.notifications.at(-1)?.message).toContain("BTW model: fast-provider/fast-model (custom-api) (override).");
+
+    await harness.command("btw:thinking", "");
+    expect(harness.notifications.at(-1)).toEqual({
+      message: "BTW thinking: low (override).",
+      type: "info",
+    });
+  });
+
+  it("falls back to the main model when the BTW model override has no credentials", async () => {
+    const harness = createHarness();
+    harness.setCredentialResolver((requestedModel) =>
+      requestedModel.provider === "fast-provider" ? undefined : "main-key",
+    );
+
+    await harness.runSessionStart();
+    await harness.command("btw:model", "fast-provider fast-model custom-api");
+    await harness.command("btw", "first question");
+
+    const options = createAgentSessionMock.mock.calls[0][0];
+    expect(options.model).toBe(harness.baseCtx.model);
+    expect(
+      harness.notifications.some((entry) =>
+        entry.message.includes(
+          "Configured BTW model fast-provider/fast-model (custom-api) has no credentials. Falling back to main model test-provider/test-model (openai-responses).",
+        ),
+      ),
+    ).toBe(true);
+  });
+
+  it("disposing an active BTW session on override change preserves the hidden thread and applies the new settings next turn", async () => {
+    const harness = createHarness();
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+
+    const firstSession = subSessionRecords[0].session;
+    await harness.command("btw:thinking", "low");
+
+    expect(firstSession.abort).toHaveBeenCalledTimes(1);
+    expect(firstSession.dispose).toHaveBeenCalledTimes(1);
+    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(1);
+
+    await harness.command("btw:model", "fast-provider fast-model custom-api");
+    await harness.command("btw", "second question");
+
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(2);
+    const secondOptions = createAgentSessionMock.mock.calls[1][0];
+    expect(secondOptions.model).toEqual({ provider: "fast-provider", id: "fast-model", api: "custom-api" });
+    expect(secondOptions.thinkingLevel).toBe("low");
   });
 
   it("contextual BTW seeds the sub-session with main-session messages but excludes visible BTW notes", async () => {
@@ -1420,7 +1605,7 @@ describe("btw runtime behavior", () => {
     expect(resets.at(-1)?.data).toMatchObject({ mode: "contextual" });
     expect(harness.notifications.at(-1)).toEqual({ message: "Cleared BTW thread.", type: "info" });
 
-    await harness.runEvent("session_switch");
+    await harness.runEvent("session_start");
     await harness.command("btw", "");
     overlay = harness.latestOverlayComponent();
     expect(transcriptText(overlay)).toContain("No BTW thread yet. Ask a side question to start one.");
@@ -1476,13 +1661,13 @@ describe("btw runtime behavior", () => {
     expect(transcriptText(harness.latestOverlayComponent())).toContain("No BTW thread yet. Ask a side question to start one.");
   });
 
-  it("restore behavior is consistent across session_start, session_switch, and session_tree", async () => {
+  it("restore behavior is consistent across session_start and session_tree", async () => {
     const entries: SessionEntry[] = [
       { type: "custom", customType: "btw-thread-reset", data: { timestamp: 1, mode: "tangent" } },
       { type: "custom", customType: "btw-thread-entry", data: { question: "restored q", thinking: "", answer: "restored a", provider: "p", model: "m", thinkingLevel: "off", timestamp: 2 } },
     ];
 
-    for (const eventName of ["session_start", "session_switch", "session_tree"]) {
+    for (const eventName of ["session_start", "session_tree"]) {
       const harness = createHarness(entries);
       await harness.runEvent(eventName);
       await harness.command("btw", "");

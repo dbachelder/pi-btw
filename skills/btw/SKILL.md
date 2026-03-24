@@ -27,6 +27,8 @@ Use these commands in your guidance to the user:
 /btw:tangent <question>
 /btw:tangent --save <question>
 /btw:clear
+/btw:model [<provider> <model> <api> | clear]
+/btw:thinking [<level> | clear]
 /btw:inject [instructions]
 /btw:summarize [instructions]
 ```
@@ -105,6 +107,17 @@ Recommend:
 
 Use this when the thread is long and only the distilled outcome should go back into the main agent.
 
+### To make BTW cheaper or faster than the main thread
+
+Recommend:
+
+```text
+/btw:model <provider> <model> <api>
+/btw:thinking <level>
+```
+
+Use these when the main thread should keep its current model or thinking level, but BTW should run with a different cost/speed profile.
+
 ## Recommendation rules
 
 - Prefer `/btw` over normal chat when the user explicitly wants a side conversation.
@@ -113,6 +126,7 @@ Use this when the thread is long and only the distilled outcome should go back i
 - Prefer `/btw:inject` when precise wording, detailed tradeoffs, or a full plan matters.
 - Suggest `/btw:new` before starting a totally unrelated side topic when main-session context is still useful.
 - Suggest `/btw:clear` when the widget/thread should be dismissed.
+- Suggest `/btw:model` or `/btw:thinking` when the user wants BTW to be cheaper, faster, or less deliberative than the main thread.
 
 ## Response style
 
@@ -146,4 +160,11 @@ When helping the user use BTW:
 
 ```text
 /btw:summarize implement the recommended migration plan
+```
+
+### Example: make BTW cheaper than the main thread
+
+```text
+/btw:model openai gpt-5-mini openai-responses
+/btw:thinking low
 ```
