@@ -42,11 +42,12 @@
     "image": "https://raw.githubusercontent.com/dbachelder/pi-btw/main/docs/btw-overlay.png"
   },
   "peerDependencies": {
-    "@mariozechner/pi-ai": "*",
-    "@mariozechner/pi-coding-agent": ">=0.63.0",
-    "@mariozechner/pi-tui": "*"
+    "@mariozechner/pi-ai": "^0.66.1",
+    "@mariozechner/pi-coding-agent": "^0.66.1",
+    "@mariozechner/pi-tui": "^0.66.1"
   },
   "devDependencies": {
+    "typescript": "^6.0.2",
     "vitest": "^4.1.0"
   }
 }

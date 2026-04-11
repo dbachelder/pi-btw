@@ -11,7 +11,7 @@ import {
   type ExtensionContext,
   type ResourceLoader,
 } from "@mariozechner/pi-coding-agent";
-import { type AssistantMessage, type Message, type ThinkingLevel as AiThinkingLevel } from "@mariozechner/pi-ai";
+import { type AssistantMessage, type Message, type ThinkingLevel as AiThinkingLevel, type UserMessage } from "@mariozechner/pi-ai";
 import {
   Box,
   Container,
@@ -152,7 +152,6 @@ function createBtwResourceLoader(
     getAgentsFiles: () => ({ agentsFiles: [] }),
     getSystemPrompt: () => systemPrompt,
     getAppendSystemPrompt: () => appendSystemPrompt,
-    getPathMetadata: () => new Map(),
     extendResources: () => {},
     reload: async () => {},
   };
@@ -196,7 +195,7 @@ function buildBtwSeedState(
   if (mode === "contextual") {
     try {
       messages.push(
-        ...buildSessionContext(ctx.sessionManager.getEntries(), ctx.sessionManager.getLeafId()).messages.filter(
+        ...(buildSessionContext(ctx.sessionManager.getEntries(), ctx.sessionManager.getLeafId()).messages as Message[]).filter(
           (message) => !isVisibleBtwMessage(message),
         ),
       );
@@ -207,7 +206,7 @@ function buildBtwSeedState(
             return [];
           }
 
-          const message = entry as Partial<Message> & { role?: string; customType?: string; content?: unknown };
+          const message = entry as unknown as Partial<Message> & { role?: string; customType?: string; content?: unknown };
           if (typeof message.role !== "string" || !Array.isArray(message.content)) {
             return [];
           }
@@ -336,7 +335,7 @@ function ensureTranscriptTurn(state: BtwTranscriptState): number {
   const turnId = state.nextTurnId++;
   state.currentTurnId = turnId;
   state.lastTurnId = turnId;
-  appendTranscriptEntry(state, { type: "turn-boundary", turnId, phase: "start" });
+  appendTranscriptEntry(state, { type: "turn-boundary", turnId, phase: "start" } as Omit<Extract<BtwTranscriptEntry, { type: "turn-boundary" }>, "id">);
   return turnId;
 }
 
@@ -350,7 +349,7 @@ function finishTranscriptTurn(state: BtwTranscriptState, turnId?: number | null)
     (entry) => entry.turnId === resolvedTurnId && entry.type === "turn-boundary" && entry.phase === "end",
   );
   if (!hasEndBoundary) {
-    appendTranscriptEntry(state, { type: "turn-boundary", turnId: resolvedTurnId, phase: "end" });
+    appendTranscriptEntry(state, { type: "turn-boundary", turnId: resolvedTurnId, phase: "end" } as Omit<Extract<BtwTranscriptEntry, { type: "turn-boundary" }>, "id">);
   }
 
   for (const entry of state.entries) {
@@ -415,8 +414,18 @@ function ensureTranscriptTurnForUserMessage(state: BtwTranscriptState): number {
   return ensureTranscriptTurn(state);
 }
 
-function extractMessageText(message: { content?: AssistantMessage["content"] }): string {
-  return Array.isArray(message.content) ? extractText(message.content, "text") : "";
+function extractMessageText(message: { content?: string | AssistantMessage["content"] | UserMessage["content"] }): string {
+  if (typeof message.content === "string") {
+    return message.content;
+  }
+  if (!Array.isArray(message.content)) {
+    return "";
+  }
+  return message.content
+    .filter((part): part is { type: "text"; text: string } => part.type === "text" && typeof part.text === "string")
+    .map((part) => part.text)
+    .join("\n")
+    .trim();
 }
 
 function upsertUserMessageEntry(state: BtwTranscriptState, turnId: number, text: string): void {
@@ -430,7 +439,7 @@ function upsertUserMessageEntry(state: BtwTranscriptState, turnId: number, text:
     return;
   }
 
-  appendTranscriptEntry(state, { type: "user-message", turnId, text });
+  appendTranscriptEntry(state, { type: "user-message", turnId, text } as Omit<Extract<BtwTranscriptEntry, { type: "user-message" }>, "id">);
 }
 
 function upsertTranscriptTextEntry(
@@ -451,7 +460,7 @@ function upsertTranscriptTextEntry(
     return;
   }
 
-  appendTranscriptEntry(state, { type, turnId, text, streaming });
+  appendTranscriptEntry(state, { type, turnId, text, streaming } as Omit<Extract<BtwTranscriptEntry, { type: "thinking" | "assistant-text" }>, "id">);
 }
 
 function summarizeToolResult(value: unknown, maxLength = 400): { content: string; truncated: boolean } {
@@ -522,7 +531,7 @@ function ensureToolCallEntry(
     toolCallId,
     toolName,
     args,
-  });
+  } as Omit<Extract<BtwTranscriptEntry, { type: "tool-call" }>, "id">);
   const record = { turnId, callEntryId: callEntry.id };
   state.toolCalls.set(toolCallId, record);
   return record;
@@ -561,21 +570,17 @@ function upsertToolResultEntry(
     truncated,
     isError,
     streaming,
-  });
+  } as Omit<Extract<BtwTranscriptEntry, { type: "tool-result" }>, "id">);
   toolCall.resultEntryId = resultEntry.id;
 }
 
 function applyAssistantMessageToTranscript(
   state: BtwTranscriptState,
   turnId: number,
-  message: AgentSessionEvent extends { message: infer T } ? T : never,
+  message: AssistantMessage,
   streaming: boolean,
 ): void {
-  if (!message || typeof message !== "object" || (message as { role?: string }).role !== "assistant") {
-    return;
-  }
-
-  const assistantMessage = message as AssistantMessage;
+  const assistantMessage = message;
   const thinking = extractThinking(assistantMessage);
   const answer = extractMessageText(assistantMessage);
 
@@ -847,7 +852,7 @@ function isThreadContinuationMarker(messages: Message[], index: number): boolean
 
 function extractBtwHandoffThread(sessionRuntime: BtwSessionRuntime): BtwHandoffExchange[] {
   const handoffMessages = sessionRuntime.session.state.messages.slice(sessionRuntime.sideThreadStartIndex);
-  const threadMessages = isThreadContinuationMarker(handoffMessages, 0) ? handoffMessages.slice(2) : handoffMessages;
+  const threadMessages = isThreadContinuationMarker(handoffMessages as Message[], 0) ? handoffMessages.slice(2) : handoffMessages;
   const exchanges: BtwHandoffExchange[] = [];
   let currentUser = "";
   let currentAssistant = "";
@@ -927,8 +932,8 @@ function getOverlayTitle(mode: BtwThreadMode): string {
 function buildTranscriptBadge(
   theme: ExtensionContext["ui"]["theme"],
   label: string,
-  background: string,
-  foreground: string,
+  background: "userMessageBg" | "toolPendingBg" | "customMessageBg",
+  foreground: "accent" | "warning" | "success",
 ): string {
   return theme.bg(background, theme.fg(foreground, theme.bold(` ${label} `)));
 }
@@ -953,6 +958,10 @@ class BtwOverlayComponent extends Container implements Focusable {
   private transcriptViewportHeight = 8;
   private followTranscript = true;
   private _focused = false;
+  private modeTextValue = "";
+  private summaryTextValue = "";
+  private statusTextValue = "";
+  private hintsTextValue = "";
 
   get focused(): boolean {
     return this._focused;
@@ -1002,7 +1011,7 @@ class BtwOverlayComponent extends Container implements Focusable {
 
     const originalHandleInput = this.input.handleInput.bind(this.input);
     this.input.handleInput = (data: string) => {
-      if (keybindings.matches(data, "selectCancel")) {
+      if (keybindings.matches(data, "tui.select.cancel")) {
         this.onDismissCallback();
         return;
       }
@@ -1111,12 +1120,12 @@ class BtwOverlayComponent extends Container implements Focusable {
     const hiddenBelow = Math.max(0, maxScroll - this.transcriptScrollOffset);
     const summary =
       hiddenAbove || hiddenBelow
-        ? `${this.summaryText.text.trim()} · ↑${hiddenAbove} ↓${hiddenBelow}`
-        : this.summaryText.text.trim();
+        ? `${this.summaryTextValue.trim()} · ↑${hiddenAbove} ↓${hiddenBelow}`
+        : this.summaryTextValue.trim();
 
     const lines = [this.borderLine(innerWidth, "top")];
 
-    lines.push(this.frameLine(this.theme.fg("accent", this.theme.bold(this.modeText.text.trim())), innerWidth));
+    lines.push(this.frameLine(this.theme.fg("accent", this.theme.bold(this.modeTextValue.trim())), innerWidth));
     lines.push(this.frameLine(this.theme.fg("dim", summary), innerWidth));
     lines.push(this.ruleLine(innerWidth));
 
@@ -1128,9 +1137,9 @@ class BtwOverlayComponent extends Container implements Focusable {
     }
 
     lines.push(this.ruleLine(innerWidth));
-    lines.push(this.frameLine(this.theme.fg("warning", this.statusText.text.trim()), innerWidth));
+    lines.push(this.frameLine(this.theme.fg("warning", this.statusTextValue.trim()), innerWidth));
     lines.push(this.inputFrameLine(dialogWidth));
-    lines.push(this.frameLine(this.theme.fg("dim", this.hintsText.text.trim()), innerWidth));
+    lines.push(this.frameLine(this.theme.fg("dim", this.hintsTextValue.trim()), innerWidth));
     lines.push(this.borderLine(innerWidth, "bottom"));
 
     return lines;
@@ -1150,11 +1159,13 @@ class BtwOverlayComponent extends Container implements Focusable {
   }
 
   refresh(): void {
-    this.modeText.setText(`${getOverlayTitle(this.getMode())} · hidden thread preserved`);
+    this.modeTextValue = `${getOverlayTitle(this.getMode())} · hidden thread preserved`;
+    this.modeText.setText(this.modeTextValue);
     const entries = this.readTranscriptEntries();
     const exchanges = getCompletedExchangeCount(entries);
     const active = hasStreamingTranscriptEntry(entries) ? " · streaming" : " · idle";
-    this.summaryText.setText(`${exchanges} exchange${exchanges === 1 ? "" : "s"}${active}`);
+    this.summaryTextValue = `${exchanges} exchange${exchanges === 1 ? "" : "s"}${active}`;
+    this.summaryText.setText(this.summaryTextValue);
 
     this.transcriptLines = buildOverlayTranscript(entries, this.theme);
     this.transcript.clear();
@@ -1163,8 +1174,10 @@ class BtwOverlayComponent extends Container implements Focusable {
     }
 
     const status = this.getStatus() ?? "Ready. Enter submits; Escape dismisses without clearing.";
-    this.statusText.setText(status);
-    this.hintsText.setText("Enter submit · Alt+/ toggle focus · Escape dismiss · PgUp/PgDn scroll");
+    this.statusTextValue = status;
+    this.statusText.setText(this.statusTextValue);
+    this.hintsTextValue = "Enter submit · Alt+/ toggle focus · Escape dismiss · PgUp/PgDn scroll";
+    this.hintsText.setText(this.hintsTextValue);
     this.tui.requestRender();
   }
 }
@@ -1329,7 +1342,7 @@ export default function (pi: ExtensionAPI) {
 
     const { messages: seedMessages, sideThreadStartIndex } = buildBtwSeedState(ctx, pendingThread, mode);
     if (seedMessages.length > 0) {
-      session.agent.replaceMessages(seedMessages as typeof session.state.messages);
+      session.agent.state.messages = seedMessages as typeof session.state.messages;
     }
 
     return { session, mode, subscriptions: new Set(), sideThreadStartIndex };
@@ -1596,17 +1609,18 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
+    const cmdCtx = ctx as ExtensionCommandContext;
     const btwCommand = parseOverlayBtwCommand(question);
     if (btwCommand) {
       setOverlayDraft("");
-      await dispatchBtwCommand(btwCommand.name, btwCommand.args, ctx);
+      await dispatchBtwCommand(btwCommand.name, btwCommand.args, cmdCtx);
       return;
     }
 
     setOverlayDraft("");
     setOverlayStatus("⏳ streaming...", ctx);
     syncUi(ctx);
-    await runBtw(ctx, question, false, pendingMode);
+    await runBtw(cmdCtx, question, false, pendingMode);
   }
 
   async function resetThread(
@@ -1642,7 +1656,7 @@ export default function (pi: ExtensionAPI) {
     for (let i = 0; i < branch.length; i++) {
       if (isCustomEntry(branch[i], BTW_RESET_TYPE)) {
         lastResetIndex = i;
-        const details = branch[i].data as BtwResetDetails | undefined;
+        const details = (branch[i] as unknown as { data?: BtwResetDetails }).data;
         pendingMode = details?.mode ?? "contextual";
       }
     }
@@ -1652,7 +1666,7 @@ export default function (pi: ExtensionAPI) {
         continue;
       }
 
-      const details = entry.data as BtwDetails | undefined;
+      const details = (entry as unknown as { data?: BtwDetails }).data;
       if (!details?.question || !details.answer) {
         continue;
       }
@@ -1865,10 +1879,6 @@ export default function (pi: ExtensionAPI) {
     await restoreThread(ctx);
   });
 
-  pi.on("session_switch", async (_event, ctx) => {
-    await restoreThread(ctx);
-  });
-
   pi.on("session_tree", async (_event, ctx) => {
     await restoreThread(ctx);
   });
@@ -1881,7 +1891,7 @@ export default function (pi: ExtensionAPI) {
   for (const shortcut of BTW_FOCUS_SHORTCUTS) {
     pi.registerShortcut(shortcut, {
       description: "Toggle BTW overlay focus while leaving it open.",
-      handler: async (_args, _ctx) => {
+      handler: async (_ctx) => {
         toggleOverlayFocus();
       },
     });

@@ -1,4 +1,5 @@
 node_modules/
+.pi/
 .DS_Store
 *.log
 .bg-shell/
