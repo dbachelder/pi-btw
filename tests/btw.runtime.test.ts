@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, RegisteredCommand } from "@mariozechner/pi-coding-agent";
+import { visibleWidth } from "@mariozechner/pi-tui";
 import btwExtension from "../extensions/btw";
 
 const { promptStreamMock, createAgentSessionMock, sessionManagerInMemoryMock, subSessionRecords } = vi.hoisted(() => ({
@@ -1442,6 +1443,30 @@ describe("btw runtime behavior", () => {
     expect(secondRender[0]).toContain("┌");
     expect(secondRender.at(-1)).toContain("└");
     expect(firstRender.length).toBe(secondRender.length);
+  });
+
+  it("normalizes tabbed transcript rows so overlay render lines stay within the requested width", async () => {
+    const harness = createHarness();
+    promptStreamMock.mockImplementation(async function* () {
+      yield { type: "tool_execution_start" as const, toolName: "read", args: { path: "internal/actor/ref.go" } };
+      yield {
+        type: "tool_execution_end" as const,
+        toolName: "read",
+        result: { content: [{ type: "text", text: "func Send() error {\n\treturn nil\n}" }] },
+      };
+      yield { type: "text_delta" as const, delta: "Done" };
+      yield { type: "done" as const, message: makeAssistantMessage("Done") };
+    });
+
+    await harness.runSessionStart();
+    await harness.command("btw", "read actor ref");
+
+    const overlay = harness.latestOverlayComponent();
+    const renderedLines = overlay.render(80);
+
+    expect(renderedLines.some((line: string) => line.includes("\t"))).toBe(false);
+    expect(renderedLines.every((line: string) => visibleWidth(line) <= 80)).toBe(true);
+    expect(transcriptText(overlay)).toContain("   return nil");
   });
 
   it("keeps the BTW modal at a fixed reading height, uses one frame color, and preserves stacked body indentation", async () => {
