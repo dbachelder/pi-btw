@@ -803,7 +803,7 @@ function buildOverlayTranscript(entries: BtwTranscript, theme: ExtensionContext[
     text: string,
     options: { blankBefore?: boolean; style?: (value: string) => string } = {},
   ) => {
-    const bodyLines = text.split("\n");
+    const bodyLines = normalizeOverlayRenderableText(text).split("\n");
     const style = options.style ?? ((value: string) => value);
     if (options.blankBefore !== false) {
       pushBlankLine();
@@ -821,7 +821,7 @@ function buildOverlayTranscript(entries: BtwTranscript, theme: ExtensionContext[
     text: string,
     options: { blankBefore?: boolean; indent?: string; style?: (value: string) => string } = {},
   ) => {
-    const bodyLines = text.split("\n");
+    const bodyLines = normalizeOverlayRenderableText(text).split("\n");
     const indent = options.indent ?? blockIndent;
     const style = options.style ?? ((value: string) => value);
     if (options.blankBefore !== false) {
@@ -1010,6 +1010,13 @@ function buildTranscriptBadge(
   return theme.bg(background, theme.fg(foreground, theme.bold(` ${label} `)));
 }
 
+function normalizeOverlayRenderableText(text: string): string {
+  // Literal tabs confuse overlay column slicing because their visual width depends on
+  // the current terminal column. Expand them before wrapping/framing so every row has
+  // stable geometry under visibleWidth()/truncateToWidth().
+  return text.replace(/\t/g, "   ");
+}
+
 class BtwOverlayComponent extends Container implements Focusable {
   private readonly input: Input;
   private readonly transcript: Container;
@@ -1093,10 +1100,15 @@ class BtwOverlayComponent extends Container implements Focusable {
     this.refresh();
   }
 
+  private fitLine(content: string, width: number): string {
+    const safeContent = normalizeOverlayRenderableText(content);
+    const truncated = truncateToWidth(safeContent, width, "");
+    const padding = Math.max(0, width - visibleWidth(truncated));
+    return `${truncated}${" ".repeat(padding)}`;
+  }
+
   private frameLine(content: string, innerWidth: number): string {
-    const truncated = truncateToWidth(content, innerWidth, "");
-    const padding = Math.max(0, innerWidth - visibleWidth(truncated));
-    return `${this.theme.fg("borderMuted", "│")}${truncated}${" ".repeat(padding)}${this.theme.fg("borderMuted", "│")}`;
+    return `${this.theme.fg("borderMuted", "│")}${this.fitLine(content, innerWidth)}${this.theme.fg("borderMuted", "│")}`;
   }
 
   private ruleLine(innerWidth: number): string {
@@ -1116,7 +1128,7 @@ class BtwOverlayComponent extends Container implements Focusable {
         wrapped.push("");
         continue;
       }
-      wrapped.push(...wrapTextWithAnsi(line, Math.max(1, innerWidth)));
+      wrapped.push(...wrapTextWithAnsi(normalizeOverlayRenderableText(line), Math.max(1, innerWidth)));
     }
     return wrapped;
   }
@@ -1158,7 +1170,7 @@ class BtwOverlayComponent extends Container implements Focusable {
     this.input.focused = false;
     try {
       const inputLine = this.input.render(targetWidth)[0] ?? "";
-      return `${this.theme.fg("borderMuted", "│")}${inputLine}${this.theme.fg("borderMuted", "│")}`;
+      return `${this.theme.fg("borderMuted", "│")}${this.fitLine(inputLine, targetWidth)}${this.theme.fg("borderMuted", "│")}`;
     } finally {
       this.input.focused = previousFocused;
     }
