@@ -453,6 +453,7 @@ function createHarness(
       italic: (text: string) => string;
       bold: (text: string) => string;
     };
+    keybindingMatches?: (data: string, id: string) => boolean;
   } = {},
 ) {
   const commands = new Map<string, RegisteredCommand>();
@@ -473,7 +474,7 @@ function createHarness(
     bold: (text: string) => text,
   };
   const keybindings = {
-    matches: (_data: string, _id: string) => false,
+    matches: options.keybindingMatches ?? ((_data: string, _id: string) => false),
   };
 
   const sessionManager = {
@@ -973,6 +974,54 @@ describe("btw runtime behavior", () => {
     expect(record).toBeDefined();
     expect(record.getListenerCount()).toBe(1);
     expect(record.session.prompt).not.toHaveBeenCalled();
+  });
+
+  it("clears a non-empty BTW composer on app.clear without dismissing the overlay", async () => {
+    const harness = createHarness([], {
+      keybindingMatches: (_data, id) => id === "app.clear" || id === "tui.select.cancel",
+    });
+
+    await harness.runSessionStart();
+    await harness.command("btw", "");
+
+    const overlay = harness.latestOverlayComponent();
+    overlay.input.setValue("draft follow-up");
+    overlay.input.handleInput("\x03");
+
+    expect(overlay.input.getValue()).toBe("");
+    expect(harness.overlayHandles.at(-1)?.hideCalls).toBe(0);
+  });
+
+  it("dismisses the BTW overlay on app.clear when the composer is empty", async () => {
+    const harness = createHarness([], {
+      keybindingMatches: (_data, id) => id === "app.clear" || id === "tui.select.cancel",
+    });
+
+    await harness.runSessionStart();
+    await harness.command("btw", "");
+
+    const overlay = harness.latestOverlayComponent();
+    overlay.input.setValue("");
+    overlay.input.handleInput("\x03");
+    await flushAsyncWork();
+
+    expect(harness.overlayHandles.at(-1)?.hideCalls).toBe(1);
+  });
+
+  it("still dismisses the BTW overlay on select cancel", async () => {
+    const harness = createHarness([], {
+      keybindingMatches: (_data, id) => id === "tui.select.cancel",
+    });
+
+    await harness.runSessionStart();
+    await harness.command("btw", "");
+
+    const overlay = harness.latestOverlayComponent();
+    overlay.input.setValue("draft follow-up");
+    overlay.input.handleInput("\x1b");
+    await flushAsyncWork();
+
+    expect(harness.overlayHandles.at(-1)?.hideCalls).toBe(1);
   });
 
   it("aborts, disposes, and unsubscribes the active BTW sub-session when Escape dismisses mid-stream", async () => {
