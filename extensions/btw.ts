@@ -1083,6 +1083,17 @@ class BtwOverlayComponent extends Container implements Focusable {
 
     const originalHandleInput = this.input.handleInput.bind(this.input);
     this.input.handleInput = (data: string) => {
+      if (keybindings.matches(data, "app.clear")) {
+        if (this.input.getValue().length > 0) {
+          this.input.setValue("");
+          this.tui.requestRender();
+          return;
+        }
+
+        this.onDismissCallback();
+        return;
+      }
+
       if (keybindings.matches(data, "tui.select.cancel")) {
         this.onDismissCallback();
         return;
