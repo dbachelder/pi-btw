@@ -27,6 +27,7 @@ import {
   type OverlayHandle,
   type TUI,
 } from "@mariozechner/pi-tui";
+import { initI18n, t } from "./i18n";
 
 const BTW_MESSAGE_TYPE = "btw-note";
 const BTW_ENTRY_TYPE = "btw-thread-entry";
@@ -2178,7 +2179,7 @@ export default function (pi: ExtensionAPI) {
 
   for (const shortcut of BTW_FOCUS_SHORTCUTS) {
     pi.registerShortcut(shortcut, {
-      description: "Toggle BTW overlay focus while leaving it open.",
+      description: t("shortcut.focus", "Toggle BTW overlay focus while leaving it open."),
       handler: async (_ctx) => {
         toggleOverlayFocus();
       },
@@ -2186,56 +2187,56 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.registerCommand("btw", {
-    description: "Continue a side conversation in a focused BTW modal. Add --save to also persist a visible note.",
+    description: t("cmd.btw", "Continue a side conversation in a focused BTW modal. Add --save to also persist a visible note."),
     handler: async (args, ctx) => {
       await dispatchBtwCommand("btw", args, ctx);
     },
   });
 
   pi.registerCommand("btw:tangent", {
-    description: "Start or continue a contextless BTW tangent in the focused BTW modal.",
+    description: t("cmd.tangent", "Start or continue a contextless BTW tangent in the focused BTW modal."),
     handler: async (args, ctx) => {
       await dispatchBtwCommand("btw:tangent", args, ctx);
     },
   });
 
   pi.registerCommand("btw:new", {
-    description: "Start a fresh BTW thread with main-session context. Optionally ask the first question immediately.",
+    description: t("cmd.new", "Start a fresh BTW thread with main-session context. Optionally ask the first question immediately."),
     handler: async (args, ctx) => {
       await dispatchBtwCommand("btw:new", args, ctx);
     },
   });
 
   pi.registerCommand("btw:clear", {
-    description: "Dismiss the BTW modal/widget and clear the current thread.",
+    description: t("cmd.clear", "Dismiss the BTW modal/widget and clear the current thread."),
     handler: async (args, ctx) => {
       await dispatchBtwCommand("btw:clear", args, ctx);
     },
   });
 
   pi.registerCommand("btw:inject", {
-    description: "Inject the full BTW thread into the main agent as a user message.",
+    description: t("cmd.inject", "Inject the full BTW thread into the main agent as a user message."),
     handler: async (args, ctx) => {
       await dispatchBtwCommand("btw:inject", args, ctx);
     },
   });
 
   pi.registerCommand("btw:summarize", {
-    description: "Summarize the BTW thread, then inject the summary into the main agent.",
+    description: t("cmd.summarize", "Summarize the BTW thread, then inject the summary into the main agent."),
     handler: async (args, ctx) => {
       await dispatchBtwCommand("btw:summarize", args, ctx);
     },
   });
 
   pi.registerCommand("btw:model", {
-    description: "Show, set, or clear the BTW-only model override.",
+    description: t("cmd.model", "Show, set, or clear the BTW-only model override."),
     handler: async (args, ctx) => {
       await dispatchBtwCommand("btw:model", args, ctx);
     },
   });
 
   pi.registerCommand("btw:thinking", {
-    description: "Show, set, or clear the BTW-only thinking override.",
+    description: t("cmd.thinking", "Show, set, or clear the BTW-only thinking override."),
     handler: async (args, ctx) => {
       await dispatchBtwCommand("btw:thinking", args, ctx);
     },
