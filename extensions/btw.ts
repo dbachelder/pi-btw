@@ -2,7 +2,6 @@ import {
   buildSessionContext,
   createAgentSession,
   createExtensionRuntime,
-  codingTools,
   SessionManager,
   type AgentSession,
   type AgentSessionEvent,
@@ -10,8 +9,8 @@ import {
   type ExtensionCommandContext,
   type ExtensionContext,
   type ResourceLoader,
-} from "@mariozechner/pi-coding-agent";
-import { type AssistantMessage, type Message, type ThinkingLevel as AiThinkingLevel, type UserMessage } from "@mariozechner/pi-ai";
+} from "@earendil-works/pi-coding-agent";
+import { type AssistantMessage, type Message, type ThinkingLevel as AiThinkingLevel, type UserMessage } from "@earendil-works/pi-ai";
 import {
   Box,
   Container,
@@ -26,7 +25,7 @@ import {
   type KeybindingsManager,
   type OverlayHandle,
   type TUI,
-} from "@mariozechner/pi-tui";
+} from "@earendil-works/pi-tui";
 
 const BTW_MESSAGE_TYPE = "btw-note";
 const BTW_ENTRY_TYPE = "btw-thread-entry";
@@ -56,6 +55,11 @@ const BTW_CONTINUE_THREAD_ASSISTANT_TEXT = "Understood, continuing our side conv
 type SessionThinkingLevel = "off" | AiThinkingLevel;
 type BtwThreadMode = "contextual" | "tangent";
 type SessionModel = NonNullable<ExtensionCommandContext["model"]>;
+/**
+ * Loose model reference parsed from `/btw:model <provider> <id> <api>` and persisted to
+ * session entries. Resolved to a full SessionModel via ctx.modelRegistry.find(...).
+ */
+type BtwModelRef = Pick<SessionModel, "provider" | "id" | "api">;
 
 type BtwDetails = {
   question: string;
@@ -216,7 +220,7 @@ function parseBtwArgs(args: string): ParsedBtwArgs {
 function parseBtwModelArgs(args: string):
   | { action: "show" }
   | { action: "clear" }
-  | { action: "set"; model: SessionModel }
+  | { action: "set"; model: BtwModelRef }
   | { action: "invalid"; message: string } {
   const trimmed = args.trim();
   if (!trimmed) {
@@ -233,7 +237,7 @@ function parseBtwModelArgs(args: string):
   }
 
   const [provider, id, api] = parts;
-  return { action: "set", model: { provider, id, api } };
+  return { action: "set", model: { provider, id, api } as BtwModelRef };
 }
 
 function parseBtwThinkingArgs(args: string):
@@ -1555,7 +1559,8 @@ export default function (pi: ExtensionAPI) {
       model: settings.model,
       modelRegistry: ctx.modelRegistry as AgentSession["modelRegistry"],
       thinkingLevel: settings.thinkingLevel,
-      tools: codingTools,
+      // Match pi's default coding-agent toolset (read/bash/edit/write).
+      tools: ["read", "bash", "edit", "write"],
       resourceLoader: createBtwResourceLoader(ctx),
     });
 
@@ -1760,7 +1765,19 @@ export default function (pi: ExtensionAPI) {
         return true;
       }
 
-      await setBtwModelOverride(ctx, parsed.action === "clear" ? null : parsed.model);
+      if (parsed.action === "clear") {
+        await setBtwModelOverride(ctx, null);
+        return true;
+      }
+      const ref = parsed.model;
+      const resolved = ctx.modelRegistry.find(ref.provider, ref.id);
+      if (!resolved) {
+        const message = `Unknown model ${ref.provider}/${ref.id}. Use /login or /models to add it before setting it as the BTW override.`;
+        setOverlayStatus(message, ctx);
+        notify(ctx, message, "error");
+        return true;
+      }
+      await setBtwModelOverride(ctx, resolved);
       return true;
     }
 
@@ -1911,17 +1928,22 @@ export default function (pi: ExtensionAPI) {
 
     for (let i = 0; i < branch.length; i++) {
       if (isCustomEntry(branch[i], BTW_MODEL_OVERRIDE_TYPE)) {
-        const details = branch[i].data as BtwModelOverrideDetails | undefined;
-        btwModelOverride =
-          details?.action === "set"
-            ? { provider: details.provider, id: details.id, api: details.api }
-            : details?.action === "clear"
-              ? null
-              : btwModelOverride;
+        const details = (branch[i] as unknown as { data?: BtwModelOverrideDetails }).data;
+        if (details?.action === "set") {
+          const resolved = ctx.modelRegistry.find(details.provider, details.id);
+          if (resolved) {
+            btwModelOverride = resolved;
+          } else {
+            // Configured override is no longer in the registry; drop it on restore.
+            btwModelOverride = null;
+          }
+        } else if (details?.action === "clear") {
+          btwModelOverride = null;
+        }
       }
 
       if (isCustomEntry(branch[i], BTW_THINKING_OVERRIDE_TYPE)) {
-        const details = branch[i].data as BtwThinkingOverrideDetails | undefined;
+        const details = (branch[i] as unknown as { data?: BtwThinkingOverrideDetails }).data;
         btwThinkingOverride =
           details?.action === "set"
             ? details.thinkingLevel

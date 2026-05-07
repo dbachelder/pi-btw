@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, RegisteredCommand } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, RegisteredCommand } from "@earendil-works/pi-coding-agent";
 import btwExtension from "../extensions/btw";
 
 const { promptStreamMock, createAgentSessionMock, sessionManagerInMemoryMock, subSessionRecords } = vi.hoisted(() => ({
@@ -17,8 +17,8 @@ const { promptStreamMock, createAgentSessionMock, sessionManagerInMemoryMock, su
   }>,
 }));
 
-vi.mock("@mariozechner/pi-coding-agent", async () => {
-  const actual = await vi.importActual<typeof import("@mariozechner/pi-coding-agent")>("@mariozechner/pi-coding-agent");
+vi.mock("@earendil-works/pi-coding-agent", async () => {
+  const actual = await vi.importActual<typeof import("@earendil-works/pi-coding-agent")>("@earendil-works/pi-coding-agent");
   return {
     ...actual,
     createAgentSession: createAgentSessionMock,
@@ -112,8 +112,8 @@ const tuiMocks = vi.hoisted(() => {
   return { FakeInput, FakeContainer, FakeText, FakeSpacer, FakeBox };
 });
 
-vi.mock("@mariozechner/pi-tui", async () => {
-  const actual = await vi.importActual<typeof import("@mariozechner/pi-tui")>("@mariozechner/pi-tui");
+vi.mock("@earendil-works/pi-tui", async () => {
+  const actual = await vi.importActual<typeof import("@earendil-works/pi-tui")>("@earendil-works/pi-tui");
   return {
     ...actual,
     Container: tuiMocks.FakeContainer,
@@ -308,7 +308,7 @@ function createMockAgentSession(options: any) {
         return stateMessages;
       },
       model: options.model,
-      tools: (options.tools ?? []).map((tool: any) => ({ name: tool.name })),
+      tools: (options.tools ?? []).map((name: string) => ({ name })),
     },
     get model() {
       return options.model;
@@ -410,7 +410,7 @@ function createMockAgentSession(options: any) {
       listeners.clear();
     }),
     bindExtensions: vi.fn(),
-    getActiveToolNames: vi.fn(() => (options.tools ?? []).map((tool: any) => tool.name)),
+    getActiveToolNames: vi.fn(() => (options.tools ?? []) as string[]),
   };
 
   record.session = session;
@@ -488,6 +488,12 @@ function createHarness(
   let hasCredentials = true;
   let mainThinkingLevel: string = "off";
   let credentialResolver: ((model: { provider: string; id: string; api: string }) => string | undefined) | null = null;
+  // Models that ctx.modelRegistry.find(provider, id) should return for /btw:model resolution.
+  // Tests that exercise overrides should call harness.registerModel(...) so the resolved
+  // Model.api preserves the value the test cares about (otherwise we synthesize a default).
+  const registeredModels = new Map<string, { provider: string; id: string; api: string }>();
+  // Pre-register the common BTW override fixture used by most tests.
+  registeredModels.set("fast-provider/fast-model", { provider: "fast-provider", id: "fast-model", api: "custom-api" });
   const mainSessionInputs: string[] = [];
 
   const ui = {
@@ -578,6 +584,15 @@ function createHarness(
         }
         return hasCredentials ? { ok: true, apiKey: "test-key", headers: undefined } : { ok: true, apiKey: undefined, headers: undefined };
       }),
+      // pi 0.74 ExtensionContext.modelRegistry.find(provider, modelId) -> Model<Api> | undefined.
+      // The mock looks up entries from `registeredModels`; falls back to a default api so legacy
+      // tests that don't register a model still get a non-null result.
+      find: vi.fn((provider: string, id: string) => {
+        const key = `${provider}/${id}`;
+        const known = registeredModels.get(key);
+        if (known) return known;
+        return { provider, id, api: "anthropic-messages" } as any;
+      }),
     },
     model,
     getSystemPrompt: () => "system",
@@ -662,6 +677,10 @@ function createHarness(
     setMainThinkingLevel(value: string) {
       mainThinkingLevel = value;
     },
+    /** Register a model so ctx.modelRegistry.find(provider, id) returns it (with the given api). */
+    registerModel(provider: string, id: string, api: string) {
+      registeredModels.set(`${provider}/${id}`, { provider, id, api });
+    },
   };
 }
 
@@ -690,7 +709,7 @@ describe("btw runtime behavior", () => {
     const options = createAgentSessionMock.mock.calls[0][0];
     expect(options.model).toBe(harness.baseCtx.model);
     expect(options.modelRegistry).toBe(harness.baseCtx.modelRegistry);
-    expect(options.tools.map((tool: any) => tool.name)).toEqual(["read", "bash", "edit", "write"]);
+    expect(options.tools).toEqual(["read", "bash", "edit", "write"]);
     expect(options.resourceLoader.getAppendSystemPrompt()[0]).toContain(
       "You are having an aside conversation with the user, separate from their main working session.",
     );
@@ -787,6 +806,10 @@ describe("btw runtime behavior", () => {
         },
       },
     ]);
+    // pi 0.74: ctx.modelRegistry.find(provider, id) is the source of truth for the
+    // resolved Model. Register the saved override so restoration produces a Model whose
+    // .api matches what the persisted session was created with.
+    harness.registerModel("saved-provider", "saved-model", "saved-api");
 
     await harness.runSessionStart();
     await harness.command("btw", "follow-up");
