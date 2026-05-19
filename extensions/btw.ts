@@ -10,7 +10,7 @@ import {
   type ExtensionContext,
   type ResourceLoader,
 } from "@earendil-works/pi-coding-agent";
-import { type AssistantMessage, type Message, type ThinkingLevel as AiThinkingLevel, type UserMessage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Message, ThinkingLevel as AiThinkingLevel, UserMessage } from "@earendil-works/pi-ai";
 import {
   Box,
   Container,
@@ -164,7 +164,7 @@ function isCustomEntry(entry: unknown, customType: string): entry is { type: "cu
 
 function stripDynamicSystemPromptFooter(systemPrompt: string): string {
   return systemPrompt
-    .replace(/\nCurrent date and time:[^\n]*(?:\nCurrent working directory:[^\n]*)?$/u, "")
+    .replace(/\nCurrent date(?: and time)?:[^\n]*(?:\nCurrent working directory:[^\n]*)?$/u, "")
     .replace(/\nCurrent working directory:[^\n]*$/u, "")
     .trim();
 }
