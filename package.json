@@ -42,9 +42,9 @@
     "image": "https://raw.githubusercontent.com/dbachelder/pi-btw/main/docs/btw-overlay.png"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "^0.74.0",
-    "@earendil-works/pi-coding-agent": "^0.74.0",
-    "@earendil-works/pi-tui": "^0.74.0"
+    "@earendil-works/pi-ai": "^0.74.0 || ^0.75.0",
+    "@earendil-works/pi-coding-agent": "^0.74.0 || ^0.75.0",
+    "@earendil-works/pi-tui": "^0.74.0 || ^0.75.0"
   },
   "devDependencies": {
     "typescript": "^6.0.2",
