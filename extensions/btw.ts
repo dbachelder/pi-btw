@@ -26,6 +26,12 @@ import {
   type OverlayHandle,
   type TUI,
 } from "@earendil-works/pi-tui";
+import {
+  bidiVisibleWidth,
+  bidiWrapText,
+  bidiTruncate,
+  wrapWithIsolates as bidiWrapWithIsolates,
+} from "../lib/bidi-wrap.ts";
 
 const BTW_MESSAGE_TYPE = "btw-note";
 const BTW_ENTRY_TYPE = "btw-thread-entry";
@@ -1137,7 +1143,14 @@ class BtwOverlayComponent extends Container implements Focusable {
         wrapped.push("");
         continue;
       }
-      wrapped.push(...wrapTextWithAnsi(line, Math.max(1, innerWidth)));
+      // bidiWrapText correctly handles mixed RTL/LTR content per UAX #9,
+      // wrapping each directional run independently while preserving ANSI
+      // escape sequences for theming. Falls back to wrapTextWithAnsi for
+      // pure LTR lines to avoid unnecessary marker overhead.
+      const lines = this.containsBidi(line)
+        ? bidiWrapText(line, Math.max(1, innerWidth))
+        : wrapTextWithAnsi(line, Math.max(1, innerWidth));
+      wrapped.push(...lines);
     }
     return wrapped;
   }
@@ -1219,7 +1232,36 @@ class BtwOverlayComponent extends Container implements Focusable {
   }
 
   private fitRenderedLine(line: string, width: number): string {
-    return visibleWidth(line) > width ? truncateToWidth(line, width, "") : line;
+    // Use bidiVisibleWidth which ignores FSI/PDI/LRM/RLM markers and
+    // ANSI escape sequences, giving accurate width for mixed-direction text.
+    // bidiTruncate respects isolation markers during truncation, preventing
+    // broken code identifiers or reversed RTL runs at the cut boundary.
+    const lineWidth = this.containsBidi(line)
+      ? bidiVisibleWidth(line)
+      : visibleWidth(line);
+    if (lineWidth <= width) return line;
+    return this.containsBidi(line)
+      ? bidiTruncate(line, width, "")
+      : truncateToWidth(line, width, "");
+  }
+
+  /**
+   * Detects whether a line contains bidirectional text (RTL characters).
+   * Used to decide between bidi-aware and pure-LTR processing paths.
+   */
+  private containsBidi(line: string): boolean {
+    for (let i = 0; i < line.length; i++) {
+      const cp = line.charCodeAt(i);
+      // Hebrew: 0x0590-0x05FF, Arabic: 0x0600-0x06FF, and broader RTL ranges
+      if (
+        (cp >= 0x0590 && cp <= 0x06ff) ||
+        (cp >= 0x0700 && cp <= 0x08ff) ||
+        (cp >= 0xfb1d && cp <= 0xfeff)
+      ) {
+        return true;
+      }
+    }
+    return false;
   }
 
   override render(width: number): string[] {
