@@ -18,6 +18,9 @@ A small [pi](https://github.com/earendil-works/pi-mono) extension that adds a `/
 - supports BTW-only model and thinking overrides without changing the main thread settings
 - lets you inject the full thread, or a summary of it, back into the main agent
 - optionally saves an individual BTW exchange as a visible session note with `--save`
+- **bidi-correct rendering**: properly displays mixed RTL/LTR text (Arabic,
+  Hebrew, etc. mixed with English/code) per Unicode UAX #9; code identifiers
+  like `cpp_str` are preserved without visual reversal
 
 ## Install
 

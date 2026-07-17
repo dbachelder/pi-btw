@@ -1,14 +1,15 @@
 {
-  "compilerOptions": {
-    "target": "ESNext",
-    "module": "ESNext",
-    "moduleResolution": "bundler",
-    "strict": true,
-    "esModuleInterop": true,
-    "skipLibCheck": true,
-    "noEmit": true,
-    "resolveJsonModule": true,
-    "types": ["node"]
-  },
-  "include": ["extensions/**/*.ts"]
+	"compilerOptions": {
+		"target": "ESNext",
+		"module": "ESNext",
+		"moduleResolution": "bundler",
+		"strict": true,
+		"esModuleInterop": true,
+		"skipLibCheck": true,
+		"noEmit": true,
+		"resolveJsonModule": true,
+		"types": ["node"],
+		"allowImportingTsExtensions": true
+	},
+	"include": ["extensions/**/*.ts", "lib/**/*.ts"]
 }
