@@ -488,7 +488,10 @@ function createHarness(
   let idle = true;
   let hasCredentials = true;
   let mainThinkingLevel: string = "off";
-  let credentialResolver: ((model: { provider: string; id: string; api: string }) => string | undefined) | null = null;
+  type AuthResult =
+    | { ok: true; apiKey?: string; headers?: Record<string, string>; env?: Record<string, string> }
+    | { ok: false; error: string };
+  let authResolver: ((model: { provider: string; id: string; api: string }) => AuthResult) | null = null;
   // Models that ctx.modelRegistry.find(provider, id) should return for /btw:model resolution.
   // Tests that exercise overrides should call harness.registerModel(...) so the resolved
   // Model.api preserves the value the test cares about (otherwise we synthesize a default).
@@ -579,11 +582,12 @@ function createHarness(
     sessionManager: sessionManager as any,
     modelRegistry: {
       getApiKeyAndHeaders: vi.fn(async (requestedModel: { provider: string; id: string; api: string }) => {
-        if (credentialResolver) {
-          const key = credentialResolver(requestedModel);
-          return key ? { ok: true, apiKey: key, headers: undefined } : { ok: true, apiKey: undefined, headers: undefined };
+        if (authResolver) {
+          return authResolver(requestedModel);
         }
-        return hasCredentials ? { ok: true, apiKey: "test-key", headers: undefined } : { ok: true, apiKey: undefined, headers: undefined };
+        return hasCredentials
+          ? { ok: true, apiKey: "test-key", headers: undefined }
+          : { ok: false, error: `No credentials available for ${requestedModel.provider}/${requestedModel.id}.` };
       }),
       // pi 0.74 ExtensionContext.modelRegistry.find(provider, modelId) -> Model<Api> | undefined.
       // The mock looks up entries from `registeredModels`; falls back to a default api so legacy
@@ -672,8 +676,8 @@ function createHarness(
     setCredentials(value: boolean) {
       hasCredentials = value;
     },
-    setCredentialResolver(value: ((model: { provider: string; id: string; api: string }) => string | undefined) | null) {
-      credentialResolver = value;
+    setAuthResolver(value: ((model: { provider: string; id: string; api: string }) => AuthResult) | null) {
+      authResolver = value;
     },
     setMainThinkingLevel(value: string) {
       mainThinkingLevel = value;
@@ -722,9 +726,31 @@ describe("btw runtime behavior", () => {
     expect(subSession.prompt).toHaveBeenCalledWith("first question", { source: "extension" });
   });
 
-  it("uses BTW-specific model and thinking overrides for BTW prompts", async () => {
+  it("accepts successful subscription auth without requiring an API key", async () => {
+    const harness = createHarness();
+    harness.setAuthResolver(() => ({
+      ok: true,
+      headers: { Authorization: "Bearer subscription-token" },
+      env: { PI_AUTH_MODE: "subscription" },
+    }));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "subscription question");
+
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(1);
+    expect(subSessionRecords[0]?.session.prompt).toHaveBeenCalledWith("subscription question", { source: "extension" });
+    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(1);
+    expect(harness.notifications.some((entry) => entry.message.includes("No credentials"))).toBe(false);
+  });
+
+  it("uses a BTW-specific model with subscription auth and a thinking override", async () => {
     const harness = createHarness();
     harness.setMainThinkingLevel("high");
+    harness.setAuthResolver((requestedModel) =>
+      requestedModel.provider === "fast-provider"
+        ? { ok: true, headers: { Authorization: "Bearer subscription-token" } }
+        : { ok: true, apiKey: "main-key" },
+    );
 
     await harness.runSessionStart();
     await harness.command("btw:model", "fast-provider fast-model custom-api");
@@ -853,8 +879,10 @@ describe("btw runtime behavior", () => {
 
   it("falls back to the main model when the BTW model override has no credentials", async () => {
     const harness = createHarness();
-    harness.setCredentialResolver((requestedModel) =>
-      requestedModel.provider === "fast-provider" ? undefined : "main-key",
+    harness.setAuthResolver((requestedModel) =>
+      requestedModel.provider === "fast-provider"
+        ? { ok: false, error: 'No API key found for "fast-provider"' }
+        : { ok: true, apiKey: "main-key" },
     );
 
     await harness.runSessionStart();
@@ -1889,6 +1917,28 @@ describe("btw runtime behavior", () => {
     await harness.command("btw", "");
     const reopened = harness.latestOverlayComponent();
     expect(transcriptText(reopened)).toContain("No BTW thread yet. Ask a side question to start one.");
+  });
+
+  it("summarizes with successful subscription auth that has no API key", async () => {
+    const harness = createHarness();
+    promptStreamMock
+      .mockImplementationOnce(() => streamAnswer("First answer"))
+      .mockImplementationOnce(() => streamAnswer("Subscription summary"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+    harness.setAuthResolver(() => ({
+      ok: true,
+      headers: { Authorization: "Bearer subscription-token" },
+    }));
+
+    await harness.command("btw:summarize", "handoff this");
+
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(2);
+    expect(harness.sentUserMessages[0]?.content).toBe(
+      "Here is a summary of a side conversation I had. handoff this\n\nSubscription summary",
+    );
+    expect(harness.notifications.some((entry) => entry.message.includes("No credentials"))).toBe(false);
   });
 
   it("summarize failure preserves BTW thread state and keeps the overlay recoverable", async () => {
