@@ -581,9 +581,9 @@ function createHarness(
       getApiKeyAndHeaders: vi.fn(async (requestedModel: { provider: string; id: string; api: string }) => {
         if (credentialResolver) {
           const key = credentialResolver(requestedModel);
-          return key ? { ok: true, apiKey: key, headers: undefined } : { ok: true, apiKey: undefined, headers: undefined };
+          return key ? { ok: true, apiKey: key, headers: undefined } : { ok: false, error: `No credentials available for ${requestedModel.provider}/${requestedModel.id}.` };
         }
-        return hasCredentials ? { ok: true, apiKey: "test-key", headers: undefined } : { ok: true, apiKey: undefined, headers: undefined };
+        return hasCredentials ? { ok: true, apiKey: "test-key", headers: undefined } : { ok: false, error: "No credentials available for test-provider/test-model." };
       }),
       // pi 0.74 ExtensionContext.modelRegistry.find(provider, modelId) -> Model<Api> | undefined.
       // The mock looks up entries from `registeredModels`; falls back to a default api so legacy

@@ -1468,7 +1468,7 @@ export default function (pi: ExtensionAPI) {
   ): Promise<ResolvedBtwModel> {
     if (btwModelOverride) {
       const auth = await ctx.modelRegistry.getApiKeyAndHeaders(btwModelOverride);
-      if (auth.ok && auth.apiKey) {
+      if (auth.ok) {
         return {
           model: btwModelOverride,
           source: "override",
@@ -2042,8 +2042,8 @@ export default function (pi: ExtensionAPI) {
     }
 
     const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-    if (!auth.ok || !auth.apiKey) {
-      const message = auth.ok ? `No credentials available for ${model.provider}/${model.id}.` : auth.error;
+    if (!auth.ok) {
+      const message = auth.error || `No credentials available for ${model.provider}/${model.id}.`;
       setOverlayStatus(message, ctx);
       notify(ctx, message, "error");
       await ensureOverlay(ctx);
@@ -2149,8 +2149,8 @@ export default function (pi: ExtensionAPI) {
     }
 
     const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-    if (!auth.ok || !auth.apiKey) {
-      throw new Error(auth.ok ? `No credentials available for ${model.provider}/${model.id}.` : auth.error);
+    if (!auth.ok) {
+      throw new Error(auth.error || `No credentials available for ${model.provider}/${model.id}.`);
     }
 
     const { session } = await createAgentSession({
