@@ -2,6 +2,7 @@ import {
   buildSessionContext,
   createAgentSession,
   createExtensionRuntime,
+  getMarkdownTheme,
   SessionManager,
   type AgentSession,
   type AgentSessionEvent,
@@ -16,6 +17,7 @@ import {
   Container,
   Input,
   Key,
+  Markdown,
   Text,
   matchesKey,
   truncateToWidth,
@@ -23,6 +25,7 @@ import {
   wrapTextWithAnsi,
   type Focusable,
   type KeybindingsManager,
+  type MarkdownTheme,
   type OverlayHandle,
   type TUI,
 } from "@earendil-works/pi-tui";
@@ -782,7 +785,12 @@ function getCompletedExchangeCount(entries: BtwTranscript): number {
   return entries.filter((entry) => entry.type === "assistant-text" && !entry.streaming).length;
 }
 
-function buildOverlayTranscript(entries: BtwTranscript, theme: ExtensionContext["ui"]["theme"]): string[] {
+function buildOverlayTranscript(
+  entries: BtwTranscript,
+  theme: ExtensionContext["ui"]["theme"],
+  markdownTheme: MarkdownTheme,
+  contentWidth: number,
+): string[] {
   if (entries.length === 0) {
     return [theme.fg("dim", "No BTW thread yet. Ask a side question to start one.")];
   }
@@ -793,7 +801,7 @@ function buildOverlayTranscript(entries: BtwTranscript, theme: ExtensionContext[
   const toolBadge = buildTranscriptBadge(theme, "Tool", "toolPendingBg", "warning");
   const assistantBadge = buildTranscriptBadge(theme, "Assistant", "customMessageBg", "success");
   const separator = theme.fg("borderMuted", "────────────────────────────────────────");
-  const blockIndent = "    ";
+  const blockIndent = BTW_BLOCK_INDENT;
   const resultIndent = blockIndent;
 
   const pushBlankLine = () => {
@@ -854,9 +862,19 @@ function buildOverlayTranscript(entries: BtwTranscript, theme: ExtensionContext[
 
     if (entry.type === "thinking") {
       const thinkingHeader = entry.streaming ? `${thinkingBadge} ${theme.fg("warning", "▍")}` : thinkingBadge;
-      pushStackedBlock(thinkingHeader, entry.text, {
-        style: (line) => theme.fg("warning", theme.italic(line)),
-      });
+      // Render reasoning as markdown (matching the main agent) while keeping the BTW
+      // overlay's amber thinking look via a warning-colored italic default text style.
+      const markdownLines = new Markdown(entry.text, 0, 0, markdownTheme, {
+        color: (text: string) => theme.fg("warning", text),
+        italic: true,
+      })
+        .render(Math.max(1, contentWidth))
+        .map((line) => line.replace(/\s+$/u, ""));
+      pushBlankLine();
+      lines.push(thinkingHeader);
+      for (const line of markdownLines) {
+        lines.push(line ? `${blockIndent}${line}` : "");
+      }
       continue;
     }
 
@@ -884,7 +902,16 @@ function buildOverlayTranscript(entries: BtwTranscript, theme: ExtensionContext[
 
     if (entry.type === "assistant-text") {
       const assistantHeader = entry.streaming ? `${assistantBadge} ${theme.fg("warning", "▍")}` : assistantBadge;
-      pushStackedBlock(assistantHeader, entry.text);
+      // Render the assistant response as styled markdown instead of raw text so that
+      // headings, lists, code blocks, tables, and inline formatting are actually parsed.
+      const markdownLines = new Markdown(entry.text, 0, 0, markdownTheme)
+        .render(Math.max(1, contentWidth))
+        .map((line) => line.replace(/\s+$/u, ""));
+      pushBlankLine();
+      lines.push(assistantHeader);
+      for (const line of markdownLines) {
+        lines.push(line ? `${blockIndent}${line}` : "");
+      }
     }
   }
 
@@ -1004,6 +1031,9 @@ function notify(ctx: ExtensionContext | ExtensionCommandContext, message: string
 /** Fixed overlay rows outside the transcript viewport (must match render() structure). */
 const BTW_OVERLAY_CHROME_LINES = 9;
 
+/** Indent applied to transcript block bodies (assistant/thinking/tool-result continuations). */
+const BTW_BLOCK_INDENT = "    ";
+
 function getOverlayTitle(mode: BtwThreadMode): string {
   return mode === "tangent" ? "BTW tangent" : "BTW";
 }
@@ -1032,9 +1062,11 @@ class BtwOverlayComponent extends Container implements Focusable {
   private readonly onUnfocusCallback: () => void;
   private readonly tui: TUI;
   private readonly theme: ExtensionContext["ui"]["theme"];
+  private readonly markdownTheme: MarkdownTheme;
   private transcriptLines: string[] = [];
   private transcriptScrollOffset = 0;
   private transcriptViewportHeight = 8;
+  private contentWidth = 66;
   private followTranscript = true;
   private _focused = false;
   private modeTextValue = "";
@@ -1065,6 +1097,7 @@ class BtwOverlayComponent extends Container implements Focusable {
     super();
     this.tui = tui;
     this.theme = theme;
+    this.markdownTheme = getMarkdownTheme();
     this.readTranscriptEntries = readTranscriptEntries;
     this.getStatus = getStatus;
     this.getMode = getMode;
@@ -1225,6 +1258,11 @@ class BtwOverlayComponent extends Container implements Focusable {
   override render(width: number): string[] {
     const dialogWidth = Math.max(24, width);
     const innerWidth = Math.max(22, dialogWidth - 2);
+    const contentWidth = Math.max(1, innerWidth - BTW_BLOCK_INDENT.length);
+    if (contentWidth !== this.contentWidth) {
+      this.contentWidth = contentWidth;
+      this.rebuildTranscriptLines();
+    }
     const transcriptLines = this.wrapTranscript(innerWidth);
     const dialogHeight = this.getDialogHeight();
     const chromeHeight = BTW_OVERLAY_CHROME_LINES;
@@ -1288,6 +1326,15 @@ class BtwOverlayComponent extends Container implements Focusable {
     return this.readTranscriptEntries().map((entry) => ({ ...entry }));
   }
 
+  private rebuildTranscriptLines(): void {
+    this.transcriptLines = buildOverlayTranscript(
+      this.readTranscriptEntries(),
+      this.theme,
+      this.markdownTheme,
+      this.contentWidth,
+    );
+  }
+
   refresh(): void {
     this.modeTextValue = `${getOverlayTitle(this.getMode())} · hidden thread preserved`;
     this.modeText.setText(this.modeTextValue);
@@ -1297,7 +1344,7 @@ class BtwOverlayComponent extends Container implements Focusable {
     this.summaryTextValue = `${exchanges} exchange${exchanges === 1 ? "" : "s"}${active}`;
     this.summaryText.setText(this.summaryTextValue);
 
-    this.transcriptLines = buildOverlayTranscript(entries, this.theme);
+    this.rebuildTranscriptLines();
     this.transcript.clear();
     for (const line of this.transcriptLines) {
       this.transcript.addChild(new Text(line, 1, 0));
@@ -2198,28 +2245,43 @@ export default function (pi: ExtensionAPI) {
   pi.registerMessageRenderer(BTW_MESSAGE_TYPE, (message, { expanded }, theme) => {
     const details = message.details as BtwDetails | undefined;
     const content = typeof message.content === "string" ? message.content : "[non-text btw message]";
-    const lines = [theme.fg("accent", theme.bold("[BTW]")), content];
+
+    const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
+    box.addChild(new Text(theme.fg("accent", theme.bold("[BTW]")), 0, 0));
+    // Render the saved note body as markdown so headings/code/lists are formatted,
+    // matching how the main agent renders assistant messages.
+    box.addChild(
+      new Markdown(content, 0, 0, getMarkdownTheme(), {
+        color: (text: string) => theme.fg("customMessageText", text),
+      }),
+    );
 
     if (expanded && details) {
-      lines.push(
-        theme.fg(
-          "dim",
-          `model: ${details.provider}/${details.model} (${details.api ?? "openai-responses"}) · thinking: ${details.thinkingLevel}`,
+      box.addChild(
+        new Text(
+          theme.fg(
+            "dim",
+            `model: ${details.provider}/${details.model} (${details.api ?? "openai-responses"}) · thinking: ${details.thinkingLevel}`,
+          ),
+          0,
+          0,
         ),
       );
 
       if (details.usage) {
-        lines.push(
-          theme.fg(
-            "dim",
-            `tokens: in ${details.usage.input} · out ${details.usage.output} · total ${details.usage.totalTokens}`,
+        box.addChild(
+          new Text(
+            theme.fg(
+              "dim",
+              `tokens: in ${details.usage.input} · out ${details.usage.output} · total ${details.usage.totalTokens}`,
+            ),
+            0,
+            0,
           ),
         );
       }
     }
 
-    const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
-    box.addChild(new Text(lines.join("\n"), 0, 0));
     return box;
   });
 
