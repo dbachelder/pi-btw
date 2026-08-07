@@ -7,6 +7,7 @@ const {
   promptStreamMock,
   createAgentSessionMock,
   sessionManagerInMemoryMock,
+  modelRuntimeExport,
   modelRuntimeCreateMock,
   modelRuntimeRecords,
   subSessionRecords,
@@ -14,6 +15,7 @@ const {
   promptStreamMock: vi.fn(),
   createAgentSessionMock: vi.fn(),
   sessionManagerInMemoryMock: vi.fn(() => ({ type: "in-memory-session" })),
+  modelRuntimeExport: {} as { create?: ReturnType<typeof vi.fn> },
   modelRuntimeCreateMock: vi.fn(),
   modelRuntimeRecords: [] as Array<{
     registerProvider: ReturnType<typeof vi.fn>;
@@ -37,7 +39,7 @@ vi.mock("@earendil-works/pi-coding-agent", async () => {
   return {
     ...actual,
     createAgentSession: createAgentSessionMock,
-    ModelRuntime: { create: modelRuntimeCreateMock },
+    ModelRuntime: modelRuntimeExport,
     SessionManager: {
       ...actual.SessionManager,
       inMemory: sessionManagerInMemoryMock,
@@ -723,6 +725,7 @@ describe("btw runtime behavior", () => {
     createAgentSessionMock.mockReset();
     sessionManagerInMemoryMock.mockClear();
     modelRuntimeCreateMock.mockReset();
+    modelRuntimeExport.create = modelRuntimeCreateMock;
     modelRuntimeRecords.length = 0;
     subSessionRecords.length = 0;
 
@@ -860,6 +863,36 @@ describe("btw runtime behavior", () => {
     expect(modelRuntimeRecords[0].registerNativeProvider).toHaveBeenCalledWith(nativeProvider);
     expect(modelRuntimeRecords[0].registerProvider).not.toHaveBeenCalled();
     expect(createAgentSessionMock.mock.calls[0][0].modelRuntime).toBe(modelRuntimeRecords[0]);
+  });
+
+  it("uses legacy modelRegistry while preserving BTW model and thinking overrides", async () => {
+    const harness = createHarness();
+    harness.registerModel("legacy-provider", "legacy-model", "custom-api");
+    harness.registerProviderConfig("legacy-provider", { api: "custom-api", streamSimple: vi.fn() });
+    delete modelRuntimeExport.create;
+
+    await harness.runSessionStart();
+    await harness.command("btw:model", "legacy-provider legacy-model custom-api");
+    await harness.command("btw:thinking", "low");
+    await harness.command("btw", "first question");
+    await harness.command("btw:summarize", "handoff this");
+
+    expect(modelRuntimeCreateMock).not.toHaveBeenCalled();
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(2);
+
+    const [btwOptions, summaryOptions] = createAgentSessionMock.mock.calls.map(([options]) => options);
+    expect(btwOptions).toMatchObject({
+      model: { provider: "legacy-provider", id: "legacy-model", api: "custom-api" },
+      thinkingLevel: "low",
+      modelRegistry: harness.baseCtx.modelRegistry,
+    });
+    expect(btwOptions).not.toHaveProperty("modelRuntime");
+    expect(summaryOptions).toMatchObject({
+      model: { provider: "legacy-provider", id: "legacy-model", api: "custom-api" },
+      thinkingLevel: "off",
+      modelRegistry: harness.baseCtx.modelRegistry,
+    });
+    expect(summaryOptions).not.toHaveProperty("modelRuntime");
   });
 
   it("uses BTW-specific model and thinking overrides for BTW prompts", async () => {

@@ -1,8 +1,8 @@
+import * as piCodingAgent from "@earendil-works/pi-coding-agent";
 import {
   buildSessionContext,
   createAgentSession,
   createExtensionRuntime,
-  ModelRuntime,
   SessionManager,
   type AgentSession,
   type AgentSessionEvent,
@@ -152,12 +152,34 @@ type BtwSessionRuntime = {
   sideThreadStartIndex: number;
 };
 
-type ModelRegistryWithNativeProvider = {
-  getRegisteredNativeProvider?: (providerId: string) => Provider | undefined;
+type BtwModelRuntime = {
+  registerProvider: (providerId: string, config: unknown) => void;
+  refresh: (options: { allowNetwork: boolean }) => Promise<unknown>;
+  setRuntimeApiKey?: (providerId: string, apiKey: string) => Promise<void>;
+  registerNativeProvider?: (provider: Provider) => void;
 };
 
-type ModelRuntimeWithNativeProvider = ModelRuntime & {
-  registerNativeProvider?: (provider: Provider) => void;
+type ModelRuntimeConstructor = {
+  create: (options?: { allowModelNetwork?: boolean }) => Promise<BtwModelRuntime>;
+};
+
+type ModelRegistryWithRuntimeSupport = {
+  getRegisteredProviderConfig?: (providerId: string) => unknown;
+  getRegisteredNativeProvider?: (providerId: string) => Provider | undefined;
+  getProviderAuthStatus?: (providerId: string) => { source?: string } | undefined;
+};
+
+type BtwModelRuntimeOptions = {
+  modelRuntime?: BtwModelRuntime;
+  modelRegistry?: ExtensionCommandContext["modelRegistry"];
+};
+
+type BtwCreateAgentSessionOptions = BtwModelRuntimeOptions & {
+  sessionManager: ReturnType<typeof SessionManager.inMemory>;
+  model: SessionModel;
+  thinkingLevel: SessionThinkingLevel;
+  tools: string[];
+  resourceLoader: ResourceLoader;
 };
 
 type BtwResourceLoader = Pick<
@@ -222,26 +244,32 @@ function createBtwResourceLoader(
   });
 }
 
-async function createBtwModelRuntime(
+async function createBtwModelRuntimeOptions(
   ctx: ExtensionCommandContext,
   model: SessionModel,
-): Promise<ModelRuntime | undefined> {
-  const registry = ctx.modelRegistry as typeof ctx.modelRegistry & ModelRegistryWithNativeProvider;
+): Promise<BtwModelRuntimeOptions> {
+  const registry = ctx.modelRegistry as typeof ctx.modelRegistry & ModelRegistryWithRuntimeSupport;
+  const ModelRuntime = (piCodingAgent as { ModelRuntime?: ModelRuntimeConstructor }).ModelRuntime;
+  const getRegisteredProviderConfig = registry.getRegisteredProviderConfig;
+
+  if (!ModelRuntime || typeof ModelRuntime.create !== "function" || typeof getRegisteredProviderConfig !== "function") {
+    return { modelRegistry: ctx.modelRegistry };
+  }
+
   const nativeProvider = registry.getRegisteredNativeProvider?.(model.provider);
-  const providerConfig = ctx.modelRegistry.getRegisteredProviderConfig(model.provider);
-  const hasRuntimeApiKey = ctx.modelRegistry.getProviderAuthStatus(model.provider).source === "runtime";
+  const providerConfig = getRegisteredProviderConfig(model.provider);
+  const hasRuntimeApiKey = registry.getProviderAuthStatus?.(model.provider)?.source === "runtime";
 
   if (!nativeProvider && !providerConfig && !hasRuntimeApiKey) {
-    return undefined;
+    return {};
   }
 
   const modelRuntime = await ModelRuntime.create({ allowModelNetwork: false });
   if (nativeProvider) {
-    const nativeRuntime = modelRuntime as ModelRuntimeWithNativeProvider;
-    if (!nativeRuntime.registerNativeProvider) {
+    if (!modelRuntime.registerNativeProvider) {
       throw new Error(`Pi does not support native provider ${model.provider}.`);
     }
-    nativeRuntime.registerNativeProvider(nativeProvider);
+    modelRuntime.registerNativeProvider(nativeProvider);
   } else if (providerConfig) {
     modelRuntime.registerProvider(model.provider, providerConfig);
   }
@@ -251,11 +279,14 @@ async function createBtwModelRuntime(
   if (hasRuntimeApiKey) {
     const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
     if (auth.ok && auth.apiKey) {
+      if (!modelRuntime.setRuntimeApiKey) {
+        throw new Error(`Pi does not support runtime API key propagation for ${model.provider}.`);
+      }
       await modelRuntime.setRuntimeApiKey(model.provider, auth.apiKey);
     }
   }
 
-  return modelRuntime;
+  return { modelRuntime };
 }
 
 function extractText(parts: AssistantMessage["content"], type: "text" | "thinking"): string {
@@ -1669,17 +1700,18 @@ export default function (pi: ExtensionAPI) {
       throw new Error(settings.fallbackReason || "No active model selected.");
     }
 
-    const modelRuntime = await createBtwModelRuntime(ctx, settings.model);
+    const modelRuntimeOptions = await createBtwModelRuntimeOptions(ctx, settings.model);
 
-    const { session } = await createAgentSession({
+    const sessionOptions: BtwCreateAgentSessionOptions = {
       sessionManager: SessionManager.inMemory(),
       model: settings.model,
-      ...(modelRuntime ? { modelRuntime } : {}),
+      ...modelRuntimeOptions,
       thinkingLevel: settings.thinkingLevel,
       // Match pi's default coding-agent toolset (read/bash/edit/write).
       tools: ["read", "bash", "edit", "write"],
       resourceLoader: createBtwResourceLoader(ctx),
-    });
+    };
+    const { session } = await createAgentSession(sessionOptions as Parameters<typeof createAgentSession>[0]);
 
     const { messages: seedMessages, sideThreadStartIndex } = buildBtwSeedState(ctx, pendingThread, mode, settings.model);
     if (seedMessages.length > 0) {
@@ -2227,16 +2259,17 @@ export default function (pi: ExtensionAPI) {
       throw new Error(auth.ok ? `No credentials available for ${model.provider}/${model.id}.` : auth.error);
     }
 
-    const modelRuntime = await createBtwModelRuntime(ctx, model);
+    const modelRuntimeOptions = await createBtwModelRuntimeOptions(ctx, model);
 
-    const { session } = await createAgentSession({
+    const sessionOptions: BtwCreateAgentSessionOptions = {
       sessionManager: SessionManager.inMemory(),
       model,
-      ...(modelRuntime ? { modelRuntime } : {}),
+      ...modelRuntimeOptions,
       thinkingLevel: "off",
       tools: [],
       resourceLoader: createBtwResourceLoader(ctx, [BTW_SUMMARIZE_SYSTEM_PROMPT]),
-    });
+    };
+    const { session } = await createAgentSession(sessionOptions as Parameters<typeof createAgentSession>[0]);
 
     try {
       await session.prompt(formatThread(thread), { source: "extension" });
