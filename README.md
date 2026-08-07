@@ -2,6 +2,8 @@
 
 A small [pi](https://github.com/earendil-works/pi-mono) extension that adds a `/btw` side conversation channel.
 
+Requires Pi 0.80.8 or later.
+
 `/btw` opens a real pi sub-session with coding-tool access, and it runs immediately even while the main agent is still busy.
 
 ![BTW overlay example](docs/btw-overlay.png)

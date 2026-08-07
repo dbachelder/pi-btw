@@ -2,6 +2,7 @@ import {
   buildSessionContext,
   createAgentSession,
   createExtensionRuntime,
+  ModelRuntime,
   SessionManager,
   type AgentSession,
   type AgentSessionEvent,
@@ -10,7 +11,13 @@ import {
   type ExtensionContext,
   type ResourceLoader,
 } from "@earendil-works/pi-coding-agent";
-import { type AssistantMessage, type Message, type ThinkingLevel as AiThinkingLevel, type UserMessage } from "@earendil-works/pi-ai";
+import {
+  type AssistantMessage,
+  type Message,
+  type Provider,
+  type ThinkingLevel as AiThinkingLevel,
+  type UserMessage,
+} from "@earendil-works/pi-ai";
 import {
   Box,
   Container,
@@ -145,6 +152,27 @@ type BtwSessionRuntime = {
   sideThreadStartIndex: number;
 };
 
+type ModelRegistryWithNativeProvider = {
+  getRegisteredNativeProvider?: (providerId: string) => Provider | undefined;
+};
+
+type ModelRuntimeWithNativeProvider = ModelRuntime & {
+  registerNativeProvider?: (provider: Provider) => void;
+};
+
+type BtwResourceLoader = Pick<
+  ResourceLoader,
+  | "getExtensions"
+  | "getSkills"
+  | "getPrompts"
+  | "getThemes"
+  | "getAgentsFiles"
+  | "getSystemPrompt"
+  | "getAppendSystemPrompt"
+  | "extendResources"
+  | "reload"
+>;
+
 type OverlayRuntime = {
   handle?: OverlayHandle;
   refresh?: () => void;
@@ -176,7 +204,7 @@ function createBtwResourceLoader(
   const extensionsResult = { extensions: [], errors: [], runtime: createExtensionRuntime() };
   const systemPrompt = stripDynamicSystemPromptFooter(ctx.getSystemPrompt());
 
-  return {
+  const resourceLoader: BtwResourceLoader = {
     getExtensions: () => extensionsResult,
     getSkills: () => ({ skills: [], diagnostics: [] }),
     getPrompts: () => ({ prompts: [], diagnostics: [] }),
@@ -187,6 +215,47 @@ function createBtwResourceLoader(
     extendResources: () => {},
     reload: async () => {},
   };
+
+  return Object.assign(resourceLoader, {
+    getSystemPromptSource: () => undefined,
+    getAppendSystemPromptSources: () => [],
+  });
+}
+
+async function createBtwModelRuntime(
+  ctx: ExtensionCommandContext,
+  model: SessionModel,
+): Promise<ModelRuntime | undefined> {
+  const registry = ctx.modelRegistry as typeof ctx.modelRegistry & ModelRegistryWithNativeProvider;
+  const nativeProvider = registry.getRegisteredNativeProvider?.(model.provider);
+  const providerConfig = ctx.modelRegistry.getRegisteredProviderConfig(model.provider);
+  const hasRuntimeApiKey = ctx.modelRegistry.getProviderAuthStatus(model.provider).source === "runtime";
+
+  if (!nativeProvider && !providerConfig && !hasRuntimeApiKey) {
+    return undefined;
+  }
+
+  const modelRuntime = await ModelRuntime.create({ allowModelNetwork: false });
+  if (nativeProvider) {
+    const nativeRuntime = modelRuntime as ModelRuntimeWithNativeProvider;
+    if (!nativeRuntime.registerNativeProvider) {
+      throw new Error(`Pi does not support native provider ${model.provider}.`);
+    }
+    nativeRuntime.registerNativeProvider(nativeProvider);
+  } else if (providerConfig) {
+    modelRuntime.registerProvider(model.provider, providerConfig);
+  }
+  await modelRuntime.refresh({ allowNetwork: false });
+
+  // --api-key is stored only in the parent runtime.
+  if (hasRuntimeApiKey) {
+    const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+    if (auth.ok && auth.apiKey) {
+      await modelRuntime.setRuntimeApiKey(model.provider, auth.apiKey);
+    }
+  }
+
+  return modelRuntime;
 }
 
 function extractText(parts: AssistantMessage["content"], type: "text" | "thinking"): string {
@@ -1591,16 +1660,21 @@ export default function (pi: ExtensionAPI) {
     notify(ctx, `${message} ${describeResolvedThinking(settings)}`, "info");
   }
 
-  async function createBtwSubSession(ctx: ExtensionCommandContext, mode: BtwThreadMode): Promise<BtwSessionRuntime> {
-    const settings = await resolveBtwSettings(ctx, true);
+  async function createBtwSubSession(
+    ctx: ExtensionCommandContext,
+    mode: BtwThreadMode,
+    settings: ResolvedBtwSettings,
+  ): Promise<BtwSessionRuntime> {
     if (!settings.model) {
       throw new Error(settings.fallbackReason || "No active model selected.");
     }
 
+    const modelRuntime = await createBtwModelRuntime(ctx, settings.model);
+
     const { session } = await createAgentSession({
       sessionManager: SessionManager.inMemory(),
       model: settings.model,
-      modelRegistry: ctx.modelRegistry as AgentSession["modelRegistry"],
+      ...(modelRuntime ? { modelRuntime } : {}),
       thinkingLevel: settings.thinkingLevel,
       // Match pi's default coding-agent toolset (read/bash/edit/write).
       tools: ["read", "bash", "edit", "write"],
@@ -1616,7 +1690,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function ensureBtwSession(ctx: ExtensionCommandContext, mode: BtwThreadMode): Promise<BtwSessionRuntime | null> {
-    const settings = await resolveBtwSettings(ctx);
+    const settings = await resolveBtwSettings(ctx, true);
     if (!settings.model) {
       return null;
     }
@@ -1626,7 +1700,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     await disposeBtwSession();
-    activeBtwSession = await createBtwSubSession(ctx, mode);
+    activeBtwSession = await createBtwSubSession(ctx, mode, settings);
     return activeBtwSession;
   }
 
@@ -2153,10 +2227,12 @@ export default function (pi: ExtensionAPI) {
       throw new Error(auth.ok ? `No credentials available for ${model.provider}/${model.id}.` : auth.error);
     }
 
+    const modelRuntime = await createBtwModelRuntime(ctx, model);
+
     const { session } = await createAgentSession({
       sessionManager: SessionManager.inMemory(),
       model,
-      modelRegistry: ctx.modelRegistry as AgentSession["modelRegistry"],
+      ...(modelRuntime ? { modelRuntime } : {}),
       thinkingLevel: "off",
       tools: [],
       resourceLoader: createBtwResourceLoader(ctx, [BTW_SUMMARIZE_SYSTEM_PROMPT]),
