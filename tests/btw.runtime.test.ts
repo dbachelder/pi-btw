@@ -18,11 +18,29 @@ const { promptStreamMock, createAgentSessionMock, sessionManagerInMemoryMock, su
   }>,
 }));
 
+const markdownTheme = {
+  heading: (text: string) => `<heading>${text}</heading>`,
+  link: (text: string) => text,
+  linkUrl: (text: string) => text,
+  code: (text: string) => text,
+  codeBlock: (text: string) => text,
+  codeBlockBorder: (text: string) => text,
+  quote: (text: string) => text,
+  quoteBorder: (text: string) => text,
+  hr: (text: string) => text,
+  listBullet: (text: string) => text,
+  bold: (text: string) => `<bold>${text}</bold>`,
+  italic: (text: string) => `<italic>${text}</italic>`,
+  strikethrough: (text: string) => text,
+  underline: (text: string) => text,
+};
+
 vi.mock("@earendil-works/pi-coding-agent", async () => {
   const actual = await vi.importActual<typeof import("@earendil-works/pi-coding-agent")>("@earendil-works/pi-coding-agent");
   return {
     ...actual,
     createAgentSession: createAgentSessionMock,
+    getMarkdownTheme: () => markdownTheme,
     SessionManager: {
       ...actual.SessionManager,
       inMemory: sessionManagerInMemoryMock,
@@ -459,6 +477,7 @@ function createHarness(
 ) {
   const commands = new Map<string, RegisteredCommand>();
   const shortcuts = new Map<string, any>();
+  const messageRenderers = new Map<string, any>();
   const handlers = new Map<string, Function[]>();
   const entries: SessionEntry[] = [...initialEntries];
   const notifications: Array<{ message: string; type?: string }> = [];
@@ -553,7 +572,7 @@ function createHarness(
     }) as any,
     registerFlag: vi.fn() as any,
     getFlag: vi.fn() as any,
-    registerMessageRenderer: vi.fn() as any,
+    registerMessageRenderer: ((type: string, renderer: unknown) => messageRenderers.set(type, renderer)) as any,
     sendMessage: ((message: unknown, options?: unknown) => sentMessages.push({ message, options })) as any,
     sendUserMessage: ((content: unknown, options?: unknown) => sentUserMessages.push({ content, options })) as any,
     appendEntry: ((customType: string, data?: unknown) => entries.push({ type: "custom", customType, data })) as any,
@@ -651,6 +670,7 @@ function createHarness(
   return {
     api,
     entries,
+    messageRenderers,
     notifications,
     widgets,
     sentMessages,
@@ -1290,7 +1310,7 @@ describe("btw runtime behavior", () => {
 
     const transcript = transcriptText(overlay);
     expect(transcript).toContain("<bg:toolPendingBg>");
-    expect(transcript).toContain("<italic>Inspecting package.json</italic>");
+    expect(transcript).toContain("<italic><fg:warning>Inspecting package.json</fg:warning></italic>");
     expect(transcript).toContain("<bold>read</bold>");
     expect(transcript).toContain("package.json");
     expect(transcript).toContain("↳ result");
@@ -1405,6 +1425,63 @@ describe("btw runtime behavior", () => {
     expect(transcript).toContain("<fg:accent>");
     expect(transcript).toContain("<bg:customMessageBg>");
     expect(transcript).toContain("<fg:success>");
+  });
+
+  it("renders overlay Markdown and wraps tables within the dialog width", async () => {
+    const harness = createHarness();
+    const answer = [
+      "# Result",
+      "",
+      "**Ready**",
+      "",
+      "| Check | Status | Detail |",
+      "| --- | --- | --- |",
+      "| Markdown | pass | Tables wrap in narrow overlays |",
+    ].join("\n");
+    promptStreamMock.mockImplementation(() => streamAnswer(answer));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "show the result");
+
+    const rendered = harness.latestOverlayComponent().render(72);
+    const transcript = rendered.join("\n");
+    expect(transcript).toContain("<heading><bold>Result</bold></heading>");
+    expect(transcript).toContain("<bold>Ready</bold>");
+    expect(transcript).toContain("┌");
+    expect(transcript).toContain("┘");
+    expect(transcript).not.toContain("| --- | --- | --- |");
+    expect(rendered.every((line: string) => visibleWidth(line) <= 72)).toBe(true);
+  });
+
+  it("renders saved BTW notes as Markdown, including legacy note details", () => {
+    const harness = createHarness();
+    const renderMessage = harness.messageRenderers.get("btw-note");
+    expect(renderMessage).toBeTypeOf("function");
+
+    const box = renderMessage(
+      {
+        customType: "btw-note",
+        content: "Q: legacy question\n\nA: raw answer",
+        details: {
+          question: "legacy question",
+          answer: "| Check | Status |\n| --- | --- |\n| Saved note | pass |",
+          provider: "test-provider",
+          model: "test-model",
+          api: "openai-responses",
+          thinkingLevel: "off",
+        },
+      },
+      { expanded: false },
+      harness.baseCtx.ui.theme,
+    );
+    const markdown = box.children[1];
+    const rendered = markdown.render(56).join("\n");
+
+    expect(rendered).toContain("<bold>Question</bold>");
+    expect(rendered).toContain("<bold>Answer</bold>");
+    expect(rendered).toContain("┌");
+    expect(rendered).toContain("┘");
+    expect(rendered).not.toContain("| --- | --- |");
   });
 
   it("surfaces missing credentials as an explicit error without creating a thread entry", async () => {
