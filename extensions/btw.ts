@@ -935,7 +935,7 @@ type BtwHandoffExchange = {
 };
 
 function buildBtwMessageContent(question: string, answer: string): string {
-  return `Q: ${question}\n\nA: ${answer}`;
+  return `**Question**\n\n${question}\n\n**Answer**\n\n${answer}`;
 }
 
 function formatThread(thread: BtwHandoffExchange[]): string {
@@ -2244,7 +2244,13 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerMessageRenderer(BTW_MESSAGE_TYPE, (message, { expanded }, theme) => {
     const details = message.details as BtwDetails | undefined;
-    const content = typeof message.content === "string" ? message.content : "[non-text btw message]";
+    // Rebuild from details when available so pre-existing saved notes gain the
+    // block layout required for nested Markdown (especially tables) to parse.
+    const content = details
+      ? buildBtwMessageContent(details.question, details.answer)
+      : typeof message.content === "string"
+        ? message.content
+        : "[non-text btw message]";
 
     const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
     box.addChild(new Text(theme.fg("accent", theme.bold("[BTW]")), 0, 0));
