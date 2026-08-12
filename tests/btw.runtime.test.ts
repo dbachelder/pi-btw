@@ -513,6 +513,11 @@ function createHarness(
   const registeredModels = new Map<string, { provider: string; id: string; api: string }>();
   const registeredProviderConfigs = new Map<string, unknown>();
   const registeredNativeProviders = new Map<string, unknown>();
+  const modelRegistryRuntime = {
+    registeredProviderConfigs,
+    registeredNativeProviders,
+    getCredentialSource: () => credentialSource,
+  };
   // Pre-register the common BTW override fixture used by most tests.
   registeredModels.set("fast-provider/fast-model", { provider: "fast-provider", id: "fast-model", api: "custom-api" });
   const mainSessionInputs: string[] = [];
@@ -598,6 +603,7 @@ function createHarness(
     ui: ui as any,
     sessionManager: sessionManager as any,
     modelRegistry: {
+      runtime: modelRegistryRuntime,
       getApiKeyAndHeaders: vi.fn(async (requestedModel: { provider: string; id: string; api: string }) => {
         if (credentialResolver) {
           const key = credentialResolver(requestedModel);
@@ -614,11 +620,24 @@ function createHarness(
         if (known) return known;
         return { provider, id, api: "anthropic-messages" } as any;
       }),
-      getRegisteredProviderConfig: vi.fn((provider: string) => registeredProviderConfigs.get(provider)),
-      getRegisteredNativeProvider: vi.fn((provider: string) => registeredNativeProviders.get(provider)),
-      getProviderAuthStatus: vi.fn(() =>
-        credentialSource ? { configured: true, source: credentialSource } : { configured: false },
-      ),
+      // Pi 0.84+ ModelRegistry methods delegate through this.runtime. Keep the
+      // receiver dependency here so detached method calls fail in tests too.
+      getRegisteredProviderConfig: vi.fn(function (
+        this: { runtime: typeof modelRegistryRuntime },
+        provider: string,
+      ) {
+        return this.runtime.registeredProviderConfigs.get(provider);
+      }),
+      getRegisteredNativeProvider: vi.fn(function (
+        this: { runtime: typeof modelRegistryRuntime },
+        provider: string,
+      ) {
+        return this.runtime.registeredNativeProviders.get(provider);
+      }),
+      getProviderAuthStatus: vi.fn(function (this: { runtime: typeof modelRegistryRuntime }) {
+        const source = this.runtime.getCredentialSource();
+        return source ? { configured: true, source } : { configured: false };
+      }),
     },
     model,
     getSystemPrompt: () => "system",
@@ -893,6 +912,22 @@ describe("btw runtime behavior", () => {
       modelRegistry: harness.baseCtx.modelRegistry,
     });
     expect(summaryOptions).not.toHaveProperty("modelRuntime");
+  });
+
+  it("uses legacy modelRegistry when the registry lacks runtime provider introspection", async () => {
+    const harness = createHarness();
+    delete (harness.baseCtx.modelRegistry as { getRegisteredProviderConfig?: unknown }).getRegisteredProviderConfig;
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+    await harness.command("btw:summarize", "handoff this");
+
+    expect(modelRuntimeCreateMock).not.toHaveBeenCalled();
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(2);
+    for (const [options] of createAgentSessionMock.mock.calls) {
+      expect(options.modelRegistry).toBe(harness.baseCtx.modelRegistry);
+      expect(options).not.toHaveProperty("modelRuntime");
+    }
   });
 
   it("uses BTW-specific model and thinking overrides for BTW prompts", async () => {

@@ -250,14 +250,17 @@ async function createBtwModelRuntimeOptions(
 ): Promise<BtwModelRuntimeOptions> {
   const registry = ctx.modelRegistry as typeof ctx.modelRegistry & ModelRegistryWithRuntimeSupport;
   const ModelRuntime = (piCodingAgent as { ModelRuntime?: ModelRuntimeConstructor }).ModelRuntime;
-  const getRegisteredProviderConfig = registry.getRegisteredProviderConfig;
 
-  if (!ModelRuntime || typeof ModelRuntime.create !== "function" || typeof getRegisteredProviderConfig !== "function") {
+  if (
+    !ModelRuntime ||
+    typeof ModelRuntime.create !== "function" ||
+    typeof registry.getRegisteredProviderConfig !== "function"
+  ) {
     return { modelRegistry: ctx.modelRegistry };
   }
 
   const nativeProvider = registry.getRegisteredNativeProvider?.(model.provider);
-  const providerConfig = getRegisteredProviderConfig(model.provider);
+  const providerConfig = registry.getRegisteredProviderConfig(model.provider);
   const hasRuntimeApiKey = registry.getProviderAuthStatus?.(model.provider)?.source === "runtime";
 
   if (!nativeProvider && !providerConfig && !hasRuntimeApiKey) {
