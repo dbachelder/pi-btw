@@ -1088,9 +1088,6 @@ class BtwOverlayComponent extends Container implements Focusable {
 
     this.hintsText = new Text("", 1, 0);
 
-    // Enable SGR mouse reporting so wheel/touchpad events reach handleInput().
-    this.tui.terminal?.write?.("\x1b[?1000h\x1b[?1006h");
-
     const originalHandleInput = this.input.handleInput.bind(this.input);
     this.input.handleInput = (data: string) => {
       if (keybindings.matches(data, "app.clear")) {
@@ -1155,10 +1152,7 @@ class BtwOverlayComponent extends Container implements Focusable {
     this.tui.requestRender();
   }
 
-  dispose(): void {
-    this.tui.terminal?.write?.("\x1b[?1000l\x1b[?1006l");
-  }
-
+  // Pi owns terminal mouse modes; consume only mouse events delivered by the host.
   private getMouseScrollDelta(data: string): number | null {
     const match = data.match(/^\x1b\[<(\d+);\d+;\d+[Mm]$/);
     if (!match) {
@@ -1698,7 +1692,6 @@ export default function (pi: ExtensionAPI) {
           };
           runtime.close = () => {
             overlayDraft = overlay.getDraft();
-            overlay.dispose();
             closeRuntime();
           };
 
