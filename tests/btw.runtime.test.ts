@@ -467,7 +467,11 @@ function createHarness(
   const sentUserMessages: Array<{ content: unknown; options?: unknown }> = [];
   const overlayHandles: FakeOverlayHandle[] = [];
   const overlays: Array<{ factoryOptions?: unknown; done?: (result: unknown) => void; component?: any }> = [];
-  const tui = { requestRender: vi.fn() };
+  const terminalWrites: string[] = [];
+  const tui = {
+    requestRender: vi.fn(),
+    terminal: { write: (data: string) => terminalWrites.push(data) },
+  };
   const theme = options.theme ?? {
     fg: (_name: string, text: string) => text,
     bg: (_name: string, text: string) => text,
@@ -657,6 +661,7 @@ function createHarness(
     sentUserMessages,
     overlayHandles,
     overlays,
+    terminalWrites,
     baseCtx,
     mainSessionInputs,
     runSessionStart,
@@ -1439,6 +1444,19 @@ describe("btw runtime behavior", () => {
       },
     });
     expect(harness.widgets.some((entry) => entry.key === "btw" && typeof entry.content === "function")).toBe(false);
+  });
+
+  it("does not change Pi-owned terminal mouse reporting when the overlay opens or closes", async () => {
+    const harness = createHarness();
+
+    await harness.runSessionStart();
+    await harness.command("btw", "");
+
+    const overlay = harness.latestOverlayComponent();
+    overlay.input.onEscape?.();
+    await flushAsyncWork();
+
+    expect(harness.terminalWrites).toEqual([]);
   });
 
   it("toggles BTW overlay focus with the registered focus shortcuts without closing it", async () => {
