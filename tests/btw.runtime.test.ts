@@ -508,7 +508,14 @@ function createHarness(
     custom: async (factory: any, options?: any) => {
       let done!: (result: unknown) => void;
       const resultPromise = new Promise((resolve) => {
-        done = (result: unknown) => resolve(result);
+        done = (result: unknown) => {
+          // Simulate pi's ctx.ui.custom close callback: it calls
+          // ui.hideOverlay(), which pops the topmost overlay entry. That is the
+          // only thing that removes the overlay from the screen; btw.ts must not
+          // also call handle.hide() (which would double-close).
+          overlayHandles.at(-1)?.hide();
+          resolve(result);
+        };
       });
       const handle = new FakeOverlayHandle();
       overlayHandles.push(handle);

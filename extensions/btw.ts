@@ -1088,8 +1088,9 @@ class BtwOverlayComponent extends Container implements Focusable {
 
     this.hintsText = new Text("", 1, 0);
 
-    // Enable SGR mouse reporting so wheel/touchpad events reach handleInput().
-    this.tui.terminal?.write?.("\x1b[?1000h\x1b[?1006h");
+    // Mouse reporting is owned by pi's TUI. The fullscreen alt-screen already
+    // enables ?1000h?1002h?1004h?1006h in beforeTerminalStart and disables it in
+    // beforeTerminalStop; toggling it here (or in dispose) races that lifecycle.
 
     const originalHandleInput = this.input.handleInput.bind(this.input);
     this.input.handleInput = (data: string) => {
@@ -1156,7 +1157,10 @@ class BtwOverlayComponent extends Container implements Focusable {
   }
 
   dispose(): void {
-    this.tui.terminal?.write?.("\x1b[?1000l\x1b[?1006l");
+    // Do not disable SGR mouse reporting here: pi's fullscreen alt-screen relies
+    // on ?1000h?1002h?1004h?1006h for the whole session. Writing ?1000l?1006l on
+    // dispose leaves the terminal without mouse reporting, so wheel input
+    // degrades to up/down arrows and drives editor history navigation.
   }
 
   private getMouseScrollDelta(data: string): number | null {
@@ -1651,7 +1655,10 @@ export default function (pi: ExtensionAPI) {
       if (activeBtwSession) {
         clearBtwSessionSubscriptions(activeBtwSession);
       }
-      runtime.handle?.hide();
+      // done() (runtime.finish) already closes the overlay: pi's ctx.ui.custom
+      // close callback calls ui.hideOverlay(), which pops the topmost overlay
+      // (btw itself). Calling handle.hide() first double-closes and pops the
+      // overlay below btw (e.g. a sibling sidebar).
       if (overlayRuntime === runtime) {
         overlayRuntime = null;
       }
