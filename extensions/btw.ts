@@ -1117,17 +1117,17 @@ class BtwOverlayComponent extends Container implements Focusable {
   private frameLine(content: string, innerWidth: number): string {
     const truncated = truncateToWidth(content, innerWidth, "");
     const padding = Math.max(0, innerWidth - visibleWidth(truncated));
-    return `${this.theme.fg("border", "│")}${truncated}${" ".repeat(padding)}${this.theme.fg("border", "│")}`;
+    return `${truncated}${" ".repeat(padding)}`;
   }
 
   private ruleLine(innerWidth: number): string {
-    return this.theme.fg("border", `├${"─".repeat(innerWidth)}┤`);
+    return this.theme.fg("border", `${"─".repeat(innerWidth)}`);
   }
 
   private borderLine(innerWidth: number, edge: "top" | "bottom"): string {
     const left = edge === "top" ? "┌" : "└";
     const right = edge === "top" ? "┐" : "┘";
-    return this.theme.fg("border", `${left}${"─".repeat(innerWidth)}${right}`);
+    return this.theme.fg("border", `${"─".repeat(innerWidth)}`);
   }
 
   private wrapTranscript(innerWidth: number): string[] {
@@ -1201,7 +1201,7 @@ class BtwOverlayComponent extends Container implements Focusable {
   }
 
   private inputFrameLine(dialogWidth: number): string {
-    const targetWidth = Math.max(1, dialogWidth - 2);
+    const targetWidth = Math.max(1, dialogWidth);
     const previousFocused = this.input.focused;
     // Input.render() emits CURSOR_MARKER when focused. In overlay mode that APC marker
     // can skew width/composition on this one row before the TUI strips it, producing a
@@ -1212,7 +1212,7 @@ class BtwOverlayComponent extends Container implements Focusable {
       const renderedInputLine = this.input.render(targetWidth)[0] ?? "";
       const inputLine = truncateToWidth(renderedInputLine, targetWidth, "");
       const padding = Math.max(0, targetWidth - visibleWidth(inputLine));
-      return `${this.theme.fg("border", "│")}${inputLine}${" ".repeat(padding)}${this.theme.fg("border", "│")}`;
+      return `${inputLine}${" ".repeat(padding)}`;
     } finally {
       this.input.focused = previousFocused;
     }
@@ -1224,7 +1224,7 @@ class BtwOverlayComponent extends Container implements Focusable {
 
   override render(width: number): string[] {
     const dialogWidth = Math.max(24, width);
-    const innerWidth = Math.max(22, dialogWidth - 2);
+    const innerWidth = Math.max(22, dialogWidth);
     const transcriptLines = this.wrapTranscript(innerWidth);
     const dialogHeight = this.getDialogHeight();
     const chromeHeight = BTW_OVERLAY_CHROME_LINES;
@@ -1713,11 +1713,11 @@ export default function (pi: ExtensionAPI) {
         {
           overlay: true,
           overlayOptions: {
-            width: "78%",
+            width: "100%",
             minWidth: 72,
             maxHeight: "78%",
             anchor: "top-center",
-            margin: { top: 1, left: 2, right: 2 },
+            margin: { top: 1 },
             nonCapturing: true,
           },
           onHandle: (handle) => {

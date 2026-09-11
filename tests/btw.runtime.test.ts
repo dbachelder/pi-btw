@@ -1510,10 +1510,10 @@ describe("btw runtime behavior", () => {
 
     const secondRender = overlay.render(80);
 
-    expect(firstRender[0]).toContain("┌");
-    expect(firstRender.at(-1)).toContain("└");
-    expect(secondRender[0]).toContain("┌");
-    expect(secondRender.at(-1)).toContain("└");
+    expect(firstRender[0]).toContain("─");
+    expect(firstRender.at(-1)).toContain("─");
+    expect(secondRender[0]).toContain("─");
+    expect(secondRender.at(-1)).toContain("─");
     expect(firstRender.length).toBe(secondRender.length);
   });
 
@@ -1543,14 +1543,13 @@ describe("btw runtime behavior", () => {
     const assistantBodyLine = populatedLines.find((line: string) => line.includes("First answer"));
 
     expect(emptyLines.length).toBe(populatedLines.length);
-    expect(emptyLines[0]).toContain("<fg:border>┌");
-    expect(emptyLines[0]).not.toContain("<fg:accent>┌");
-    expect(emptyLines.at(-1)).toContain("<fg:border>└");
-    expect(emptyLines.at(-1)).not.toContain("<fg:accent>└");
-    expect(emptyStateLine).toContain("<fg:border>│</fg:border><fg:dim>No BTW thread yet.");
-    expect(emptyStateLine).not.toContain("<fg:border>│</fg:border> <fg:dim>No BTW thread yet.");
-    expect(assistantBodyLine).toContain("<fg:border>│</fg:border>    First answer");
-    expect(inputLine).toContain("<fg:border>│</fg:border>> ");
+    expect(emptyLines[0]).toContain("<fg:border>─");
+    expect(emptyLines[0]).not.toContain("<fg:accent>─");
+    expect(emptyLines.at(-1)).toContain("<fg:border>─");
+    expect(emptyLines.at(-1)).not.toContain("<fg:accent>─");
+    expect(emptyStateLine).toContain("<fg:dim>No BTW thread yet.");
+    expect(assistantBodyLine).toContain("    First answer");
+    expect(inputLine).toContain("> ");
     expect(inputLine).not.toContain("\x1b_pi:c\x07");
   });
 
@@ -2132,7 +2131,7 @@ describe("btw runtime behavior", () => {
 
     expect(lines.every((line) => visibleWidth(line) <= 79)).toBe(true);
     expect(visibleWidth(inputLine)).toBe(79);
-    expect(inputLine.endsWith("│")).toBe(true);
+    expect(inputLine.endsWith("│")).toBe(false);
   });
 
   describe("overlay render height vs maxHeight", () => {
@@ -2169,7 +2168,7 @@ describe("btw runtime behavior", () => {
           const lines = overlay.render(80) as string[];
           const maxHeight = resolveOverlayMaxHeight(rows);
           expect(lines.length).toBeLessThanOrEqual(maxHeight);
-          expect(lines.at(-1)).toMatch(/└/);
+          expect(lines.at(-1)).toMatch(/─/);
         } finally {
           restore();
         }
