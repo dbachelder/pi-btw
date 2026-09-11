@@ -1462,6 +1462,29 @@ export default function (pi: ExtensionAPI) {
     await disposeBtwSession();
   }
 
+  /**
+   * Escape behaves differently depending on whether the BTW side session is
+   * currently doing work:
+   *
+   * - streaming: the first Escape aborts the in-flight request but keeps the
+   *   overlay open (so the partial transcript stays readable and the thread
+   *   remains usable). A second Escape, once the agent is idle, dismisses.
+   * - idle: Escape dismisses the overlay immediately (previous behavior).
+   */
+  async function dismissOrAbortOverlaySession(): Promise<void> {
+    const session = activeBtwSession?.session;
+    if (session?.isStreaming) {
+      try {
+        await session.abort();
+      } catch {
+        // Ignore abort errors; the overlay stays open either way.
+      }
+      setOverlayStatus("⏹ Aborted. Press Esc again to dismiss the BTW overlay.");
+      return;
+    }
+    await dismissOverlaySession();
+  }
+
   async function resolveBtwModel(
     ctx: ExtensionCommandContext,
     notifyOnFallback = false,
@@ -1679,7 +1702,7 @@ export default function (pi: ExtensionAPI) {
               void submitFromOverlay(ctx, value);
             },
             () => {
-              void dismissOverlaySession();
+              void dismissOrAbortOverlaySession();
             },
             () => {
               overlayRuntime?.handle?.unfocus();
@@ -2074,7 +2097,7 @@ export default function (pi: ExtensionAPI) {
       }
       if (response.stopReason === "aborted") {
         removeTranscriptTurn(transcriptState, transcriptState.lastTurnId ?? transcriptState.currentTurnId);
-        setOverlayStatus("Request aborted.", ctx);
+        setOverlayStatus("⏹ Aborted. Press Esc again to dismiss the BTW overlay.", ctx);
         return;
       }
       if (response.stopReason === "error") {

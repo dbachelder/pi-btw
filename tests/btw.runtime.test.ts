@@ -1048,7 +1048,7 @@ describe("btw runtime behavior", () => {
     expect(harness.overlayHandles.at(-1)?.hideCalls).toBe(1);
   });
 
-  it("aborts, disposes, and unsubscribes the active BTW sub-session when Escape dismisses mid-stream", async () => {
+  it("aborts mid-stream on first Escape but keeps the overlay open, then dismisses on second Escape", async () => {
     const harness = createHarness();
     const blocking = createBlockingToolStream();
     promptStreamMock.mockImplementation(() => blocking.stream());
@@ -1065,17 +1065,28 @@ describe("btw runtime behavior", () => {
     expect(firstRecord.getIsStreaming()).toBe(true);
     expect(firstRecord.getListenerCount()).toBe(1);
 
+    // First Escape: abort the in-flight request, keep the overlay open.
     overlay.input.onEscape?.();
     await flushAsyncWork();
 
     expect(firstRecord.session.abort).toHaveBeenCalledTimes(1);
-    expect(firstRecord.session.dispose).toHaveBeenCalledTimes(1);
-    expect(firstRecord.getIsStreaming()).toBe(false);
-    expect(firstRecord.getListenerCount()).toBe(0);
-    expect(harness.overlayHandles.at(-1)?.hideCalls).toBe(1);
+    expect(firstRecord.session.dispose).not.toHaveBeenCalled();
+    expect(firstRecord.getListenerCount()).toBe(1);
+    expect(harness.overlayHandles.at(-1)?.hideCalls).toBe(0);
+    expect(overlay.statusText.text).toContain("Press Esc again to dismiss");
 
+    // The aborted request settles; the overlay remains usable.
     blocking.release();
     await pendingCommand;
+    expect(firstRecord.getIsStreaming()).toBe(false);
+
+    // Second Escape (now idle): dismiss and dispose as before.
+    overlay.input.onEscape?.();
+    await flushAsyncWork();
+
+    expect(firstRecord.session.dispose).toHaveBeenCalledTimes(1);
+    expect(firstRecord.getListenerCount()).toBe(0);
+    expect(harness.overlayHandles.at(-1)?.hideCalls).toBe(1);
   });
 
   it("allows main-session input to proceed while the BTW sub-session is streaming", async () => {
@@ -1116,6 +1127,23 @@ describe("btw runtime behavior", () => {
 
     mainTurn.finish();
     expect(harness.baseCtx.isIdle()).toBe(true);
+  });
+
+  it("dismisses immediately on Escape when the side session is idle", async () => {
+    const harness = createHarness();
+
+    await harness.runSessionStart();
+    await harness.command("btw", "");
+
+    const overlay = harness.latestOverlayComponent();
+    const record = subSessionRecords[0];
+    expect(record.getIsStreaming()).toBe(false);
+
+    overlay.input.onEscape?.();
+    await flushAsyncWork();
+
+    expect(record.session.dispose).toHaveBeenCalledTimes(1);
+    expect(harness.overlayHandles.at(-1)?.hideCalls).toBe(1);
   });
 
   it("ignores late session events after overlay dismissal disposes the sub-session", async () => {
