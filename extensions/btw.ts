@@ -169,6 +169,15 @@ type ModelRegistryWithRuntimeSupport = {
   getProviderAuthStatus?: (providerId: string) => { source?: string } | undefined;
 };
 
+type BtwResolvedRequestAuth =
+  | {
+      ok: true;
+      apiKey?: string;
+      headers?: Record<string, string>;
+      env?: Record<string, string>;
+    }
+  | { ok: false; error: string };
+
 type BtwModelRuntimeOptions = {
   modelRuntime?: BtwModelRuntime;
   modelRegistry?: ExtensionCommandContext["modelRegistry"];
@@ -290,6 +299,27 @@ async function createBtwModelRuntimeOptions(
   }
 
   return { modelRuntime };
+}
+
+function hasResolvedAuthValues(values?: Record<string, string>): boolean {
+  return !!values && Object.values(values).some((value) => value.length > 0);
+}
+
+function hasUsableModelAuth(
+  ctx: ExtensionCommandContext,
+  model: SessionModel,
+  auth: BtwResolvedRequestAuth,
+): boolean {
+  if (!auth.ok) {
+    return false;
+  }
+
+  return (
+    !!auth.apiKey ||
+    hasResolvedAuthValues(auth.headers) ||
+    hasResolvedAuthValues(auth.env) ||
+    ctx.modelRegistry.hasConfiguredAuth(model)
+  );
 }
 
 function extractText(parts: AssistantMessage["content"], type: "text" | "thinking"): string {
@@ -1579,8 +1609,8 @@ export default function (pi: ExtensionAPI) {
     notifyOnFallback = false,
   ): Promise<ResolvedBtwModel> {
     if (btwModelOverride) {
-      const auth = await ctx.modelRegistry.getApiKeyAndHeaders(btwModelOverride);
-      if (auth.ok && auth.apiKey) {
+      const auth = (await ctx.modelRegistry.getApiKeyAndHeaders(btwModelOverride)) as BtwResolvedRequestAuth;
+      if (hasUsableModelAuth(ctx, btwModelOverride, auth)) {
         return {
           model: btwModelOverride,
           source: "override",
@@ -2157,8 +2187,8 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-    if (!auth.ok || !auth.apiKey) {
+    const auth = (await ctx.modelRegistry.getApiKeyAndHeaders(model)) as BtwResolvedRequestAuth;
+    if (!hasUsableModelAuth(ctx, model, auth)) {
       const message = auth.ok ? `No credentials available for ${model.provider}/${model.id}.` : auth.error;
       setOverlayStatus(message, ctx);
       notify(ctx, message, "error");
@@ -2264,8 +2294,8 @@ export default function (pi: ExtensionAPI) {
       throw new Error(settings.fallbackReason || "No active model selected.");
     }
 
-    const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-    if (!auth.ok || !auth.apiKey) {
+    const auth = (await ctx.modelRegistry.getApiKeyAndHeaders(model)) as BtwResolvedRequestAuth;
+    if (!hasUsableModelAuth(ctx, model, auth)) {
       throw new Error(auth.ok ? `No credentials available for ${model.provider}/${model.id}.` : auth.error);
     }
 
