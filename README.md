@@ -70,6 +70,8 @@ pi install /absolute/path/to/pi-btw
 - continues the current BTW thread
 - opens or refreshes the focused BTW modal shell
 - streams into the BTW modal transcript/status surface
+- on RPC/SDK hosts, displays completed inline-question responses as visible session notes instead
+- composer-only `/btw` requires the TUI; pass the question inline on RPC/SDK hosts
 - persists the BTW exchange as hidden thread state
 - with `--save`, also saves that single exchange as a visible session note
 
