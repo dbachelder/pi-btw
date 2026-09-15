@@ -3,9 +3,10 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, Registere
 import { visibleWidth } from "@earendil-works/pi-tui";
 import btwExtension from "../extensions/btw";
 
-const { promptStreamMock, createAgentSessionMock, sessionManagerInMemoryMock, subSessionRecords } = vi.hoisted(() => ({
+const { promptStreamMock, createAgentSessionMock, sessionManagerInMemoryMock, subSessionRecords, copyToClipboardMock } = vi.hoisted(() => ({
   promptStreamMock: vi.fn(),
   createAgentSessionMock: vi.fn(),
+  copyToClipboardMock: vi.fn(async () => {}),
   sessionManagerInMemoryMock: vi.fn(() => ({ type: "in-memory-session" })),
   subSessionRecords: [] as Array<{
     options: any;
@@ -23,6 +24,7 @@ vi.mock("@earendil-works/pi-coding-agent", async () => {
   return {
     ...actual,
     createAgentSession: createAgentSessionMock,
+    copyToClipboard: copyToClipboardMock,
     SessionManager: {
       ...actual.SessionManager,
       inMemory: sessionManagerInMemoryMock,
@@ -679,8 +681,12 @@ function createHarness(
       mainThinkingLevel = value;
     },
     /** Register a model so ctx.modelRegistry.find(provider, id) returns it (with the given api). */
-    registerModel(provider: string, id: string, api: string) {
-      registeredModels.set(`${provider}/${id}`, { provider, id, api });
+    registerModel(modelOrProvider: string | any, id?: string, api?: string) {
+      if (typeof modelOrProvider === "object") {
+        registeredModels.set(`${modelOrProvider.provider}/${modelOrProvider.id}`, modelOrProvider);
+      } else {
+        registeredModels.set(`${modelOrProvider}/${id}`, { provider: modelOrProvider, id: id!, api: api! });
+      }
     },
   };
 }
@@ -763,6 +769,72 @@ describe("btw runtime behavior", () => {
     expect(summaryOptions.tools).toEqual([]);
   });
 
+  it("safely falls back to active thinking level for summarize when model cannot disable thinking", async () => {
+    const harness = createHarness();
+    harness.setMainThinkingLevel("high");
+    harness.registerModel({
+      provider: "google-vertex",
+      id: "gemini-3.8-flash",
+      api: "google-vertex",
+      reasoning: true,
+      thinkingLevelMap: { off: null },
+    } as any);
+
+    await harness.runSessionStart();
+    await harness.command("btw:model", "google-vertex gemini-3.8-flash google-vertex");
+    await harness.command("btw", "first question");
+    await harness.command("btw:summarize", "handoff this");
+
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(2);
+    const summaryOptions = createAgentSessionMock.mock.calls[1][0];
+    expect(summaryOptions.model.id).toBe("gemini-3.8-flash");
+    expect(summaryOptions.thinkingLevel).toBe("high");
+    expect(summaryOptions.tools).toEqual([]);
+  });
+
+  it("retries summarize with safe thinking level if provider rejects thinkingLevel: off at runtime", async () => {
+    const harness = createHarness();
+    harness.setMainThinkingLevel("medium");
+
+    let promptCount = 0;
+    promptStreamMock.mockImplementation(async function* () {
+      promptCount++;
+      if (promptCount === 1) {
+        // Normal btw turn
+        yield { type: "text_delta" as const, delta: "Answer" };
+        yield { type: "done" as const, message: makeAssistantMessage("Answer") };
+        return;
+      }
+      if (promptCount === 2) {
+        // First summarize attempt with "off" fails at runtime with provider thinking error
+        yield {
+          type: "error" as const,
+          error: {
+            ...makeAssistantMessage(""),
+            stopReason: "error" as const,
+            errorMessage: "Thinking level is unsupported: THINKING_LEVEL_MINIMAL",
+          },
+        };
+        return;
+      }
+      // Retry attempt with "medium" succeeds
+      yield { type: "text_delta" as const, delta: "Summary text" };
+      yield { type: "done" as const, message: makeAssistantMessage("Summary text") };
+    });
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+    await harness.command("btw:summarize", "summarize thread");
+
+    // Should have created 3 sessions: 1 for btw, 1 for failed summarize with off, 1 for retry summarize
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(3);
+    const firstSummaryOptions = createAgentSessionMock.mock.calls[1][0];
+    expect(firstSummaryOptions.thinkingLevel).toBe("off");
+    const retrySummaryOptions = createAgentSessionMock.mock.calls[2][0];
+    expect(retrySummaryOptions.thinkingLevel).toBe("medium");
+    expect(harness.sentUserMessages.at(-1)?.content).toContain("Summary text");
+  });
+
   it("clearing BTW overrides restores inheritance from the main thread", async () => {
     const harness = createHarness();
     harness.setMainThinkingLevel("high");
@@ -778,6 +850,19 @@ describe("btw runtime behavior", () => {
     const options = createAgentSessionMock.mock.calls[0][0];
     expect(options.model).toBe(harness.baseCtx.model);
     expect(options.thinkingLevel).toBe("high");
+  });
+
+  it("displays model and thinking level in the overlay header and omits hidden thread text", async () => {
+    const harness = createHarness();
+    harness.setMainThinkingLevel("high");
+
+    await harness.runSessionStart();
+    await harness.command("btw", "");
+
+    const overlay = harness.latestOverlayComponent();
+    expect(overlay['modeText'].text).toContain("test-model");
+    expect(overlay['modeText'].text).toContain("thinking: high");
+    expect(overlay['modeText'].text).not.toContain("hidden thread preserved");
   });
 
   it("restores BTW override state from session history", async () => {
@@ -985,7 +1070,8 @@ describe("btw runtime behavior", () => {
 
     expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(1);
     expect(transcriptText(overlay)).toContain("Recovered answer");
-    expect(overlay.statusText.text).toContain("Ready for a follow-up. Hidden BTW thread updated.");
+    expect(overlay.statusText.text).toContain("Ready for a follow-up.");
+    expect(overlay.statusText.text).not.toContain("Hidden BTW thread updated");
   });
 
   it("subscribes to the BTW sub-session as soon as the overlay opens", async () => {
@@ -1282,7 +1368,7 @@ describe("btw runtime behavior", () => {
       .mockImplementationOnce(() => streamAnswer("Second answer"));
 
     await harness.runSessionStart();
-    await harness.command("btw", "read package metadata");
+    await harness.command("btw:debug", "read package metadata");
 
     const overlay = harness.latestOverlayComponent();
     overlay.input.onSubmit?.("second question");
@@ -1302,6 +1388,112 @@ describe("btw runtime behavior", () => {
     expect(transcript).toContain("Second answer");
     expect(transcript.indexOf("↳ result")).toBeGreaterThan(transcript.indexOf("<bold>read</bold>"));
     expect(transcript.indexOf("second question")).toBeGreaterThan(transcript.indexOf("────────────────"));
+  });
+
+  it("hides thinking and tool rows by default in /btw, shows them in /btw:debug, and resets on subsequent /btw", async () => {
+    const harness = createHarness([], {
+      theme: {
+        fg: (name: string, text: string) => `<fg:${name}>${text}</fg:${name}>`,
+        bg: (name: string, text: string) => `<bg:${name}>${text}</bg:${name}>`,
+        italic: (text: string) => `<italic>${text}</italic>`,
+        bold: (text: string) => `<bold>${text}</bold>`,
+      },
+    });
+
+    promptStreamMock
+      .mockImplementationOnce(async function* () {
+        yield { type: "thinking_delta" as const, delta: "Secret internal thinking" };
+        yield { type: "tool_execution_start" as const, toolName: "read", args: { path: "package.json" } };
+        yield {
+          type: "tool_execution_end" as const,
+          toolName: "read",
+          result: { content: [{ type: "text", text: "file content" }] },
+        };
+        yield { type: "text_delta" as const, delta: "First answer" };
+        yield {
+          type: "done" as const,
+          message: {
+            ...makeAssistantMessage("First answer"),
+            content: buildAssistantContent("Secret internal thinking", "First answer"),
+          },
+        };
+      })
+      .mockImplementationOnce(async function* () {
+        yield { type: "thinking_delta" as const, delta: "Debug thinking visible" };
+        yield { type: "tool_execution_start" as const, toolName: "bash", args: { command: "ls" } };
+        yield {
+          type: "tool_execution_end" as const,
+          toolName: "bash",
+          result: { content: [{ type: "text", text: "dir content" }] },
+        };
+        yield { type: "text_delta" as const, delta: "Debug answer" };
+        yield {
+          type: "done" as const,
+          message: {
+            ...makeAssistantMessage("Debug answer"),
+            content: buildAssistantContent("Debug thinking visible", "Debug answer"),
+          },
+        };
+      })
+      .mockImplementationOnce(async function* () {
+        yield { type: "thinking_delta" as const, delta: "Third hidden thinking" };
+        yield { type: "text_delta" as const, delta: "Third answer" };
+        yield {
+          type: "done" as const,
+          message: {
+            ...makeAssistantMessage("Third answer"),
+            content: buildAssistantContent("Third hidden thinking", "Third answer"),
+          },
+        };
+      });
+
+    await harness.runSessionStart();
+
+    // 1. /btw should hide thinking and tool rows by default
+    await harness.command("btw", "run normal btw");
+    let overlay = harness.latestOverlayComponent();
+    let transcript = transcriptText(overlay);
+    expect(transcript).toContain("run normal btw");
+    expect(transcript).toContain("First answer");
+    expect(transcript).not.toContain("Secret internal thinking");
+    expect(transcript).not.toContain("<bold>read</bold>");
+    expect(transcript).not.toContain("file content");
+
+    // 2. /btw:debug should display thinking and tool rows
+    await harness.command("btw:debug", "run debug btw");
+    overlay = harness.latestOverlayComponent();
+    transcript = transcriptText(overlay);
+    expect(transcript).toContain("Debug answer");
+    expect(transcript).toContain("Debug thinking visible");
+    expect(transcript).toContain("<bold>bash</bold>");
+    expect(transcript).toContain("dir content");
+    // Also reveals prior thinking/tool rows when debug is active
+    expect(transcript).toContain("Secret internal thinking");
+
+    // 3. Subsequent /btw should switch back to hiding thinking and tool rows
+    await harness.command("btw", "run normal btw again");
+    overlay = harness.latestOverlayComponent();
+    transcript = transcriptText(overlay);
+    expect(transcript).toContain("Third answer");
+    expect(transcript).not.toContain("Secret internal thinking");
+    expect(transcript).not.toContain("Debug thinking visible");
+    expect(transcript).not.toContain("Third hidden thinking");
+    expect(transcript).not.toContain("<bold>read</bold>");
+    expect(transcript).not.toContain("<bold>bash</bold>");
+
+    // 4. /btw:debug on should enable debug view explicitly
+    await harness.command("btw:debug", "on");
+    overlay = harness.latestOverlayComponent();
+    transcript = transcriptText(overlay);
+    expect(transcript).toContain("Debug thinking visible");
+    expect(transcript).toContain("<bold>bash</bold>");
+
+    // 5. /btw:debug off should disable debug view explicitly
+    await harness.command("btw:debug", "off");
+    overlay = harness.latestOverlayComponent();
+    transcript = transcriptText(overlay);
+    expect(transcript).not.toContain("Debug thinking visible");
+    expect(transcript).not.toContain("<bold>bash</bold>");
   });
 
   it("transcript inspection exposes streaming and failure state", async () => {
@@ -1357,7 +1549,7 @@ describe("btw runtime behavior", () => {
       text: "Partial",
       streaming: true,
     });
-    expect(overlay.statusText.text).toContain("streaming");
+    expect(overlay.statusText.text).toContain("thinking");
 
     blocking.release();
     await pendingCommand;
@@ -2133,6 +2325,132 @@ describe("btw runtime behavior", () => {
     expect(lines.every((line) => visibleWidth(line) <= 79)).toBe(true);
     expect(visibleWidth(inputLine)).toBe(79);
     expect(inputLine.endsWith("│")).toBe(true);
+  });
+
+  it("/copy in the overlay copies the latest assistant response without prompting the sub-session", async () => {
+    const harness = createHarness();
+    copyToClipboardMock.mockClear();
+    promptStreamMock.mockImplementationOnce(() => streamAnswer("Copied assistant text"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "question to answer");
+
+    const overlay = harness.latestOverlayComponent();
+    const record = subSessionRecords[0];
+    const promptCallsCount = record.session.prompt.mock.calls.length;
+
+    overlay.input.onSubmit?.("/copy");
+    await flushAsyncWork();
+
+    expect(copyToClipboardMock).toHaveBeenCalledWith("Copied assistant text");
+    // Should NOT have prompted the sub-session
+    expect(record.session.prompt.mock.calls.length).toBe(promptCallsCount);
+    expect(overlay.statusText.text).toContain("Copied last response to clipboard.");
+  });
+
+  it("does not render consecutive separator lines when multiple tool turns are hidden", async () => {
+    const harness = createHarness([], {
+      theme: {
+        fg: (name: string, text: string) => `<fg:${name}>${text}</fg:${name}>`,
+        bg: (name: string, text: string) => `<bg:${name}>${text}</bg:${name}>`,
+        italic: (text: string) => `<italic>${text}</italic>`,
+        bold: (text: string) => `<bold>${text}</bold>`,
+      },
+    });
+
+    // Simulate multi-step tool run with debug false
+    promptStreamMock.mockImplementationOnce(async function* () {
+      yield { type: "tool_execution_start" as const, toolName: "bash", args: { command: "step 1" } };
+      yield { type: "tool_execution_end" as const, toolName: "bash", result: "ok 1" };
+      yield { type: "tool_execution_start" as const, toolName: "bash", args: { command: "step 2" } };
+      yield { type: "tool_execution_end" as const, toolName: "bash", result: "ok 2" };
+      yield { type: "text_delta" as const, delta: "Final answer after tools" };
+      yield { type: "done" as const, message: makeAssistantMessage("Final answer after tools") };
+    });
+
+    await harness.runSessionStart();
+    await harness.command("btw", "run tools");
+
+    const overlay = harness.latestOverlayComponent();
+    const transcript = transcriptText(overlay);
+
+    // Separators should never be back-to-back with no content between them
+    const doubleSeparator = "────────────────────────────────────────\n\n────────────────────────────────────────";
+    expect(transcript).not.toContain(doubleSeparator);
+  });
+
+  it("bare /clear in overlay resets the thread in place without dismissing the overlay", async () => {
+    const harness = createHarness();
+    promptStreamMock.mockImplementationOnce(() => streamAnswer("First answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+
+    const overlay = harness.latestOverlayComponent();
+    expect(transcriptText(overlay)).toContain("First answer");
+
+    overlay.input.onSubmit?.("/clear");
+    await flushAsyncWork();
+
+    expect(transcriptText(overlay)).toContain("No BTW thread yet");
+    expect(overlay.statusText.text).toContain("Cleared BTW thread.");
+    expect(harness.overlayHandles.at(-1)?.isHidden()).toBe(false);
+  });
+
+  it("bare /sync in overlay refreshes parent messages into the active sub-session", async () => {
+    const harness = createHarness([
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "text", text: "initial parent task" }],
+        timestamp: 1,
+      } as SessionEntry,
+    ]);
+    promptStreamMock.mockImplementationOnce(() => streamAnswer("Side answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first side question");
+
+    const overlay = harness.latestOverlayComponent();
+    expect(transcriptText(overlay)).toContain("Side answer");
+    expect(subSessionRecords).toHaveLength(1);
+
+    // Parent session makes new progress in the background
+    harness.entries.push({
+      type: "message",
+      role: "user",
+      content: [{ type: "text", text: "new parent update while btw was open" }],
+      timestamp: 2,
+    } as SessionEntry);
+
+    overlay.input.onSubmit?.("/sync");
+    await flushAsyncWork();
+
+    // Active session should be recreated with the new parent context
+    expect(subSessionRecords).toHaveLength(2);
+    const updatedRecord = subSessionRecords[1];
+    const seedTexts = updatedRecord.seedMessages.map((msg) => (msg.content[0] as any)?.text ?? "");
+    expect(seedTexts).toContain("new parent update while btw was open");
+    // Side thread is still preserved in the overlay
+    expect(transcriptText(overlay)).toContain("Side answer");
+    expect(overlay.statusText.text).toContain("Synced");
+  });
+
+  it("bare /inject in overlay injects into main session and dismisses", async () => {
+    const harness = createHarness();
+    promptStreamMock.mockImplementationOnce(() => streamAnswer("Answer to inject"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "question to inject");
+
+    const overlay = harness.latestOverlayComponent();
+    overlay.input.onSubmit?.("/inject finalize this task");
+    await flushAsyncWork();
+
+    expect(harness.sentUserMessages).toHaveLength(1);
+    expect((harness.sentUserMessages[0].content as string)).toContain("finalize this task");
+    expect((harness.sentUserMessages[0].content as string)).toContain("Answer to inject");
+    expect(harness.overlayHandles.at(-1)?.isHidden()).toBe(true);
   });
 
   describe("overlay render height vs maxHeight", () => {
