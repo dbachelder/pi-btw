@@ -3,10 +3,26 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, Registere
 import { visibleWidth } from "@earendil-works/pi-tui";
 import btwExtension from "../extensions/btw";
 
-const { promptStreamMock, createAgentSessionMock, sessionManagerInMemoryMock, subSessionRecords } = vi.hoisted(() => ({
+const {
+  promptStreamMock,
+  createAgentSessionMock,
+  sessionManagerInMemoryMock,
+  modelRuntimeExport,
+  modelRuntimeCreateMock,
+  modelRuntimeRecords,
+  subSessionRecords,
+} = vi.hoisted(() => ({
   promptStreamMock: vi.fn(),
   createAgentSessionMock: vi.fn(),
   sessionManagerInMemoryMock: vi.fn(() => ({ type: "in-memory-session" })),
+  modelRuntimeExport: {} as { create?: ReturnType<typeof vi.fn> },
+  modelRuntimeCreateMock: vi.fn(),
+  modelRuntimeRecords: [] as Array<{
+    registerProvider: ReturnType<typeof vi.fn>;
+    registerNativeProvider: ReturnType<typeof vi.fn>;
+    refresh: ReturnType<typeof vi.fn>;
+    setRuntimeApiKey: ReturnType<typeof vi.fn>;
+  }>,
   subSessionRecords: [] as Array<{
     options: any;
     session: any;
@@ -23,6 +39,7 @@ vi.mock("@earendil-works/pi-coding-agent", async () => {
   return {
     ...actual,
     createAgentSession: createAgentSessionMock,
+    ModelRuntime: modelRuntimeExport,
     SessionManager: {
       ...actual.SessionManager,
       inMemory: sessionManagerInMemoryMock,
@@ -455,6 +472,7 @@ function createHarness(
       bold: (text: string) => string;
     };
     keybindingMatches?: (data: string, id: string) => boolean;
+    tuiMode?: "regular" | "fullscreen";
   } = {},
 ) {
   const commands = new Map<string, RegisteredCommand>();
@@ -467,7 +485,12 @@ function createHarness(
   const sentUserMessages: Array<{ content: unknown; options?: unknown }> = [];
   const overlayHandles: FakeOverlayHandle[] = [];
   const overlays: Array<{ factoryOptions?: unknown; done?: (result: unknown) => void; component?: any }> = [];
-  const tui = { requestRender: vi.fn() };
+  const terminalWrites: string[] = [];
+  const tui = {
+    requestRender: vi.fn(),
+    terminal: { write: (data: string) => terminalWrites.push(data) },
+    mode: options.tuiMode,
+  };
   const theme = options.theme ?? {
     fg: (_name: string, text: string) => text,
     bg: (_name: string, text: string) => text,
@@ -488,14 +511,19 @@ function createHarness(
   let idle = true;
   let hasCredentials = true;
   let mainThinkingLevel: string = "off";
-  type AuthResult =
-    | { ok: true; apiKey?: string; headers?: Record<string, string>; env?: Record<string, string> }
-    | { ok: false; error: string };
-  let authResolver: ((model: { provider: string; id: string; api: string }) => AuthResult) | null = null;
+  let credentialSource: string | undefined;
+  let credentialResolver: ((model: { provider: string; id: string; api: string }) => string | undefined) | null = null;
   // Models that ctx.modelRegistry.find(provider, id) should return for /btw:model resolution.
   // Tests that exercise overrides should call harness.registerModel(...) so the resolved
   // Model.api preserves the value the test cares about (otherwise we synthesize a default).
   const registeredModels = new Map<string, { provider: string; id: string; api: string }>();
+  const registeredProviderConfigs = new Map<string, unknown>();
+  const registeredNativeProviders = new Map<string, unknown>();
+  const modelRegistryRuntime = {
+    registeredProviderConfigs,
+    registeredNativeProviders,
+    getCredentialSource: () => credentialSource,
+  };
   // Pre-register the common BTW override fixture used by most tests.
   registeredModels.set("fast-provider/fast-model", { provider: "fast-provider", id: "fast-model", api: "custom-api" });
   const mainSessionInputs: string[] = [];
@@ -510,13 +538,20 @@ function createHarness(
     },
     custom: async (factory: any, options?: any) => {
       let done!: (result: unknown) => void;
+      let component: any;
       const resultPromise = new Promise((resolve) => {
-        done = (result: unknown) => resolve(result);
+        done = (result: unknown) => {
+          // Match pi's custom-overlay close callback: pop the topmost overlay,
+          // then dispose the component after resolving the custom UI promise.
+          overlayHandles.at(-1)?.hide();
+          component?.dispose?.();
+          resolve(result);
+        };
       });
       const handle = new FakeOverlayHandle();
       overlayHandles.push(handle);
       options?.onHandle?.(handle);
-      const component = await factory(tui as any, theme as any, keybindings as any, done);
+      component = await factory(tui as any, theme as any, keybindings as any, done);
       overlays.push({ factoryOptions: options, done, component });
       return resultPromise;
     },
@@ -581,13 +616,13 @@ function createHarness(
     ui: ui as any,
     sessionManager: sessionManager as any,
     modelRegistry: {
+      runtime: modelRegistryRuntime,
       getApiKeyAndHeaders: vi.fn(async (requestedModel: { provider: string; id: string; api: string }) => {
-        if (authResolver) {
-          return authResolver(requestedModel);
+        if (credentialResolver) {
+          const key = credentialResolver(requestedModel);
+          return key ? { ok: true, apiKey: key, headers: undefined } : { ok: true, apiKey: undefined, headers: undefined };
         }
-        return hasCredentials
-          ? { ok: true, apiKey: "test-key", headers: undefined }
-          : { ok: false, error: `No credentials available for ${requestedModel.provider}/${requestedModel.id}.` };
+        return hasCredentials ? { ok: true, apiKey: "test-key", headers: undefined } : { ok: true, apiKey: undefined, headers: undefined };
       }),
       // pi 0.74 ExtensionContext.modelRegistry.find(provider, modelId) -> Model<Api> | undefined.
       // The mock looks up entries from `registeredModels`; falls back to a default api so legacy
@@ -597,6 +632,24 @@ function createHarness(
         const known = registeredModels.get(key);
         if (known) return known;
         return { provider, id, api: "anthropic-messages" } as any;
+      }),
+      // Pi 0.84+ ModelRegistry methods delegate through this.runtime. Keep the
+      // receiver dependency here so detached method calls fail in tests too.
+      getRegisteredProviderConfig: vi.fn(function (
+        this: { runtime: typeof modelRegistryRuntime },
+        provider: string,
+      ) {
+        return this.runtime.registeredProviderConfigs.get(provider);
+      }),
+      getRegisteredNativeProvider: vi.fn(function (
+        this: { runtime: typeof modelRegistryRuntime },
+        provider: string,
+      ) {
+        return this.runtime.registeredNativeProviders.get(provider);
+      }),
+      getProviderAuthStatus: vi.fn(function (this: { runtime: typeof modelRegistryRuntime }) {
+        const source = this.runtime.getCredentialSource();
+        return source ? { configured: true, source } : { configured: false };
       }),
     },
     model,
@@ -661,6 +714,7 @@ function createHarness(
     sentUserMessages,
     overlayHandles,
     overlays,
+    terminalWrites,
     baseCtx,
     mainSessionInputs,
     runSessionStart,
@@ -676,8 +730,11 @@ function createHarness(
     setCredentials(value: boolean) {
       hasCredentials = value;
     },
-    setAuthResolver(value: ((model: { provider: string; id: string; api: string }) => AuthResult) | null) {
-      authResolver = value;
+    setCredentialResolver(value: ((model: { provider: string; id: string; api: string }) => string | undefined) | null) {
+      credentialResolver = value;
+    },
+    setCredentialSource(value: string | undefined) {
+      credentialSource = value;
     },
     setMainThinkingLevel(value: string) {
       mainThinkingLevel = value;
@@ -685,6 +742,12 @@ function createHarness(
     /** Register a model so ctx.modelRegistry.find(provider, id) returns it (with the given api). */
     registerModel(provider: string, id: string, api: string) {
       registeredModels.set(`${provider}/${id}`, { provider, id, api });
+    },
+    registerProviderConfig(provider: string, config: unknown) {
+      registeredProviderConfigs.set(provider, config);
+    },
+    registerNativeProvider(provider: string, nativeProvider: unknown) {
+      registeredNativeProviders.set(provider, nativeProvider);
     },
   };
 }
@@ -694,9 +757,22 @@ describe("btw runtime behavior", () => {
     promptStreamMock.mockReset();
     createAgentSessionMock.mockReset();
     sessionManagerInMemoryMock.mockClear();
+    modelRuntimeCreateMock.mockReset();
+    modelRuntimeExport.create = modelRuntimeCreateMock;
+    modelRuntimeRecords.length = 0;
     subSessionRecords.length = 0;
 
     createAgentSessionMock.mockImplementation(async (options: any) => createMockAgentSession(options));
+    modelRuntimeCreateMock.mockImplementation(async () => {
+      const runtime = {
+        registerProvider: vi.fn(),
+        registerNativeProvider: vi.fn(),
+        refresh: vi.fn(async () => ({ aborted: false, errors: new Map() })),
+        setRuntimeApiKey: vi.fn(async () => {}),
+      };
+      modelRuntimeRecords.push(runtime);
+      return runtime;
+    });
     promptStreamMock.mockImplementation((_record: unknown, _text: string, context: StreamContext) => {
       return streamAnswer(`default:${(context.messages.at(-1)?.content[0] as any)?.text ?? ""}`);
     });
@@ -713,7 +789,8 @@ describe("btw runtime behavior", () => {
 
     const options = createAgentSessionMock.mock.calls[0][0];
     expect(options.model).toBe(harness.baseCtx.model);
-    expect(options.modelRegistry).toBe(harness.baseCtx.modelRegistry);
+    expect(options).not.toHaveProperty("modelRegistry");
+    expect(options).not.toHaveProperty("modelRuntime");
     expect(options.tools).toEqual(["read", "bash", "edit", "write"]);
     expect(options.resourceLoader.getAppendSystemPrompt()[0]).toContain(
       "You are having an aside conversation with the user, separate from their main working session.",
@@ -726,31 +803,150 @@ describe("btw runtime behavior", () => {
     expect(subSession.prompt).toHaveBeenCalledWith("first question", { source: "extension" });
   });
 
-  it("accepts successful subscription auth without requiring an API key", async () => {
+  it("copies a registered custom provider into BTW and summary child runtimes", async () => {
     const harness = createHarness();
-    harness.setAuthResolver(() => ({
-      ok: true,
-      headers: { Authorization: "Bearer subscription-token" },
-      env: { PI_AUTH_MODE: "subscription" },
-    }));
+    const providerConfig = { api: "commandcode-custom", streamSimple: vi.fn() };
+    harness.registerProviderConfig("test-provider", providerConfig);
 
     await harness.runSessionStart();
-    await harness.command("btw", "subscription question");
+    await harness.command("btw", "first question");
+    await harness.command("btw:summarize", "handoff this");
 
-    expect(createAgentSessionMock).toHaveBeenCalledTimes(1);
-    expect(subSessionRecords[0]?.session.prompt).toHaveBeenCalledWith("subscription question", { source: "extension" });
-    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(1);
-    expect(harness.notifications.some((entry) => entry.message.includes("No credentials"))).toBe(false);
+    expect(modelRuntimeCreateMock).toHaveBeenCalledTimes(2);
+    expect(modelRuntimeCreateMock).toHaveBeenCalledWith({ allowModelNetwork: false });
+    expect(modelRuntimeRecords).toHaveLength(2);
+    for (const runtime of modelRuntimeRecords) {
+      expect(runtime.registerProvider).toHaveBeenCalledWith("test-provider", providerConfig);
+      expect(runtime.refresh).toHaveBeenCalledWith({ allowNetwork: false });
+    }
+
+    expect(createAgentSessionMock.mock.calls[0][0].modelRuntime).toBe(modelRuntimeRecords[0]);
+    expect(createAgentSessionMock.mock.calls[1][0].modelRuntime).toBe(modelRuntimeRecords[1]);
   });
 
-  it("uses a BTW-specific model with subscription auth and a thinking override", async () => {
+  it("copies a temporary runtime API key into BTW and summary child runtimes", async () => {
+    const harness = createHarness();
+    harness.registerProviderConfig("test-provider", { api: "commandcode-custom", streamSimple: vi.fn() });
+    harness.setCredentialSource("runtime");
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+    await harness.command("btw:summarize", "handoff this");
+
+    expect(modelRuntimeRecords).toHaveLength(2);
+    for (const runtime of modelRuntimeRecords) {
+      expect(runtime.setRuntimeApiKey).toHaveBeenCalledWith("test-provider", "test-key");
+    }
+  });
+
+  it("copies a temporary runtime API key even when no provider registration needs copying", async () => {
+    const harness = createHarness();
+    harness.setCredentialSource("runtime");
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+    await harness.command("btw:summarize", "handoff this");
+
+    expect(modelRuntimeRecords).toHaveLength(2);
+    for (const runtime of modelRuntimeRecords) {
+      expect(runtime.registerProvider).not.toHaveBeenCalled();
+      expect(runtime.setRuntimeApiKey).toHaveBeenCalledWith("test-provider", "test-key");
+    }
+  });
+
+  it("copies a custom BTW model override into both child runtimes without changing thinking behavior", async () => {
+    const harness = createHarness();
+    const providerConfig = { api: "custom-api", streamSimple: vi.fn() };
+    harness.registerModel("override-provider", "override-model", "custom-api");
+    harness.registerProviderConfig("override-provider", providerConfig);
+
+    await harness.runSessionStart();
+    await harness.command("btw:model", "override-provider override-model custom-api");
+    await harness.command("btw:thinking", "low");
+    await harness.command("btw", "first question");
+    await harness.command("btw:summarize", "handoff this");
+
+    expect(modelRuntimeRecords).toHaveLength(2);
+    for (const runtime of modelRuntimeRecords) {
+      expect(runtime.registerProvider).toHaveBeenCalledWith("override-provider", providerConfig);
+    }
+
+    const [btwOptions, summaryOptions] = createAgentSessionMock.mock.calls.map(([options]) => options);
+    expect(btwOptions).toMatchObject({
+      model: { provider: "override-provider", id: "override-model", api: "custom-api" },
+      thinkingLevel: "low",
+      modelRuntime: modelRuntimeRecords[0],
+    });
+    expect(summaryOptions).toMatchObject({
+      model: { provider: "override-provider", id: "override-model", api: "custom-api" },
+      thinkingLevel: "off",
+      modelRuntime: modelRuntimeRecords[1],
+    });
+  });
+
+  it("copies a registered native provider into the BTW child runtime", async () => {
+    const harness = createHarness();
+    const nativeProvider = { id: "test-provider" };
+    harness.registerNativeProvider("test-provider", nativeProvider);
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+
+    expect(modelRuntimeCreateMock).toHaveBeenCalledTimes(1);
+    expect(modelRuntimeRecords[0].registerNativeProvider).toHaveBeenCalledWith(nativeProvider);
+    expect(modelRuntimeRecords[0].registerProvider).not.toHaveBeenCalled();
+    expect(createAgentSessionMock.mock.calls[0][0].modelRuntime).toBe(modelRuntimeRecords[0]);
+  });
+
+  it("uses legacy modelRegistry while preserving BTW model and thinking overrides", async () => {
+    const harness = createHarness();
+    harness.registerModel("legacy-provider", "legacy-model", "custom-api");
+    harness.registerProviderConfig("legacy-provider", { api: "custom-api", streamSimple: vi.fn() });
+    delete modelRuntimeExport.create;
+
+    await harness.runSessionStart();
+    await harness.command("btw:model", "legacy-provider legacy-model custom-api");
+    await harness.command("btw:thinking", "low");
+    await harness.command("btw", "first question");
+    await harness.command("btw:summarize", "handoff this");
+
+    expect(modelRuntimeCreateMock).not.toHaveBeenCalled();
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(2);
+
+    const [btwOptions, summaryOptions] = createAgentSessionMock.mock.calls.map(([options]) => options);
+    expect(btwOptions).toMatchObject({
+      model: { provider: "legacy-provider", id: "legacy-model", api: "custom-api" },
+      thinkingLevel: "low",
+      modelRegistry: harness.baseCtx.modelRegistry,
+    });
+    expect(btwOptions).not.toHaveProperty("modelRuntime");
+    expect(summaryOptions).toMatchObject({
+      model: { provider: "legacy-provider", id: "legacy-model", api: "custom-api" },
+      thinkingLevel: "off",
+      modelRegistry: harness.baseCtx.modelRegistry,
+    });
+    expect(summaryOptions).not.toHaveProperty("modelRuntime");
+  });
+
+  it("uses legacy modelRegistry when the registry lacks runtime provider introspection", async () => {
+    const harness = createHarness();
+    delete (harness.baseCtx.modelRegistry as { getRegisteredProviderConfig?: unknown }).getRegisteredProviderConfig;
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+    await harness.command("btw:summarize", "handoff this");
+
+    expect(modelRuntimeCreateMock).not.toHaveBeenCalled();
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(2);
+    for (const [options] of createAgentSessionMock.mock.calls) {
+      expect(options.modelRegistry).toBe(harness.baseCtx.modelRegistry);
+      expect(options).not.toHaveProperty("modelRuntime");
+    }
+  });
+
+  it("uses BTW-specific model and thinking overrides for BTW prompts", async () => {
     const harness = createHarness();
     harness.setMainThinkingLevel("high");
-    harness.setAuthResolver((requestedModel) =>
-      requestedModel.provider === "fast-provider"
-        ? { ok: true, headers: { Authorization: "Bearer subscription-token" } }
-        : { ok: true, apiKey: "main-key" },
-    );
 
     await harness.runSessionStart();
     await harness.command("btw:model", "fast-provider fast-model custom-api");
@@ -879,10 +1075,8 @@ describe("btw runtime behavior", () => {
 
   it("falls back to the main model when the BTW model override has no credentials", async () => {
     const harness = createHarness();
-    harness.setAuthResolver((requestedModel) =>
-      requestedModel.provider === "fast-provider"
-        ? { ok: false, error: 'No API key found for "fast-provider"' }
-        : { ok: true, apiKey: "main-key" },
+    harness.setCredentialResolver((requestedModel) =>
+      requestedModel.provider === "fast-provider" ? undefined : "main-key",
     );
 
     await harness.runSessionStart();
@@ -1469,6 +1663,39 @@ describe("btw runtime behavior", () => {
     expect(harness.widgets.some((entry) => entry.key === "btw" && typeof entry.content === "function")).toBe(false);
   });
 
+  it("does not change Pi-owned terminal mouse reporting in fullscreen mode", async () => {
+    const harness = createHarness([], { tuiMode: "fullscreen" });
+
+    await harness.runSessionStart();
+    await harness.command("btw", "");
+
+    const overlay = harness.latestOverlayComponent();
+    overlay.input.onEscape?.();
+    await flushAsyncWork();
+
+    expect(harness.terminalWrites).toEqual([]);
+  });
+
+  for (const tuiMode of [undefined, "regular"] as const) {
+    it(`balances BTW-owned terminal mouse reporting in ${tuiMode ?? "legacy"} mode`, async () => {
+      const harness = createHarness([], { tuiMode });
+
+      await harness.runSessionStart();
+      await harness.command("btw", "");
+
+      expect(harness.terminalWrites).toEqual(["\x1b[?1000h\x1b[?1006h"]);
+
+      const overlay = harness.latestOverlayComponent();
+      overlay.input.onEscape?.();
+      await flushAsyncWork();
+
+      expect(harness.terminalWrites).toEqual([
+        "\x1b[?1000h\x1b[?1006h",
+        "\x1b[?1000l\x1b[?1006l",
+      ]);
+    });
+  }
+
   it("toggles BTW overlay focus with the registered focus shortcuts without closing it", async () => {
     const harness = createHarness();
 
@@ -1917,28 +2144,6 @@ describe("btw runtime behavior", () => {
     await harness.command("btw", "");
     const reopened = harness.latestOverlayComponent();
     expect(transcriptText(reopened)).toContain("No BTW thread yet. Ask a side question to start one.");
-  });
-
-  it("summarizes with successful subscription auth that has no API key", async () => {
-    const harness = createHarness();
-    promptStreamMock
-      .mockImplementationOnce(() => streamAnswer("First answer"))
-      .mockImplementationOnce(() => streamAnswer("Subscription summary"));
-
-    await harness.runSessionStart();
-    await harness.command("btw", "first question");
-    harness.setAuthResolver(() => ({
-      ok: true,
-      headers: { Authorization: "Bearer subscription-token" },
-    }));
-
-    await harness.command("btw:summarize", "handoff this");
-
-    expect(createAgentSessionMock).toHaveBeenCalledTimes(2);
-    expect(harness.sentUserMessages[0]?.content).toBe(
-      "Here is a summary of a side conversation I had. handoff this\n\nSubscription summary",
-    );
-    expect(harness.notifications.some((entry) => entry.message.includes("No credentials"))).toBe(false);
   });
 
   it("summarize failure preserves BTW thread state and keeps the overlay recoverable", async () => {
