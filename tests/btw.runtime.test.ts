@@ -477,6 +477,7 @@ function createHarness(
     };
     keybindingMatches?: (data: string, id: string) => boolean;
     tuiMode?: "regular" | "fullscreen";
+    contextMode?: "tui" | "rpc" | "print";
   } = {},
 ) {
   const commands = new Map<string, RegisteredCommand>();
@@ -619,6 +620,7 @@ function createHarness(
 
   const baseCtx = {
     hasUI: true,
+    mode: options.contextMode ?? "tui",
     ui: ui as any,
     sessionManager: sessionManager as any,
     modelRegistry: {
@@ -1726,6 +1728,100 @@ describe("btw runtime behavior", () => {
       type: "error",
     });
   });
+
+  it("displays inline BTW responses as visible notes in RPC mode", async () => {
+    const harness = createHarness([], { contextMode: "rpc" });
+    promptStreamMock.mockImplementation(() => streamAnswer("RPC answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "rpc question");
+
+    expect(harness.overlays).toHaveLength(0);
+    expect(harness.sentMessages).toHaveLength(1);
+    expect(harness.sentMessages[0]).toEqual({
+      message: expect.objectContaining({
+        customType: "btw-note",
+        display: true,
+        content: "Q: rpc question\n\nA: RPC answer",
+      }),
+      options: undefined,
+    });
+    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(1);
+  });
+
+  it("detects legacy Pi RPC mode when ctx.mode is absent and stdout is not a TTY", async () => {
+    const descriptor = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+    Object.defineProperty(process.stdout, "isTTY", { value: false, configurable: true });
+
+    try {
+      const harness = createHarness();
+      delete (harness.baseCtx as { mode?: string }).mode;
+      promptStreamMock.mockImplementation(() => streamAnswer("Legacy RPC answer"));
+
+      await harness.runSessionStart();
+      await harness.command("btw", "legacy rpc question");
+
+      expect(harness.overlays).toHaveLength(0);
+      expect(harness.sentMessages).toHaveLength(1);
+    } finally {
+      if (descriptor) {
+        Object.defineProperty(process.stdout, "isTTY", descriptor);
+      } else {
+        delete (process.stdout as { isTTY?: boolean }).isTTY;
+      }
+    }
+  });
+
+  it("does not duplicate an explicitly saved RPC response and queues it while the main session is busy", async () => {
+    const harness = createHarness([], { contextMode: "rpc" });
+    promptStreamMock.mockImplementation(() => streamAnswer("Busy RPC answer"));
+    harness.setIdle(false);
+
+    await harness.runSessionStart();
+    await harness.command("btw", "--save busy question");
+
+    expect(harness.sentMessages).toHaveLength(1);
+    expect(harness.sentMessages[0]).toEqual({
+      message: expect.objectContaining({
+        customType: "btw-note",
+        display: true,
+        content: "Q: busy question\n\nA: Busy RPC answer",
+      }),
+      options: { deliverAs: "followUp" },
+    });
+  });
+
+  for (const commandName of ["btw", "btw:tangent", "btw:new"] as const) {
+    it(`guides ${commandName} users without clearing their thread when RPC cannot open a composer`, async () => {
+      const existingEntry = {
+        type: "custom",
+        customType: "btw-thread-entry",
+        data: {
+          question: "existing question",
+          thinking: "",
+          answer: "existing answer",
+          provider: "test-provider",
+          model: "test-model",
+          api: "openai-responses",
+          thinkingLevel: "off",
+          timestamp: 1,
+        },
+      } as SessionEntry;
+      const harness = createHarness([existingEntry], { contextMode: "rpc" });
+
+      await harness.runSessionStart();
+      await harness.command(commandName, "");
+
+      expect(createAgentSessionMock).not.toHaveBeenCalled();
+      expect(harness.overlays).toHaveLength(0);
+      expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(1);
+      expect(getCustomEntries(harness.entries, "btw-thread-reset")).toHaveLength(0);
+      expect(harness.notifications.at(-1)).toMatchObject({
+        message: expect.stringContaining("Pass the question inline instead."),
+        type: "warning",
+      });
+    });
+  }
 
   it("keeps BTW in a top-centered non-capturing overlay and does not leave a persistent widget above the main input", async () => {
     const harness = createHarness();
