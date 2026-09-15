@@ -1469,10 +1469,13 @@ class BtwOverlayComponent extends Container implements Focusable {
     this.refresh();
   }
 
-  private frameLine(content: string, innerWidth: number): string {
-    const truncated = truncateToWidth(content, innerWidth, "");
-    const padding = Math.max(0, innerWidth - visibleWidth(truncated));
-    return `${this.theme.fg("border", "│")}${truncated}${" ".repeat(padding)}${this.theme.fg("border", "│")}`;
+  private frameLine(content: string, innerWidth: number, padX = 2): string {
+    const contentWidth = Math.max(1, innerWidth - padX * 2);
+    const truncated = truncateToWidth(content, contentWidth, "");
+    const padding = Math.max(0, contentWidth - visibleWidth(truncated));
+    const leftMargin = " ".repeat(padX);
+    const rightMargin = " ".repeat(padX + padding);
+    return `${this.theme.fg("border", "│")}${leftMargin}${truncated}${rightMargin}${this.theme.fg("border", "│")}`;
   }
 
   private ruleLine(innerWidth: number): string {
@@ -1485,14 +1488,25 @@ class BtwOverlayComponent extends Container implements Focusable {
     return this.theme.fg("border", `${left}${"─".repeat(innerWidth)}${right}`);
   }
 
-  private wrapTranscript(innerWidth: number): string[] {
+  private wrapTranscript(innerWidth: number, padX = 2): string[] {
+    const contentWidth = Math.max(1, innerWidth - padX * 2);
     const wrapped: string[] = [];
     for (const line of this.transcriptLines) {
       if (!line) {
         wrapped.push("");
         continue;
       }
-      wrapped.push(...wrapTextWithAnsi(line, Math.max(1, innerWidth)));
+      const indentMatch = line.match(/^(\s{2,})/);
+      if (indentMatch) {
+        const indent = indentMatch[1];
+        const indentWidth = visibleWidth(indent);
+        const available = Math.max(1, contentWidth - indentWidth);
+        const stripped = line.slice(indent.length);
+        const subWrapped = wrapTextWithAnsi(stripped, available);
+        wrapped.push(...subWrapped.map((l) => `${indent}${l}`));
+      } else {
+        wrapped.push(...wrapTextWithAnsi(line, contentWidth));
+      }
     }
     return wrapped;
   }
@@ -1558,8 +1572,9 @@ class BtwOverlayComponent extends Container implements Focusable {
     this.input.handleInput(data);
   }
 
-  private inputFrameLine(dialogWidth: number): string {
-    const targetWidth = Math.max(1, dialogWidth - 2);
+  private inputFrameLine(dialogWidth: number, padX = 2): string {
+    const innerWidth = Math.max(1, dialogWidth - 2);
+    const contentWidth = Math.max(1, innerWidth - padX * 2);
     const previousFocused = this.input.focused;
     // Input.render() emits CURSOR_MARKER when focused. In overlay mode that APC marker
     // can skew width/composition on this one row before the TUI strips it, producing a
@@ -1567,10 +1582,12 @@ class BtwOverlayComponent extends Container implements Focusable {
     // the row stays geometrically stable while the overlay still owns keyboard input.
     this.input.focused = false;
     try {
-      const renderedInputLine = this.input.render(targetWidth)[0] ?? "";
-      const inputLine = truncateToWidth(renderedInputLine, targetWidth, "");
-      const padding = Math.max(0, targetWidth - visibleWidth(inputLine));
-      return `${this.theme.fg("border", "│")}${inputLine}${" ".repeat(padding)}${this.theme.fg("border", "│")}`;
+      const renderedInputLine = this.input.render(contentWidth)[0] ?? "";
+      const inputLine = truncateToWidth(renderedInputLine, contentWidth, "");
+      const padding = Math.max(0, contentWidth - visibleWidth(inputLine));
+      const leftMargin = " ".repeat(padX);
+      const rightMargin = " ".repeat(padX + padding);
+      return `${this.theme.fg("border", "│")}${leftMargin}${inputLine}${rightMargin}${this.theme.fg("border", "│")}`;
     } finally {
       this.input.focused = previousFocused;
     }

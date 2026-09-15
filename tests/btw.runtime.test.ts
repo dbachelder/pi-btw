@@ -1730,10 +1730,9 @@ describe("btw runtime behavior", () => {
     expect(emptyLines[0]).not.toContain("<fg:accent>┌");
     expect(emptyLines.at(-1)).toContain("<fg:border>└");
     expect(emptyLines.at(-1)).not.toContain("<fg:accent>└");
-    expect(emptyStateLine).toContain("<fg:border>│</fg:border><fg:dim>No BTW thread yet.");
-    expect(emptyStateLine).not.toContain("<fg:border>│</fg:border> <fg:dim>No BTW thread yet.");
-    expect(assistantBodyLine).toContain("<fg:border>│</fg:border>    First answer");
-    expect(inputLine).toContain("<fg:border>│</fg:border>> ");
+    expect(emptyStateLine).toContain("<fg:border>│</fg:border>  <fg:dim>No BTW thread yet.");
+    expect(assistantBodyLine).toContain("<fg:border>│</fg:border>      First answer");
+    expect(inputLine).toContain("<fg:border>│</fg:border>  > ");
     expect(inputLine).not.toContain("\x1b_pi:c\x07");
   });
 
