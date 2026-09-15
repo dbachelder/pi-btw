@@ -51,6 +51,7 @@ pi install /absolute/path/to/pi-btw
 /btw what file defines this route?
 /btw how would you refactor this parser?
 /btw --save summarize the last error in one sentence
+/btw:debug inspect why the command failed
 /btw:new let's start a fresh thread about auth
 /btw:tangent brainstorm from first principles without using the current chat context
 /btw:model openai gpt-5-mini openai-responses
@@ -123,10 +124,28 @@ pi install /absolute/path/to/pi-btw
 
 ### `/btw:thinking [<level> | clear]`
 
-- with no args, shows the current effective BTW thinking level and whether it is inherited or overridden
+- with no args, shows the current effective BTW thinking level and whether it
+  is inherited or overridden
 - with a value, sets a BTW-only thinking override for normal BTW chat
-- `clear` removes the override and returns BTW to inheriting the main thread thinking level
-- changing `/btw:model` or `/btw:thinking` disposes the current BTW sub-session and applies the new settings on the next BTW prompt while preserving the hidden thread
+- `clear` removes the override and returns BTW to inheriting the main thread
+  thinking level
+- changing `/btw:model` or `/btw:thinking` disposes the current BTW sub-session
+  and applies the new settings on the next BTW prompt while preserving the
+  hidden thread
+
+### `/btw:sync` (or `/sync` in the modal)
+
+- pulls the latest parent session messages into the active BTW sub-session's
+  context
+- keeps the current side thread and transcript intact while refreshing
+  background context from the main agent
+- seamlessly connects a tangent thread to parent session context
+
+### `/btw:copy` (or `/copy` in the modal)
+
+- copies the latest BTW assistant response to the system clipboard
+- can be invoked as `/btw:copy` from the main session or `/copy` directly inside
+  the modal composer
 
 ## Behavior
 
@@ -145,8 +164,18 @@ BTW is implemented as an actual pi sub-session with its own in-memory session st
 
 Inside the BTW modal composer, slash handling is split at the BTW/session boundary:
 
-- `/btw:new`, `/btw:tangent`, `/btw:clear`, `/btw:model`, `/btw:thinking`, `/btw:inject`, and `/btw:summarize` stay owned by BTW because they control BTW lifecycle, configuration, or handoff behavior
-- any other slash-prefixed input is routed through the BTW sub-session's normal `prompt()` path
+- bare `/clear`, `/new`, `/sync`, `/inject`, `/summarize`, `/copy`, `/debug`,
+  `/model`, `/thinking`, `/tangent` (as well as their `/btw:*` equivalents) are
+  handled directly by BTW:
+  - `/clear` resets the thread and transcript in place without dismissing the
+    modal
+  - `/new [question]` clears the thread, re-seeds fresh parent context, and
+    keeps the modal open
+  - `/sync` refreshes parent context into the active thread in place
+  - `/inject` and `/summarize` hand off to the main agent and dismiss the modal
+  - `/copy` copies the last assistant response to clipboard
+- any other slash-prefixed input is routed through the BTW sub-session's normal
+  `prompt()` path
 - this means ordinary pi slash commands like `/help` are handled by the sub-session instead of being rejected by a modal-only fallback
 - if the sub-session cannot handle a slash command, BTW surfaces the real sub-session failure through the transcript/status state instead of inventing an "unsupported slash input" warning
 

@@ -26,6 +26,9 @@ Use these commands in your guidance to the user:
 /btw:new [question]
 /btw:tangent <question>
 /btw:tangent --save <question>
+/btw:debug [on | off | <question>]
+/btw:copy
+/btw:sync
 /btw:clear
 /btw:model [<provider> <model> <api> | clear]
 /btw:thinking [<level> | clear]
@@ -87,7 +90,25 @@ or
 
 Use this when the user wants a side conversation that does not include the current main-session context.
 
-### To hand the full thread back to the main agent
+### To refresh parent context into an active BTW thread
+
+Recommend:
+
+```text
+/btw:sync
+```
+
+(or type `/sync` directly into the BTW modal composer).
+
+### To copy the last BTW response to clipboard
+
+Recommend:
+
+```text
+/btw:copy
+```
+
+(or type `/copy` directly into the BTW modal composer).
 
 Recommend:
 
@@ -117,6 +138,23 @@ Recommend:
 ```
 
 Use these when the main thread should keep its current model or thinking level, but BTW should run with a different cost/speed profile.
+
+### To view thinking and tool executions
+
+Recommend:
+
+```text
+/btw:debug <question>
+```
+
+or
+
+```text
+/btw:debug on
+```
+
+Use this when you need visibility into model thinking and tool execution
+details. Subsequent `/btw` invocations automatically switch debug mode back off.
 
 ## Recommendation rules
 
