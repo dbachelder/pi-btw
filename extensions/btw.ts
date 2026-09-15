@@ -109,6 +109,11 @@ type ResolvedBtwSettings = {
   fallbackReason?: string;
 };
 
+type CompatibleModelSessionOptions = {
+  modelRegistry: ExtensionCommandContext["modelRegistry"];
+  modelRuntime?: unknown;
+};
+
 type BtwTranscriptEntry =
   | { id: number; turnId: number; type: "turn-boundary"; phase: "start" | "end" }
   | { id: number; turnId: number; type: "user-message"; text: string }
@@ -183,10 +188,65 @@ function createBtwResourceLoader(
     getThemes: () => ({ themes: [], diagnostics: [] }),
     getAgentsFiles: () => ({ agentsFiles: [] }),
     getSystemPrompt: () => systemPrompt,
+    getSystemPromptSource: () => undefined,
     getAppendSystemPrompt: () => appendSystemPrompt,
+    getAppendSystemPromptSources: () => [],
     extendResources: () => {},
     reload: async () => {},
+  } as ResourceLoader;
+}
+
+/**
+ * Pi < 0.80.8 accepts ModelRegistry when creating a session. Newer Pi releases
+ * require ModelRuntime, but extension contexts still expose only the ModelRegistry
+ * compatibility facade. Until Pi provides a public runtime accessor for extensions,
+ * keep the private-field access isolated here and continue passing ModelRegistry for
+ * older supported releases.
+ */
+function getParentModelSessionOptions(ctx: ExtensionCommandContext): CompatibleModelSessionOptions {
+  const modelRegistry = ctx.modelRegistry;
+  const modelRuntime = (modelRegistry as unknown as { runtime?: unknown }).runtime;
+
+  if (modelRuntime) {
+    return { modelRegistry, modelRuntime };
+  }
+
+  const modernRegistry = modelRegistry as unknown as {
+    complete?: unknown;
+    getProvider?: unknown;
+    getRegisteredProviderIds?: unknown;
   };
+  if (
+    typeof modernRegistry.complete === "function" ||
+    typeof modernRegistry.getProvider === "function" ||
+    typeof modernRegistry.getRegisteredProviderIds === "function"
+  ) {
+    throw new Error(
+      "BTW cannot reuse the parent model runtime: this Pi ModelRegistry facade does not expose its underlying runtime.",
+    );
+  }
+
+  return { modelRegistry };
+}
+
+async function createBtwAgentSession(
+  ctx: ExtensionCommandContext,
+  model: SessionModel,
+  thinkingLevel: SessionThinkingLevel,
+  tools: string[],
+  appendSystemPrompt?: string[],
+): Promise<AgentSession> {
+  const sessionOptions = {
+    sessionManager: SessionManager.inMemory(),
+    model,
+    thinkingLevel,
+    tools,
+    resourceLoader: createBtwResourceLoader(ctx, appendSystemPrompt),
+    ...getParentModelSessionOptions(ctx),
+  } as NonNullable<Parameters<typeof createAgentSession>[0]>;
+
+  const { session } = await createAgentSession(sessionOptions);
+  return session;
 }
 
 function extractText(parts: AssistantMessage["content"], type: "text" | "thinking"): string {
@@ -1597,15 +1657,13 @@ export default function (pi: ExtensionAPI) {
       throw new Error(settings.fallbackReason || "No active model selected.");
     }
 
-    const { session } = await createAgentSession({
-      sessionManager: SessionManager.inMemory(),
-      model: settings.model,
-      modelRegistry: ctx.modelRegistry as AgentSession["modelRegistry"],
-      thinkingLevel: settings.thinkingLevel,
+    const session = await createBtwAgentSession(
+      ctx,
+      settings.model,
+      settings.thinkingLevel,
       // Match pi's default coding-agent toolset (read/bash/edit/write).
-      tools: ["read", "bash", "edit", "write"],
-      resourceLoader: createBtwResourceLoader(ctx),
-    });
+      ["read", "bash", "edit", "write"],
+    );
 
     const { messages: seedMessages, sideThreadStartIndex } = buildBtwSeedState(ctx, pendingThread, mode, settings.model);
     if (seedMessages.length > 0) {
@@ -2153,14 +2211,7 @@ export default function (pi: ExtensionAPI) {
       throw new Error(auth.ok ? `No credentials available for ${model.provider}/${model.id}.` : auth.error);
     }
 
-    const { session } = await createAgentSession({
-      sessionManager: SessionManager.inMemory(),
-      model,
-      modelRegistry: ctx.modelRegistry as AgentSession["modelRegistry"],
-      thinkingLevel: "off",
-      tools: [],
-      resourceLoader: createBtwResourceLoader(ctx, [BTW_SUMMARIZE_SYSTEM_PROMPT]),
-    });
+    const session = await createBtwAgentSession(ctx, model, "off", [], [BTW_SUMMARIZE_SYSTEM_PROMPT]);
 
     try {
       await session.prompt(formatThread(thread), { source: "extension" });

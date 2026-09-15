@@ -202,6 +202,19 @@ function createBlockingSuccessStream(answer: string) {
   };
 }
 
+function createProviderFailureStream(message: string) {
+  return async function* () {
+    yield {
+      type: "error" as const,
+      error: {
+        ...makeAssistantMessage(""),
+        stopReason: "error" as const,
+        errorMessage: message,
+      },
+    };
+  };
+}
+
 function createStreamingFailureStream() {
   let release!: () => void;
   const blocked = new Promise<void>((resolve) => {
@@ -493,6 +506,27 @@ function createHarness(
   // Tests that exercise overrides should call harness.registerModel(...) so the resolved
   // Model.api preserves the value the test cares about (otherwise we synthesize a default).
   const registeredModels = new Map<string, { provider: string; id: string; api: string }>();
+  const runtimeProviders = new Map<
+    string,
+    { apiKey: string; model: { provider: string; id: string; api: string }; respond: (prompt: string) => string }
+  >();
+  const parentModelRuntime = {
+    registerProvider(
+      provider: string,
+      model: { provider: string; id: string; api: string },
+      apiKey: string,
+      respond: (prompt: string) => string,
+    ) {
+      runtimeProviders.set(provider, { apiKey, model, respond });
+    },
+    complete(model: { provider: string; id: string; api: string }, prompt: string) {
+      const registration = runtimeProviders.get(model.provider);
+      if (!registration || registration.model.id !== model.id) {
+        throw new Error(`No API key found for ${model.provider}.`);
+      }
+      return registration.respond(prompt);
+    },
+  };
   // Pre-register the common BTW override fixture used by most tests.
   registeredModels.set("fast-provider/fast-model", { provider: "fast-provider", id: "fast-model", api: "custom-api" });
   const mainSessionInputs: string[] = [];
@@ -578,7 +612,14 @@ function createHarness(
     ui: ui as any,
     sessionManager: sessionManager as any,
     modelRegistry: {
+      // Pi 0.80.8+ exposes ModelRegistry as a compatibility facade around a private
+      // ModelRuntime field. Tests model that runtime without using real credentials or network.
+      runtime: parentModelRuntime,
       getApiKeyAndHeaders: vi.fn(async (requestedModel: { provider: string; id: string; api: string }) => {
+        const runtimeProvider = runtimeProviders.get(requestedModel.provider);
+        if (runtimeProvider) {
+          return { ok: true, apiKey: runtimeProvider.apiKey, headers: undefined };
+        }
         if (credentialResolver) {
           const key = credentialResolver(requestedModel);
           return key ? { ok: true, apiKey: key, headers: undefined } : { ok: true, apiKey: undefined, headers: undefined };
@@ -658,6 +699,7 @@ function createHarness(
     overlayHandles,
     overlays,
     baseCtx,
+    parentModelRuntime,
     mainSessionInputs,
     runSessionStart,
     runEvent,
@@ -682,6 +724,16 @@ function createHarness(
     registerModel(provider: string, id: string, api: string) {
       registeredModels.set(`${provider}/${id}`, { provider, id, api });
     },
+    registerRuntimeProvider(
+      provider: string,
+      id: string,
+      api: string,
+      respond: (prompt: string) => string,
+    ) {
+      const model = { provider, id, api };
+      registeredModels.set(`${provider}/${id}`, model);
+      parentModelRuntime.registerProvider(provider, model, "fake-test-key", respond);
+    },
   };
 }
 
@@ -696,6 +748,102 @@ describe("btw runtime behavior", () => {
     promptStreamMock.mockImplementation((_record: unknown, _text: string, context: StreamContext) => {
       return streamAnswer(`default:${(context.messages.at(-1)?.content[0] as any)?.text ?? ""}`);
     });
+  });
+
+  it("reuses a custom provider runtime for normal BTW sub-session calls", async () => {
+    const harness = createHarness();
+    harness.registerRuntimeProvider("cpa", "gpt-test", "openai-responses", () => "BTW_CPA_OK");
+    promptStreamMock.mockImplementation((record: any, text: string) => {
+      if (record.options.model.provider !== "cpa") {
+        return streamAnswer(`default:${text}`);
+      }
+
+      const runtime = record.options.modelRuntime as typeof harness.parentModelRuntime | undefined;
+      if (!runtime) {
+        return createProviderFailureStream("No API key found for cpa.")();
+      }
+      return streamAnswer(runtime.complete(record.options.model, text));
+    });
+
+    await harness.runSessionStart();
+    await harness.command("btw:model", "cpa gpt-test openai-responses");
+    await harness.command("btw", "only reply with the marker");
+
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(1);
+    expect(createAgentSessionMock.mock.calls[0][0].modelRuntime).toBe(harness.parentModelRuntime);
+    expect(getCustomEntries(harness.entries, "btw-thread-entry")[0]?.data).toMatchObject({
+      provider: "cpa",
+      model: "gpt-test",
+      answer: "BTW_CPA_OK",
+    });
+  });
+
+  it("reuses a custom provider runtime for BTW summarize sub-session calls", async () => {
+    const harness = createHarness([
+      {
+        type: "custom",
+        customType: "btw-thread-entry",
+        data: {
+          question: "custom provider question",
+          thinking: "",
+          answer: "custom provider answer",
+          provider: "cpa",
+          model: "gpt-test",
+          api: "openai-responses",
+          thinkingLevel: "off",
+          timestamp: 1,
+        },
+      },
+    ]);
+    harness.registerRuntimeProvider("cpa", "gpt-test", "openai-responses", () => "BTW_CPA_SUMMARY");
+    promptStreamMock.mockImplementation((record: any, text: string) => {
+      if (record.options.model.provider !== "cpa") {
+        return streamAnswer(`default:${text}`);
+      }
+
+      const runtime = record.options.modelRuntime as typeof harness.parentModelRuntime | undefined;
+      if (!runtime) {
+        return createProviderFailureStream("No API key found for cpa.")();
+      }
+      return streamAnswer(runtime.complete(record.options.model, text));
+    });
+
+    await harness.runSessionStart();
+    await harness.command("btw:model", "cpa gpt-test openai-responses");
+    await harness.command("btw:summarize", "handoff this");
+
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(2);
+    expect(createAgentSessionMock.mock.calls[0][0].modelRuntime).toBe(harness.parentModelRuntime);
+    expect(createAgentSessionMock.mock.calls[1][0].modelRuntime).toBe(harness.parentModelRuntime);
+    expect(harness.sentUserMessages[0]).toEqual({
+      content: "Here is a summary of a side conversation I had. handoff this\n\nBTW_CPA_SUMMARY",
+      options: undefined,
+    });
+  });
+
+  it("keeps the legacy ModelRegistry session option when no ModelRuntime facade is present", async () => {
+    const harness = createHarness();
+    delete (harness.baseCtx.modelRegistry as { runtime?: unknown }).runtime;
+
+    await harness.runSessionStart();
+    await harness.command("btw", "legacy provider question");
+
+    const options = createAgentSessionMock.mock.calls[0][0];
+    expect(options.modelRegistry).toBe(harness.baseCtx.modelRegistry);
+    expect(options.modelRuntime).toBeUndefined();
+  });
+
+  it("fails clearly when a modern ModelRegistry facade does not expose its runtime", async () => {
+    const harness = createHarness();
+    delete (harness.baseCtx.modelRegistry as { runtime?: unknown }).runtime;
+    (harness.baseCtx.modelRegistry as any).complete = vi.fn();
+
+    await harness.runSessionStart();
+
+    await expect(harness.command("btw", "modern provider question")).rejects.toThrow(
+      "BTW cannot reuse the parent model runtime: this Pi ModelRegistry facade does not expose its underlying runtime.",
+    );
+    expect(createAgentSessionMock).not.toHaveBeenCalled();
   });
 
   it("creates a BTW sub-session with an in-memory session manager, coding tools, and BTW system prompt", async () => {
