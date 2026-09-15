@@ -3,10 +3,26 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, Registere
 import { visibleWidth } from "@earendil-works/pi-tui";
 import btwExtension from "../extensions/btw";
 
-const { promptStreamMock, createAgentSessionMock, sessionManagerInMemoryMock, subSessionRecords } = vi.hoisted(() => ({
+const {
+  promptStreamMock,
+  createAgentSessionMock,
+  sessionManagerInMemoryMock,
+  modelRuntimeExport,
+  modelRuntimeCreateMock,
+  modelRuntimeRecords,
+  subSessionRecords,
+} = vi.hoisted(() => ({
   promptStreamMock: vi.fn(),
   createAgentSessionMock: vi.fn(),
   sessionManagerInMemoryMock: vi.fn(() => ({ type: "in-memory-session" })),
+  modelRuntimeExport: {} as { create?: ReturnType<typeof vi.fn> },
+  modelRuntimeCreateMock: vi.fn(),
+  modelRuntimeRecords: [] as Array<{
+    registerProvider: ReturnType<typeof vi.fn>;
+    registerNativeProvider: ReturnType<typeof vi.fn>;
+    refresh: ReturnType<typeof vi.fn>;
+    setRuntimeApiKey: ReturnType<typeof vi.fn>;
+  }>,
   subSessionRecords: [] as Array<{
     options: any;
     session: any;
@@ -23,6 +39,7 @@ vi.mock("@earendil-works/pi-coding-agent", async () => {
   return {
     ...actual,
     createAgentSession: createAgentSessionMock,
+    ModelRuntime: modelRuntimeExport,
     SessionManager: {
       ...actual.SessionManager,
       inMemory: sessionManagerInMemoryMock,
@@ -488,11 +505,19 @@ function createHarness(
   let idle = true;
   let hasCredentials = true;
   let mainThinkingLevel: string = "off";
+  let credentialSource: string | undefined;
   let credentialResolver: ((model: { provider: string; id: string; api: string }) => string | undefined) | null = null;
   // Models that ctx.modelRegistry.find(provider, id) should return for /btw:model resolution.
   // Tests that exercise overrides should call harness.registerModel(...) so the resolved
   // Model.api preserves the value the test cares about (otherwise we synthesize a default).
   const registeredModels = new Map<string, { provider: string; id: string; api: string }>();
+  const registeredProviderConfigs = new Map<string, unknown>();
+  const registeredNativeProviders = new Map<string, unknown>();
+  const modelRegistryRuntime = {
+    registeredProviderConfigs,
+    registeredNativeProviders,
+    getCredentialSource: () => credentialSource,
+  };
   // Pre-register the common BTW override fixture used by most tests.
   registeredModels.set("fast-provider/fast-model", { provider: "fast-provider", id: "fast-model", api: "custom-api" });
   const mainSessionInputs: string[] = [];
@@ -578,6 +603,7 @@ function createHarness(
     ui: ui as any,
     sessionManager: sessionManager as any,
     modelRegistry: {
+      runtime: modelRegistryRuntime,
       getApiKeyAndHeaders: vi.fn(async (requestedModel: { provider: string; id: string; api: string }) => {
         if (credentialResolver) {
           const key = credentialResolver(requestedModel);
@@ -593,6 +619,24 @@ function createHarness(
         const known = registeredModels.get(key);
         if (known) return known;
         return { provider, id, api: "anthropic-messages" } as any;
+      }),
+      // Pi 0.84+ ModelRegistry methods delegate through this.runtime. Keep the
+      // receiver dependency here so detached method calls fail in tests too.
+      getRegisteredProviderConfig: vi.fn(function (
+        this: { runtime: typeof modelRegistryRuntime },
+        provider: string,
+      ) {
+        return this.runtime.registeredProviderConfigs.get(provider);
+      }),
+      getRegisteredNativeProvider: vi.fn(function (
+        this: { runtime: typeof modelRegistryRuntime },
+        provider: string,
+      ) {
+        return this.runtime.registeredNativeProviders.get(provider);
+      }),
+      getProviderAuthStatus: vi.fn(function (this: { runtime: typeof modelRegistryRuntime }) {
+        const source = this.runtime.getCredentialSource();
+        return source ? { configured: true, source } : { configured: false };
       }),
     },
     model,
@@ -675,12 +719,21 @@ function createHarness(
     setCredentialResolver(value: ((model: { provider: string; id: string; api: string }) => string | undefined) | null) {
       credentialResolver = value;
     },
+    setCredentialSource(value: string | undefined) {
+      credentialSource = value;
+    },
     setMainThinkingLevel(value: string) {
       mainThinkingLevel = value;
     },
     /** Register a model so ctx.modelRegistry.find(provider, id) returns it (with the given api). */
     registerModel(provider: string, id: string, api: string) {
       registeredModels.set(`${provider}/${id}`, { provider, id, api });
+    },
+    registerProviderConfig(provider: string, config: unknown) {
+      registeredProviderConfigs.set(provider, config);
+    },
+    registerNativeProvider(provider: string, nativeProvider: unknown) {
+      registeredNativeProviders.set(provider, nativeProvider);
     },
   };
 }
@@ -690,9 +743,22 @@ describe("btw runtime behavior", () => {
     promptStreamMock.mockReset();
     createAgentSessionMock.mockReset();
     sessionManagerInMemoryMock.mockClear();
+    modelRuntimeCreateMock.mockReset();
+    modelRuntimeExport.create = modelRuntimeCreateMock;
+    modelRuntimeRecords.length = 0;
     subSessionRecords.length = 0;
 
     createAgentSessionMock.mockImplementation(async (options: any) => createMockAgentSession(options));
+    modelRuntimeCreateMock.mockImplementation(async () => {
+      const runtime = {
+        registerProvider: vi.fn(),
+        registerNativeProvider: vi.fn(),
+        refresh: vi.fn(async () => ({ aborted: false, errors: new Map() })),
+        setRuntimeApiKey: vi.fn(async () => {}),
+      };
+      modelRuntimeRecords.push(runtime);
+      return runtime;
+    });
     promptStreamMock.mockImplementation((_record: unknown, _text: string, context: StreamContext) => {
       return streamAnswer(`default:${(context.messages.at(-1)?.content[0] as any)?.text ?? ""}`);
     });
@@ -709,7 +775,8 @@ describe("btw runtime behavior", () => {
 
     const options = createAgentSessionMock.mock.calls[0][0];
     expect(options.model).toBe(harness.baseCtx.model);
-    expect(options.modelRegistry).toBe(harness.baseCtx.modelRegistry);
+    expect(options).not.toHaveProperty("modelRegistry");
+    expect(options).not.toHaveProperty("modelRuntime");
     expect(options.tools).toEqual(["read", "bash", "edit", "write"]);
     expect(options.resourceLoader.getAppendSystemPrompt()[0]).toContain(
       "You are having an aside conversation with the user, separate from their main working session.",
@@ -720,6 +787,147 @@ describe("btw runtime behavior", () => {
     expect(subSession.bindExtensions).not.toHaveBeenCalled();
     expect(subSession.getActiveToolNames()).toEqual(["read", "bash", "edit", "write"]);
     expect(subSession.prompt).toHaveBeenCalledWith("first question", { source: "extension" });
+  });
+
+  it("copies a registered custom provider into BTW and summary child runtimes", async () => {
+    const harness = createHarness();
+    const providerConfig = { api: "commandcode-custom", streamSimple: vi.fn() };
+    harness.registerProviderConfig("test-provider", providerConfig);
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+    await harness.command("btw:summarize", "handoff this");
+
+    expect(modelRuntimeCreateMock).toHaveBeenCalledTimes(2);
+    expect(modelRuntimeCreateMock).toHaveBeenCalledWith({ allowModelNetwork: false });
+    expect(modelRuntimeRecords).toHaveLength(2);
+    for (const runtime of modelRuntimeRecords) {
+      expect(runtime.registerProvider).toHaveBeenCalledWith("test-provider", providerConfig);
+      expect(runtime.refresh).toHaveBeenCalledWith({ allowNetwork: false });
+    }
+
+    expect(createAgentSessionMock.mock.calls[0][0].modelRuntime).toBe(modelRuntimeRecords[0]);
+    expect(createAgentSessionMock.mock.calls[1][0].modelRuntime).toBe(modelRuntimeRecords[1]);
+  });
+
+  it("copies a temporary runtime API key into BTW and summary child runtimes", async () => {
+    const harness = createHarness();
+    harness.registerProviderConfig("test-provider", { api: "commandcode-custom", streamSimple: vi.fn() });
+    harness.setCredentialSource("runtime");
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+    await harness.command("btw:summarize", "handoff this");
+
+    expect(modelRuntimeRecords).toHaveLength(2);
+    for (const runtime of modelRuntimeRecords) {
+      expect(runtime.setRuntimeApiKey).toHaveBeenCalledWith("test-provider", "test-key");
+    }
+  });
+
+  it("copies a temporary runtime API key even when no provider registration needs copying", async () => {
+    const harness = createHarness();
+    harness.setCredentialSource("runtime");
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+    await harness.command("btw:summarize", "handoff this");
+
+    expect(modelRuntimeRecords).toHaveLength(2);
+    for (const runtime of modelRuntimeRecords) {
+      expect(runtime.registerProvider).not.toHaveBeenCalled();
+      expect(runtime.setRuntimeApiKey).toHaveBeenCalledWith("test-provider", "test-key");
+    }
+  });
+
+  it("copies a custom BTW model override into both child runtimes without changing thinking behavior", async () => {
+    const harness = createHarness();
+    const providerConfig = { api: "custom-api", streamSimple: vi.fn() };
+    harness.registerModel("override-provider", "override-model", "custom-api");
+    harness.registerProviderConfig("override-provider", providerConfig);
+
+    await harness.runSessionStart();
+    await harness.command("btw:model", "override-provider override-model custom-api");
+    await harness.command("btw:thinking", "low");
+    await harness.command("btw", "first question");
+    await harness.command("btw:summarize", "handoff this");
+
+    expect(modelRuntimeRecords).toHaveLength(2);
+    for (const runtime of modelRuntimeRecords) {
+      expect(runtime.registerProvider).toHaveBeenCalledWith("override-provider", providerConfig);
+    }
+
+    const [btwOptions, summaryOptions] = createAgentSessionMock.mock.calls.map(([options]) => options);
+    expect(btwOptions).toMatchObject({
+      model: { provider: "override-provider", id: "override-model", api: "custom-api" },
+      thinkingLevel: "low",
+      modelRuntime: modelRuntimeRecords[0],
+    });
+    expect(summaryOptions).toMatchObject({
+      model: { provider: "override-provider", id: "override-model", api: "custom-api" },
+      thinkingLevel: "off",
+      modelRuntime: modelRuntimeRecords[1],
+    });
+  });
+
+  it("copies a registered native provider into the BTW child runtime", async () => {
+    const harness = createHarness();
+    const nativeProvider = { id: "test-provider" };
+    harness.registerNativeProvider("test-provider", nativeProvider);
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+
+    expect(modelRuntimeCreateMock).toHaveBeenCalledTimes(1);
+    expect(modelRuntimeRecords[0].registerNativeProvider).toHaveBeenCalledWith(nativeProvider);
+    expect(modelRuntimeRecords[0].registerProvider).not.toHaveBeenCalled();
+    expect(createAgentSessionMock.mock.calls[0][0].modelRuntime).toBe(modelRuntimeRecords[0]);
+  });
+
+  it("uses legacy modelRegistry while preserving BTW model and thinking overrides", async () => {
+    const harness = createHarness();
+    harness.registerModel("legacy-provider", "legacy-model", "custom-api");
+    harness.registerProviderConfig("legacy-provider", { api: "custom-api", streamSimple: vi.fn() });
+    delete modelRuntimeExport.create;
+
+    await harness.runSessionStart();
+    await harness.command("btw:model", "legacy-provider legacy-model custom-api");
+    await harness.command("btw:thinking", "low");
+    await harness.command("btw", "first question");
+    await harness.command("btw:summarize", "handoff this");
+
+    expect(modelRuntimeCreateMock).not.toHaveBeenCalled();
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(2);
+
+    const [btwOptions, summaryOptions] = createAgentSessionMock.mock.calls.map(([options]) => options);
+    expect(btwOptions).toMatchObject({
+      model: { provider: "legacy-provider", id: "legacy-model", api: "custom-api" },
+      thinkingLevel: "low",
+      modelRegistry: harness.baseCtx.modelRegistry,
+    });
+    expect(btwOptions).not.toHaveProperty("modelRuntime");
+    expect(summaryOptions).toMatchObject({
+      model: { provider: "legacy-provider", id: "legacy-model", api: "custom-api" },
+      thinkingLevel: "off",
+      modelRegistry: harness.baseCtx.modelRegistry,
+    });
+    expect(summaryOptions).not.toHaveProperty("modelRuntime");
+  });
+
+  it("uses legacy modelRegistry when the registry lacks runtime provider introspection", async () => {
+    const harness = createHarness();
+    delete (harness.baseCtx.modelRegistry as { getRegisteredProviderConfig?: unknown }).getRegisteredProviderConfig;
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+    await harness.command("btw:summarize", "handoff this");
+
+    expect(modelRuntimeCreateMock).not.toHaveBeenCalled();
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(2);
+    for (const [options] of createAgentSessionMock.mock.calls) {
+      expect(options.modelRegistry).toBe(harness.baseCtx.modelRegistry);
+      expect(options).not.toHaveProperty("modelRuntime");
+    }
   });
 
   it("uses BTW-specific model and thinking overrides for BTW prompts", async () => {
