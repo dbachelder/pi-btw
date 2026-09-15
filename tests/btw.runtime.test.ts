@@ -596,6 +596,7 @@ function createHarness(
         if (known) return known;
         return { provider, id, api: "anthropic-messages" } as any;
       }),
+      getAll: vi.fn(() => [model, ...Array.from(registeredModels.values())]),
     },
     model,
     getSystemPrompt: () => "system",
@@ -671,6 +672,7 @@ function createHarness(
     setIdle(value: boolean) {
       idle = value;
     },
+    commands,
     setCredentials(value: boolean) {
       hasCredentials = value;
     },
@@ -716,26 +718,27 @@ describe("btw runtime behavior", () => {
     const options = createAgentSessionMock.mock.calls[0][0];
     expect(options.model).toBe(harness.baseCtx.model);
     expect(options.modelRegistry).toBe(harness.baseCtx.modelRegistry);
-    expect(options.tools).toEqual(["read", "bash", "edit", "write"]);
+    expect(options.tools).toEqual(["read", "bash", "edit", "write", "configure_btw"]);
     expect(options.resourceLoader.getAppendSystemPrompt()[0]).toContain(
       "You are having an aside conversation with the user, separate from their main working session.",
+    );
+    expect(options.resourceLoader.getAppendSystemPrompt()[1]).toContain(
+      "You are currently running as model test-provider/test-model (openai-responses) with thinking level off.",
     );
 
     const subSession = subSessionRecords[0]?.session;
     expect(subSession).toBeDefined();
     expect(subSession.bindExtensions).not.toHaveBeenCalled();
-    expect(subSession.getActiveToolNames()).toEqual(["read", "bash", "edit", "write"]);
+    expect(subSession.getActiveToolNames()).toEqual(["read", "bash", "edit", "write", "configure_btw"]);
     expect(subSession.prompt).toHaveBeenCalledWith("first question", { source: "extension" });
   });
 
-  it("uses BTW-specific model and thinking overrides for BTW prompts", async () => {
+  it("uses BTW-specific model and thinking overrides for BTW prompts via flags", async () => {
     const harness = createHarness();
     harness.setMainThinkingLevel("high");
 
     await harness.runSessionStart();
-    await harness.command("btw:model", "fast-provider fast-model custom-api");
-    await harness.command("btw:thinking", "low");
-    await harness.command("btw", "first question");
+    await harness.command("btw", "--model fast-model --thinking low first question");
 
     expect(createAgentSessionMock).toHaveBeenCalledTimes(1);
     const options = createAgentSessionMock.mock.calls[0][0];
@@ -757,9 +760,7 @@ describe("btw runtime behavior", () => {
     harness.setMainThinkingLevel("high");
 
     await harness.runSessionStart();
-    await harness.command("btw:model", "fast-provider fast-model custom-api");
-    await harness.command("btw:thinking", "low");
-    await harness.command("btw", "first question");
+    await harness.command("btw", "-m fast-model -t low first question");
     await harness.command("btw:summarize", "handoff this");
 
     expect(createAgentSessionMock).toHaveBeenCalledTimes(2);
@@ -781,7 +782,7 @@ describe("btw runtime behavior", () => {
     } as any);
 
     await harness.runSessionStart();
-    await harness.command("btw:model", "google-vertex gemini-3.8-flash google-vertex");
+    await harness.command("btw", "--model gemini-3.8-flash first question");
     await harness.command("btw", "first question");
     await harness.command("btw:summarize", "handoff this");
 
@@ -840,14 +841,11 @@ describe("btw runtime behavior", () => {
     harness.setMainThinkingLevel("high");
 
     await harness.runSessionStart();
-    await harness.command("btw:model", "fast-provider fast-model custom-api");
-    await harness.command("btw:thinking", "low");
-    await harness.command("btw:model", "clear");
-    await harness.command("btw:thinking", "clear");
-    await harness.command("btw", "first question");
+    await harness.command("btw", "--model fast-model --thinking low first question");
+    await harness.command("btw", "--model clear --thinking clear second question");
 
-    expect(createAgentSessionMock).toHaveBeenCalledTimes(1);
-    const options = createAgentSessionMock.mock.calls[0][0];
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(2);
+    const options = createAgentSessionMock.mock.calls[1][0];
     expect(options.model).toBe(harness.baseCtx.model);
     expect(options.thinkingLevel).toBe("high");
   });
@@ -909,13 +907,12 @@ describe("btw runtime behavior", () => {
     expect(seedTexts).toContain("saved answer");
   });
 
-  it("reports inherited and overridden BTW settings from the read-only commands", async () => {
+  it("reports inherited and overridden BTW thinking settings and confirms btw:model was removed", async () => {
     const harness = createHarness();
     harness.setMainThinkingLevel("high");
 
     await harness.runSessionStart();
-    await harness.command("btw:model", "");
-    expect(harness.notifications.at(-1)?.message).toContain("BTW model: test-provider/test-model (openai-responses) (inherits main thread).");
+    expect(harness.commands.has("btw:model")).toBe(false);
 
     await harness.command("btw:thinking", "");
     expect(harness.notifications.at(-1)).toEqual({
@@ -923,11 +920,7 @@ describe("btw runtime behavior", () => {
       type: "info",
     });
 
-    await harness.command("btw:model", "fast-provider fast-model custom-api");
-    await harness.command("btw:thinking", "low");
-
-    await harness.command("btw:model", "");
-    expect(harness.notifications.at(-1)?.message).toContain("BTW model: fast-provider/fast-model (custom-api) (override).");
+    await harness.command("btw", "-m fast-model -t low first question");
 
     await harness.command("btw:thinking", "");
     expect(harness.notifications.at(-1)).toEqual({
@@ -943,8 +936,7 @@ describe("btw runtime behavior", () => {
     );
 
     await harness.runSessionStart();
-    await harness.command("btw:model", "fast-provider fast-model custom-api");
-    await harness.command("btw", "first question");
+    await harness.command("btw", "--model fast-model first question");
 
     const options = createAgentSessionMock.mock.calls[0][0];
     expect(options.model).toBe(harness.baseCtx.model);
@@ -970,8 +962,7 @@ describe("btw runtime behavior", () => {
     expect(firstSession.dispose).toHaveBeenCalledTimes(1);
     expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(1);
 
-    await harness.command("btw:model", "fast-provider fast-model custom-api");
-    await harness.command("btw", "second question");
+    await harness.command("btw", "--model fast-model second question");
 
     expect(createAgentSessionMock).toHaveBeenCalledTimes(2);
     const secondOptions = createAgentSessionMock.mock.calls[1][0];
@@ -2451,6 +2442,92 @@ describe("btw runtime behavior", () => {
     expect((harness.sentUserMessages[0].content as string)).toContain("finalize this task");
     expect((harness.sentUserMessages[0].content as string)).toContain("Answer to inject");
     expect(harness.overlayHandles.at(-1)?.isHidden()).toBe(true);
+  });
+
+  describe("flags, fuzzy model resolution, and natural language switching", () => {
+    it("parses flags with space, equals, and preserves question containing git commit -m", async () => {
+      const harness = createHarness();
+      harness.registerModel("github-copilot", "gpt-5.4", "copilot");
+
+      await harness.runSessionStart();
+      await harness.command("btw", "--model=gpt-5.4 --thinking=low how do I fix this?");
+
+      expect(createAgentSessionMock).toHaveBeenCalledTimes(1);
+      const firstOptions = createAgentSessionMock.mock.calls[0][0];
+      expect(firstOptions.model).toEqual({ provider: "github-copilot", id: "gpt-5.4", api: "copilot" });
+      expect(firstOptions.thinkingLevel).toBe("low");
+      expect(subSessionRecords[0].session.prompt).toHaveBeenCalledWith("how do I fix this?", { source: "extension" });
+
+      // Non-leading -m in question is preserved on follow-up in the same active sub-session
+      await harness.command("btw", "how does git commit -m 'feat: test' work?");
+      expect(subSessionRecords[0].session.prompt).toHaveBeenNthCalledWith(2, "how does git commit -m 'feat: test' work?", {
+        source: "extension",
+      });
+    });
+
+    it("resolves fuzzy model queries with provider aliases and normalized names", async () => {
+      const harness = createHarness();
+      harness.registerModel("github-copilot", "gpt-5.6", "copilot");
+
+      await harness.runSessionStart();
+      // "copilot/gpt5.6" should resolve via provider alias copilot -> github-copilot and fuzzy gpt5.6 -> gpt-5.6
+      await harness.command("btw", "--model copilot/gpt5.6 my question");
+
+      expect(createAgentSessionMock).toHaveBeenCalledTimes(1);
+      const options = createAgentSessionMock.mock.calls[0][0];
+      expect(options.model).toEqual({ provider: "github-copilot", id: "gpt-5.6", api: "copilot" });
+    });
+
+    it("prompts for disambiguation in overlay when multiple models match and executes question after selection", async () => {
+      const harness = createHarness();
+      harness.registerModel("anthropic", "claude-3-7-sonnet", "anthropic-messages");
+      harness.registerModel("amazon-bedrock", "anthropic.claude-3-7-sonnet", "bedrock-converse-stream");
+
+      await harness.runSessionStart();
+      await harness.command("btw", "--model claude what is the meaning of life?");
+
+      // Since both are authenticated and match "claude", disambiguation should be triggered
+      const overlay = harness.latestOverlayComponent();
+      expect(overlay).toBeDefined();
+      const lines = overlay.render(80).join("\n");
+      expect(lines).toContain("Multiple models match \"claude\"");
+      expect(lines).toContain("anthropic/claude-3-7-sonnet");
+      expect(lines).toContain("amazon-bedrock/anthropic.claude-3-7-sonnet");
+
+      // Now user submits selection "1" in the overlay
+      overlay.input.onSubmit?.("1");
+      await flushAsyncWork();
+
+      expect(createAgentSessionMock).toHaveBeenCalledTimes(1);
+      const options = createAgentSessionMock.mock.calls[0][0];
+      expect(options.model).toEqual({ provider: "anthropic", id: "claude-3-7-sonnet", api: "anthropic-messages" });
+      expect(subSessionRecords[0].session.prompt).toHaveBeenCalledWith("what is the meaning of life?", { source: "extension" });
+    });
+
+    it("supports natural language switching via configure_btw tool", async () => {
+      const harness = createHarness();
+      harness.registerModel("openai", "gpt-5-mini", "openai-responses");
+
+      await harness.runSessionStart();
+      await harness.command("btw", "can we switch to gpt-5-mini?");
+
+      expect(createAgentSessionMock).toHaveBeenCalledTimes(1);
+      const options = createAgentSessionMock.mock.calls[0][0];
+      const configureTool = options.customTools?.find((t: any) => t.name === "configure_btw");
+      expect(configureTool).toBeDefined();
+
+      // Simulate model executing configure_btw
+      const result = await configureTool.execute("call-1", { model: "gpt-5-mini", thinking: "low" });
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toContain("Successfully");
+
+      // Verify that the next BTW prompt uses the newly configured model and thinking level
+      await harness.command("btw", "next question");
+      expect(createAgentSessionMock).toHaveBeenCalledTimes(2);
+      const secondOptions = createAgentSessionMock.mock.calls[1][0];
+      expect(secondOptions.model).toEqual({ provider: "openai", id: "gpt-5-mini", api: "openai-responses" });
+      expect(secondOptions.thinkingLevel).toBe("low");
+    });
   });
 
   describe("overlay render height vs maxHeight", () => {

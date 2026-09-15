@@ -54,7 +54,7 @@ pi install /absolute/path/to/pi-btw
 /btw:debug inspect why the command failed
 /btw:new let's start a fresh thread about auth
 /btw:tangent brainstorm from first principles without using the current chat context
-/btw:model openai gpt-5-mini openai-responses
+/btw --model gpt-5-mini --thinking low what are the risks of this change?
 /btw:thinking low
 /btw:inject implement the plan we just discussed
 /btw:summarize turn that side thread into a short handoff
@@ -63,7 +63,7 @@ pi install /absolute/path/to/pi-btw
 
 ## Commands
 
-### `/btw [--save] <question>`
+### `/btw [--model <m>] [--thinking <t>] [--save] <question>`
 
 - runs right away
 - works while pi is busy
@@ -72,6 +72,11 @@ pi install /absolute/path/to/pi-btw
 - opens or refreshes the focused BTW modal shell
 - streams into the BTW modal transcript/status surface
 - persists the BTW exchange as hidden thread state
+- with `--model <query>` (or `-m`), sets a BTW-only model override using fuzzy
+  matching and provider aliases (e.g. `copilot/gpt-5.4`, `gpt-5-mini`, `claude`)
+- with `--thinking <level>` (or `-t`), sets a BTW-only thinking override
+- if a model query is ambiguous across authenticated providers, the popup
+  prompts you to pick one
 - with `--save`, also saves that single exchange as a visible session note
 
 ## Overlay controls
@@ -115,12 +120,24 @@ pi install /absolute/path/to/pi-btw
 - if pi is busy, queues it as a follow-up
 - clears the BTW thread after sending
 
-### `/btw:model [<provider> <model> <api> | clear]`
+### Model & thinking controls (`--model`, `--thinking`, and natural language)
 
-- with no args, shows the current effective BTW model and whether it is inherited or overridden
-- with values, sets a BTW-only model override
-- `clear` removes the override and returns BTW to inheriting the main thread model
-- if the configured BTW model has no credentials, BTW warns and falls back to the main thread model
+- `--model <query>` / `-m <query>`: sets a BTW-only model override on `/btw`,
+  `/btw:new`, `/btw:tangent`, or `/btw:debug`
+- `--model clear`: clears the override and reverts to inheriting the main
+  thread model
+- `--thinking <level>` / `-t <level>`: sets a BTW-only thinking override
+- `--thinking clear`: reverts to inheriting the main thread thinking level
+- fuzzy model resolution supports:
+  - exact IDs or display names (e.g. `gpt-5-mini`)
+  - provider prefixes and aliases (e.g. `copilot/gpt-5.4` -> `github-copilot`)
+  - automatic credential prioritization: picks the authenticated provider if
+    only one has credentials
+  - in-popup disambiguation: if multiple authenticated models match (e.g.
+    `claude` on Anthropic vs Bedrock), the popup prompts you to choose by number
+- natural language in the popup: you can also ask directly inside the BTW modal
+  composer (e.g. *"switch to gpt-5-mini with low thinking"*), and the
+  sub-session will reconfigure itself using its built-in `configure_btw` tool
 
 ### `/btw:thinking [<level> | clear]`
 
@@ -129,7 +146,7 @@ pi install /absolute/path/to/pi-btw
 - with a value, sets a BTW-only thinking override for normal BTW chat
 - `clear` removes the override and returns BTW to inheriting the main thread
   thinking level
-- changing `/btw:model` or `/btw:thinking` disposes the current BTW sub-session
+- changing `--model` or `/btw:thinking` disposes the current BTW sub-session
   and applies the new settings on the next BTW prompt while preserving the
   hidden thread
 
@@ -155,7 +172,7 @@ BTW is implemented as an actual pi sub-session with its own in-memory session st
 
 - contextual `/btw` threads seed that sub-session from the current main-session branch while filtering out BTW-visible notes from the parent context
 - `/btw:tangent` starts the same BTW UI in a contextless mode with no inherited main-session conversation
-- BTW can inherit the main thread model/thinking settings or use BTW-only overrides via `/btw:model` and `/btw:thinking`
+- BTW can inherit the main thread model/thinking settings or use BTW-only overrides via `--model` and `--thinking` flags or natural language
 - `/btw:summarize` uses the current effective BTW model but keeps thinking off
 - the overlay transcript/status line is driven from sub-session events, so tool activity, streaming deltas, failures, and recovery are all visible without scraping rendered output
 - handoff commands (`/btw:inject` and `/btw:summarize`) read from the BTW sub-session thread rather than maintaining a separate manual transcript model
@@ -165,7 +182,7 @@ BTW is implemented as an actual pi sub-session with its own in-memory session st
 Inside the BTW modal composer, slash handling is split at the BTW/session boundary:
 
 - bare `/clear`, `/new`, `/sync`, `/inject`, `/summarize`, `/copy`, `/debug`,
-  `/model`, `/thinking`, `/tangent` (as well as their `/btw:*` equivalents) are
+  `/thinking`, `/tangent` (as well as their `/btw:*` equivalents) are
   handled directly by BTW:
   - `/clear` resets the thread and transcript in place without dismissing the
     modal

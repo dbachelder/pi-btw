@@ -1,8 +1,12 @@
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import {
   buildSessionContext,
   copyToClipboard,
   createAgentSession,
   createExtensionRuntime,
+  defineTool,
+  getAgentDir,
   SessionManager,
   type AgentSession,
   type AgentSessionEvent,
@@ -10,9 +14,11 @@ import {
   type ExtensionCommandContext,
   type ExtensionContext,
   type ResourceLoader,
+  type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import {
   getSupportedThinkingLevels,
+  Type,
   type AssistantMessage,
   type Message,
   type ThinkingLevel as AiThinkingLevel,
@@ -51,6 +57,7 @@ const BTW_SYSTEM_PROMPT = [
   "If no main session messages are provided, treat this as a fully contextless tangent thread and rely only on the user's words plus your general instructions.",
   "Focus on answering the user's side questions, helping them think through ideas, or planning next steps.",
   "Do not act as if you need to continue unfinished work from the main session unless the user explicitly asks you to prepare something for injection back to it.",
+  "You can change the model or thinking level for this side conversation when the user asks by using the configure_btw tool.",
 ].join(" ");
 
 const BTW_SUMMARIZE_SYSTEM_PROMPT =
@@ -63,8 +70,7 @@ type SessionThinkingLevel = "off" | AiThinkingLevel;
 type BtwThreadMode = "contextual" | "tangent";
 type SessionModel = NonNullable<ExtensionCommandContext["model"]>;
 /**
- * Loose model reference parsed from `/btw:model <provider> <id> <api>` and persisted to
- * session entries. Resolved to a full SessionModel via ctx.modelRegistry.find(...).
+ * Model reference persisted to session entries. Resolved to a full SessionModel via ctx.modelRegistry.find(...).
  */
 type BtwModelRef = Pick<SessionModel, "provider" | "id" | "api">;
 
@@ -83,6 +89,8 @@ type BtwDetails = {
 type ParsedBtwArgs = {
   question: string;
   save: boolean;
+  modelQuery?: string;
+  thinkingLevel?: SessionThinkingLevel;
 };
 
 type SaveState = "not-saved" | "saved" | "queued";
@@ -114,6 +122,14 @@ type ResolvedBtwSettings = {
   thinkingLevel: SessionThinkingLevel;
   thinkingSource: "override" | "main";
   fallbackReason?: string;
+};
+
+type ModelDisambiguationState = {
+  query: string;
+  candidates: SessionModel[];
+  pendingQuestion?: string;
+  save: boolean;
+  mode: BtwThreadMode;
 };
 
 type BtwTranscriptEntry =
@@ -219,32 +235,309 @@ function extractThinking(message: AssistantMessage): string {
 }
 
 function parseBtwArgs(args: string): ParsedBtwArgs {
-  const save = /(?:^|\s)(?:--save|-s)(?=\s|$)/.test(args);
-  const question = args.replace(/(?:^|\s)(?:--save|-s)(?=\s|$)/g, " ").trim();
-  return { question, save };
+  let raw = args.trim();
+  let save = false;
+  let modelQuery: string | undefined;
+  let thinkingLevel: SessionThinkingLevel | undefined;
+
+  // Extract --save / -s anywhere if present as a standalone flag
+  if (/(?:^|\s)(?:--save|-s)(?=\s|$)/.test(raw)) {
+    save = true;
+    raw = raw.replace(/(?:^|\s)(?:--save|-s)(?=\s|$)/g, " ").trim();
+  }
+
+  // Extract --model=... and --thinking=... anywhere if present
+  const modelEqMatch = raw.match(/(?:^|\s)(?:--model|-m)=([^\s"']+|"[^"]*"|'[^']*')(?=\s|$)/);
+  if (modelEqMatch) {
+    modelQuery = modelEqMatch[1].replace(/^["']|["']$/g, "").trim();
+    raw = raw.replace(modelEqMatch[0], " ").trim();
+  }
+
+  const thinkingEqMatch = raw.match(/(?:^|\s)(?:--thinking|-t)=([^\s"']+|"[^"]*"|'[^']*')(?=\s|$)/);
+  if (thinkingEqMatch) {
+    thinkingLevel = thinkingEqMatch[1].replace(/^["']|["']$/g, "").trim() as SessionThinkingLevel;
+    raw = raw.replace(thinkingEqMatch[0], " ").trim();
+  }
+
+  // Next, parse leading space-separated flags (e.g. "--model gpt-5", "-m gpt-5", "--thinking low", "-t low")
+  // Only consume from the FRONT of raw until we hit the first non-flag argument.
+  while (raw.length > 0) {
+    const modelSpaceMatch = raw.match(/^(?:--model|-m)\s+([^\s"']+|"[^"]*"|'[^']*')(?:\s+|$)/);
+    if (modelSpaceMatch) {
+      if (!modelQuery) {
+        modelQuery = modelSpaceMatch[1].replace(/^["']|["']$/g, "").trim();
+      }
+      raw = raw.slice(modelSpaceMatch[0].length).trim();
+      continue;
+    }
+
+    const thinkingSpaceMatch = raw.match(/^(?:--thinking|-t)\s+([^\s"']+|"[^"]*"|'[^']*')(?:\s+|$)/);
+    if (thinkingSpaceMatch) {
+      if (!thinkingLevel) {
+        thinkingLevel = thinkingSpaceMatch[1].replace(/^["']|["']$/g, "").trim() as SessionThinkingLevel;
+      }
+      raw = raw.slice(thinkingSpaceMatch[0].length).trim();
+      continue;
+    }
+
+    break;
+  }
+
+  return {
+    question: raw.replace(/\s+/g, " ").trim(),
+    save,
+    modelQuery: modelQuery || undefined,
+    thinkingLevel: thinkingLevel || undefined,
+  };
 }
 
-function parseBtwModelArgs(args: string):
-  | { action: "show" }
-  | { action: "clear" }
-  | { action: "set"; model: BtwModelRef }
-  | { action: "invalid"; message: string } {
-  const trimmed = args.trim();
+const PROVIDER_ALIASES: Record<string, string> = {
+  copilot: "github-copilot",
+  "github-copilot": "github-copilot",
+  bedrock: "amazon-bedrock",
+  "amazon-bedrock": "amazon-bedrock",
+  vertex: "google-vertex",
+  "google-vertex": "google-vertex",
+  azure: "azure-openai-responses",
+  "azure-openai": "azure-openai-responses",
+  openai: "openai",
+  anthropic: "anthropic",
+  deepseek: "deepseek",
+  groq: "groq",
+  together: "together",
+  openrouter: "openrouter",
+};
+
+const CONVERSATIONAL_STOP_WORDS = new Set([
+  "the", "a", "an", "model", "models", "use", "to", "switch", "please", "can", "you", "back", "into", "for", "me", "set", "change", "try"
+]);
+
+function normalizeModelBaseUrl(
+  model: SessionModel,
+  apiKey?: string,
+  currentModel?: SessionModel | null,
+): SessionModel {
+  if (model.provider === "github-copilot") {
+    if (apiKey) {
+      const match = apiKey.match(/proxy-ep=([^;]+)/);
+      if (match) {
+        const proxyHost = match[1];
+        const apiHost = proxyHost.replace(/^proxy\./, "api.");
+        return { ...model, baseUrl: `https://${apiHost}` };
+      }
+    }
+    if (currentModel?.provider === "github-copilot" && currentModel.baseUrl) {
+      return { ...model, baseUrl: currentModel.baseUrl };
+    }
+  }
+  return model;
+}
+
+function getAllAvailableModels(ctx: ExtensionCommandContext): SessionModel[] {
+  const models: SessionModel[] = [];
+  const seen = new Set<string>();
+
+  const add = (m: SessionModel | null | undefined) => {
+    if (!m || !m.provider || !m.id) return;
+    const key = `${m.provider}/${m.id}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      models.push(m);
+    }
+  };
+
+  if (ctx.model) {
+    add(ctx.model);
+  }
+
+  const scopedModels = (ctx as any).scopedModels;
+  if (Array.isArray(scopedModels)) {
+    for (const scoped of scopedModels) {
+      add((scoped as any).model ?? scoped);
+    }
+  }
+
+  if (!process.env.VITEST) {
+    try {
+      const storePath = join(getAgentDir(), "models-store.json");
+      if (existsSync(storePath)) {
+        const raw = JSON.parse(readFileSync(storePath, "utf-8"));
+        for (const val of Object.values(raw)) {
+          if (Array.isArray(val)) {
+            for (const m of val) add(m as SessionModel);
+          } else if (val && typeof val === "object" && Array.isArray((val as any).models)) {
+            for (const m of (val as any).models) add(m as SessionModel);
+          }
+        }
+      }
+    } catch {}
+  }
+
+  if (typeof (ctx.modelRegistry as any).getAll === "function") {
+    for (const m of (ctx.modelRegistry as any).getAll()) {
+      add(m);
+    }
+  }
+
+  return models;
+}
+
+type ModelResolutionResult =
+  | { status: "resolved"; model: SessionModel }
+  | { status: "ambiguous"; candidates: SessionModel[]; reason: string }
+  | { status: "not_found"; error: string };
+
+async function resolveBtwModelQuery(
+  ctx: ExtensionCommandContext,
+  query: string,
+): Promise<ModelResolutionResult> {
+  const trimmed = query.trim();
   if (!trimmed) {
-    return { action: "show" };
+    return { status: "not_found", error: "No model query provided." };
   }
 
-  if (trimmed === "clear") {
-    return { action: "clear" };
+  const allModels = getAllAvailableModels(ctx);
+  if (allModels.length === 0) {
+    return { status: "not_found", error: `No models available in registry to match "${query}".` };
   }
 
-  const parts = trimmed.split(/\s+/);
-  if (parts.length !== 3) {
-    return { action: "invalid", message: "Usage: /btw:model <provider> <model> <api> | clear" };
+  const normalized = trimmed.toLowerCase();
+
+  // 1. Exact match on provider/id
+  const canonicalMatches = allModels.filter(
+    (m) => `${m.provider}/${m.id}`.toLowerCase() === normalized,
+  );
+  if (canonicalMatches.length === 1) {
+    return { status: "resolved", model: canonicalMatches[0] };
   }
 
-  const [provider, id, api] = parts;
-  return { action: "set", model: { provider, id, api } as BtwModelRef };
+  // 2. Exact match on id alone
+  const exactIdMatches = allModels.filter((m) => m.id.toLowerCase() === normalized);
+  if (exactIdMatches.length === 1) {
+    return { status: "resolved", model: exactIdMatches[0] };
+  }
+
+  // 3. Check if provider was specified via slash or space (e.g. "copilot/gpt-4o", "copilot gpt-4o")
+  let candidates: SessionModel[] = [];
+  const slashIndex = normalized.indexOf("/");
+  const spaceIndex = normalized.indexOf(" ");
+  const splitIndex = slashIndex !== -1 ? slashIndex : spaceIndex;
+
+  if (splitIndex !== -1) {
+    const rawProvider = normalized.substring(0, splitIndex).trim();
+    const rawPattern = normalized.substring(splitIndex + 1).trim();
+    const canonicalProvider = PROVIDER_ALIASES[rawProvider];
+
+    if (canonicalProvider) {
+      const providerCandidates = allModels.filter((m) => {
+        if (m.provider.toLowerCase() !== canonicalProvider) return false;
+        const normId = m.id.toLowerCase();
+        const normPattern = rawPattern.replace(/[-_.]/g, "");
+        const normModelId = normId.replace(/[-_.]/g, "");
+
+        return (
+          normId === rawPattern ||
+          normId.includes(rawPattern) ||
+          normModelId.includes(normPattern) ||
+          (m.name && m.name.toLowerCase().includes(rawPattern))
+        );
+      });
+
+      if (providerCandidates.length > 0) {
+        candidates = providerCandidates;
+      }
+    }
+  }
+
+  // 4. If no provider-specific candidates, search across all models
+  if (candidates.length === 0) {
+    const rawWords = normalized.split(/[\s/]+/).filter(Boolean);
+    const cleanedWords = rawWords.filter((w) => !CONVERSATIONAL_STOP_WORDS.has(w));
+    const qWords = cleanedWords.length > 0 ? cleanedWords : rawWords;
+
+    candidates = allModels.filter((m) => {
+      const idNorm = m.id.toLowerCase().replace(/[-_.]/g, " ");
+      const nameNorm = (m.name ?? "").toLowerCase().replace(/[-_.]/g, " ");
+      const fullNorm = `${m.provider.toLowerCase().replace(/[-_.]/g, " ")} ${idNorm} ${nameNorm}`;
+      const fullCompact = `${m.provider}${m.id}${m.name ?? ""}`.toLowerCase().replace(/[-_.\s]/g, "");
+
+      return qWords.every((word) => {
+        const wordCompact = word.replace(/[-_.\s]/g, "");
+        return fullNorm.includes(word) || fullCompact.includes(wordCompact);
+      });
+    });
+  }
+
+  if (candidates.length === 0) {
+    return { status: "not_found", error: `No model found matching "${query}".` };
+  }
+
+  // Deduplicate candidates by provider + id
+  const seen = new Set<string>();
+  const deduped: SessionModel[] = [];
+  for (const c of candidates) {
+    const key = `${c.provider}/${c.id}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      deduped.push(c);
+    }
+  }
+
+  const resolveWithNormalizedUrl = async (m: SessionModel): Promise<SessionModel> => {
+    try {
+      const auth = await ctx.modelRegistry.getApiKeyAndHeaders(m);
+      return normalizeModelBaseUrl(m, auth.ok ? auth.apiKey : undefined, ctx.model);
+    } catch {
+      return normalizeModelBaseUrl(m, undefined, ctx.model);
+    }
+  };
+
+  if (deduped.length === 1) {
+    return { status: "resolved", model: await resolveWithNormalizedUrl(deduped[0]) };
+  }
+
+  // Prioritize current provider if current provider has exactly 1 match
+  if (ctx.model?.provider) {
+    const currentProviderMatches = deduped.filter((m) => m.provider === ctx.model?.provider);
+    if (currentProviderMatches.length === 1) {
+      return { status: "resolved", model: await resolveWithNormalizedUrl(currentProviderMatches[0]) };
+    }
+  }
+
+  // 5. Multiple matches: check credentials
+  const authChecks = await Promise.all(
+    deduped.map(async (m) => {
+      try {
+        const res = await ctx.modelRegistry.getApiKeyAndHeaders(m);
+        return res.ok && res.apiKey !== undefined;
+      } catch {
+        return false;
+      }
+    }),
+  );
+
+  const authenticated = deduped.filter((_, i) => authChecks[i]);
+
+  // If only one candidate is authenticated, pick it!
+  if (authenticated.length === 1) {
+    return { status: "resolved", model: await resolveWithNormalizedUrl(authenticated[0]) };
+  }
+
+  // If multiple are authenticated, disambiguate among authenticated ones
+  if (authenticated.length > 1) {
+    return {
+      status: "ambiguous",
+      candidates: authenticated,
+      reason: `Multiple authenticated models match "${query}".`,
+    };
+  }
+
+  // None are authenticated; disambiguate among all matched candidates
+  return {
+    status: "ambiguous",
+    candidates: deduped,
+    reason: `Multiple models match "${query}".`,
+  };
 }
 
 function parseBtwThinkingArgs(args: string):
@@ -1042,6 +1335,21 @@ function notify(ctx: ExtensionContext | ExtensionCommandContext, message: string
 /** Fixed overlay rows outside the transcript viewport (must match render() structure). */
 const BTW_OVERLAY_CHROME_LINES = 9;
 
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+function isActiveStatus(status: string | null): boolean {
+  if (!status) return false;
+  return (
+    status.includes("running tool") ||
+    status.includes("thinking") ||
+    status.includes("generating") ||
+    status.includes("resolving") ||
+    status.includes("switching") ||
+    status.includes("configuring") ||
+    status.includes("⏳")
+  );
+}
+
 function getOverlayTitle(mode: BtwThreadMode): string {
   return mode === "tangent" ? "BTW tangent" : "BTW";
 }
@@ -1067,6 +1375,7 @@ class BtwOverlayComponent extends Container implements Focusable {
   private readonly getMode: () => BtwThreadMode;
   private readonly getDebug: () => boolean;
   private readonly getModelInfo: () => string;
+  private readonly getDisambiguation?: () => ModelDisambiguationState | null;
   private readonly onSubmitCallback: (value: string) => void;
   private readonly onDismissCallback: () => void;
   private readonly onUnfocusCallback: () => void;
@@ -1081,6 +1390,9 @@ class BtwOverlayComponent extends Container implements Focusable {
   private summaryTextValue = "";
   private statusTextValue = "";
   private hintsTextValue = "";
+  private spinnerIndex = 0;
+  private animationTimer: ReturnType<typeof setInterval> | null = null;
+  private activityStartTime: number | null = null;
 
   get focused(): boolean {
     return this._focused;
@@ -1103,6 +1415,7 @@ class BtwOverlayComponent extends Container implements Focusable {
     onSubmit: (value: string) => void,
     onDismiss: () => void,
     onUnfocus: () => void,
+    getDisambiguation?: () => ModelDisambiguationState | null,
   ) {
     super();
     this.tui = tui;
@@ -1112,6 +1425,7 @@ class BtwOverlayComponent extends Container implements Focusable {
     this.getMode = getMode;
     this.getDebug = getDebug;
     this.getModelInfo = getModelInfo;
+    this.getDisambiguation = getDisambiguation;
     this.onSubmitCallback = onSubmit;
     this.onDismissCallback = onDismiss;
     this.onUnfocusCallback = onUnfocus;
@@ -1196,7 +1510,32 @@ class BtwOverlayComponent extends Container implements Focusable {
     this.tui.requestRender();
   }
 
-  dispose(): void {}
+  private startAnimationIfNeeded(status: string | null): void {
+    if (isActiveStatus(status)) {
+      if (this.activityStartTime === null) {
+        this.activityStartTime = Date.now();
+      }
+      if (!this.animationTimer) {
+        this.animationTimer = setInterval(() => {
+          this.spinnerIndex = (this.spinnerIndex + 1) % SPINNER_FRAMES.length;
+          this.tui.requestRender();
+        }, 120);
+      }
+    } else {
+      this.activityStartTime = null;
+      if (this.animationTimer) {
+        clearInterval(this.animationTimer);
+        this.animationTimer = null;
+      }
+    }
+  }
+
+  dispose(): void {
+    if (this.animationTimer) {
+      clearInterval(this.animationTimer);
+      this.animationTimer = null;
+    }
+  }
 
   handleInput(data: string): void {
     if (matchesBtwFocusShortcut(data)) {
@@ -1286,7 +1625,15 @@ class BtwOverlayComponent extends Container implements Focusable {
     }
 
     lines.push(this.ruleLine(innerWidth));
-    lines.push(this.frameLine(this.theme.fg("warning", this.statusTextValue.trim()), innerWidth));
+    const rawStatus = this.getStatus();
+    this.startAnimationIfNeeded(rawStatus);
+    let displayStatus = this.statusTextValue;
+    if (rawStatus && isActiveStatus(rawStatus)) {
+      const clean = rawStatus.replace(/^⏳\s*/, "");
+      const elapsed = Math.max(0, Math.floor((Date.now() - (this.activityStartTime ?? Date.now())) / 1000));
+      displayStatus = `${SPINNER_FRAMES[this.spinnerIndex]} ${clean} (${elapsed}s)`;
+    }
+    lines.push(this.frameLine(this.theme.fg("warning", displayStatus.trim()), innerWidth));
     lines.push(this.inputFrameLine(dialogWidth));
     lines.push(this.frameLine(this.theme.fg("dim", this.hintsTextValue.trim()), innerWidth));
     lines.push(this.borderLine(innerWidth, "bottom"));
@@ -1320,15 +1667,32 @@ class BtwOverlayComponent extends Container implements Focusable {
     this.summaryText.setText(this.summaryTextValue);
 
     this.transcriptLines = buildOverlayTranscript(entries, this.theme, this.getDebug());
+    const disambiguation = this.getDisambiguation?.();
+    if (disambiguation) {
+      const disambiguationLines = [
+        "",
+        this.theme.fg("accent", this.theme.bold(`Multiple models match "${disambiguation.query}". Select one:`)),
+        ...disambiguation.candidates.map((c: SessionModel, i: number) =>
+          `  ${this.theme.fg("warning", `[${i + 1}]`)} ${formatModelRef(c)}`
+        ),
+        this.theme.fg("dim", `Type 1-${disambiguation.candidates.length} or model name to confirm (or type cancel).`),
+      ];
+      this.transcriptLines = [...this.transcriptLines, ...disambiguationLines];
+    }
     this.transcript.clear();
     for (const line of this.transcriptLines) {
       this.transcript.addChild(new Text(line, 1, 0));
     }
 
-    const status = this.getStatus() ?? "Ready. Enter submits; Escape dismisses without clearing.";
+    const defaultStatus = disambiguation
+      ? `Ambiguous model "${disambiguation.query}". Choose 1-${disambiguation.candidates.length}:`
+      : "Ready. Enter submits; Escape dismisses without clearing.";
+    const status = this.getStatus() ?? defaultStatus;
     this.statusTextValue = status;
     this.statusText.setText(this.statusTextValue);
-    this.hintsTextValue = "PgUp/PgDn/↑↓ scroll · Enter submit · Alt+/ focus · Esc";
+    this.hintsTextValue = disambiguation
+      ? "Enter: confirm choice · Esc: cancel"
+      : "PgUp/PgDn/↑↓ scroll · Enter submit · Alt+/ focus · Esc";
     this.hintsText.setText(this.hintsTextValue);
     this.tui.requestRender();
   }
@@ -1347,6 +1711,8 @@ export default function (pi: ExtensionAPI) {
   let overlayRuntime: OverlayRuntime | null = null;
   let lastUiContext: ExtensionContext | ExtensionCommandContext | null = null;
   let activeBtwSession: BtwSessionRuntime | null = null;
+  let pendingModelDisambiguation: ModelDisambiguationState | null = null;
+  let pendingSessionDispose = false;
 
   function getEffectiveModel(): SessionModel | null {
     return (
@@ -1386,6 +1752,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   function dismissOverlay(): void {
+    pendingModelDisambiguation = null;
     overlayRuntime?.close?.();
     overlayRuntime = null;
   }
@@ -1446,25 +1813,21 @@ export default function (pi: ExtensionAPI) {
     applyTranscriptEvent(transcriptState, event);
 
     if (event.type === "tool_execution_start") {
-      setOverlayStatus(`⏳ running tool: ${event.toolName}`, ctx);
+      setOverlayStatus(`running tool: ${event.toolName}`, ctx);
       return;
     }
 
     if (event.type === "tool_execution_end") {
-      setOverlayStatus(sessionRuntime.session.isStreaming ? `⏳ running tool: ${event.toolName}` : "⏳ thinking...", ctx);
-      return;
-    }
-
-    if (event.type === "turn_end") {
-      setOverlayStatus("⏳ thinking...", ctx);
+      setOverlayStatus("thinking...", ctx);
       return;
     }
 
     if (
-      event.type === "message_start" ||
       event.type === "message_update" ||
       event.type === "message_end" ||
-      event.type === "turn_start"
+      (event as any).type === "turn_end" ||
+      (event as any).type === "turn_start" ||
+      (event as any).type === "message_start"
     ) {
       syncUi(ctx);
     }
@@ -1512,8 +1875,9 @@ export default function (pi: ExtensionAPI) {
     if (btwModelOverride) {
       const auth = await ctx.modelRegistry.getApiKeyAndHeaders(btwModelOverride);
       if (auth.ok) {
+        const normalized = normalizeModelBaseUrl(btwModelOverride, auth.apiKey, ctx.model);
         return {
-          model: btwModelOverride,
+          model: normalized,
           source: "override",
           configuredOverride: btwModelOverride,
         };
@@ -1601,13 +1965,29 @@ export default function (pi: ExtensionAPI) {
     return `BTW thinking: ${settings.thinkingLevel} (${source}).`;
   }
 
-  async function setBtwModelOverride(ctx: ExtensionCommandContext, nextModel: SessionModel | null): Promise<void> {
+  async function setBtwModelOverride(
+    ctx: ExtensionCommandContext,
+    nextModel: SessionModel | null,
+    disposeCurrent = true,
+  ): Promise<void> {
+    if (nextModel) {
+      try {
+        const auth = await ctx.modelRegistry.getApiKeyAndHeaders(nextModel);
+        nextModel = normalizeModelBaseUrl(nextModel, auth.ok ? auth.apiKey : undefined, ctx.model);
+      } catch {
+        nextModel = normalizeModelBaseUrl(nextModel, undefined, ctx.model);
+      }
+    }
     btwModelOverride = nextModel;
     const details: BtwModelOverrideDetails = nextModel
       ? { action: "set", timestamp: Date.now(), provider: nextModel.provider, id: nextModel.id, api: nextModel.api }
       : { action: "clear", timestamp: Date.now() };
     pi.appendEntry(BTW_MODEL_OVERRIDE_TYPE, details);
-    await disposeBtwSession();
+    if (disposeCurrent) {
+      await disposeBtwSession();
+    } else {
+      pendingSessionDispose = true;
+    }
     const settings = await resolveBtwSettings(ctx);
     const message = nextModel
       ? `BTW model override set to ${formatModelRef(nextModel)}.`
@@ -1640,14 +2020,113 @@ export default function (pi: ExtensionAPI) {
       throw new Error(settings.fallbackReason || "No active model selected.");
     }
 
+    const configureBtwTool: ToolDefinition = defineTool({
+      name: "configure_btw",
+      label: "Configure BTW",
+      description:
+        "Change the model or thinking level for this BTW side conversation. Use this when the user asks to switch or change models, or adjust thinking level.",
+      parameters: Type.Object({
+        model: Type.Optional(
+          Type.String({
+            description:
+              "Clean model identifier or query without conversational filler (e.g. 'gemini-3.7-flash', 'gpt-5.6-sol', 'gpt-5.6-luna', 'claude', 'clear')",
+          }),
+        ),
+        thinking: Type.Optional(
+          Type.String({
+            description: "Thinking level: 'off', 'low', 'medium', 'high', 'xhigh', 'max', or 'clear'",
+          }),
+        ),
+      }),
+      execute: async (_toolCallId, params) => {
+        const changes: string[] = [];
+
+        if (params.thinking !== undefined) {
+          const t = params.thinking.trim().toLowerCase();
+          if (t === "clear") {
+            await setBtwThinkingOverride(ctx, null);
+            changes.push("cleared thinking override (now inherits main thread)");
+          } else if (["off", "low", "medium", "high", "xhigh", "max"].includes(t)) {
+            await setBtwThinkingOverride(ctx, t as SessionThinkingLevel);
+            changes.push(`set thinking level to ${t}`);
+          } else {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Invalid thinking level "${params.thinking}". Valid levels: off, low, medium, high, max, clear.`,
+                },
+              ],
+              details: {},
+              isError: true,
+            };
+          }
+        }
+
+        if (params.model !== undefined) {
+          const m = params.model.trim();
+          if (m.toLowerCase() === "clear") {
+            setOverlayStatus("clearing model override...", ctx);
+            await setBtwModelOverride(ctx, null, false);
+            changes.push("cleared model override (now inherits main thread)");
+          } else {
+            setOverlayStatus(`resolving model "${m}"...`, ctx);
+            const res = await resolveBtwModelQuery(ctx, m);
+            if (res.status === "resolved") {
+              setOverlayStatus(`switching model to ${formatModelRef(res.model)}...`, ctx);
+              await setBtwModelOverride(ctx, res.model, false);
+              changes.push(`set model to ${formatModelRef(res.model)}`);
+            } else if (res.status === "ambiguous") {
+              const list = res.candidates.map((c: SessionModel, i: number) => `${i + 1}) ${formatModelRef(c)}`).join("\n");
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: `Multiple models match "${m}":\n${list}\nPlease ask the user to clarify which provider/model they prefer.`,
+                  },
+                ],
+                details: {},
+              };
+            } else {
+              return {
+                content: [{ type: "text", text: res.error }],
+                details: {},
+                isError: true,
+              };
+            }
+          }
+        }
+
+        if (changes.length === 0) {
+          return {
+            content: [{ type: "text", text: "No changes requested. Provide 'model' or 'thinking'." }],
+            details: {},
+          };
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Successfully ${changes.join(" and ")}. Changes will take effect on the next prompt.`,
+            },
+          ],
+          details: {},
+        };
+      },
+    });
+
+    const identityPrompt = `You are currently running as model ${formatModelRef(settings.model)} with thinking level ${settings.thinkingLevel}.`;
+
     const { session } = await createAgentSession({
       sessionManager: SessionManager.inMemory(),
       model: settings.model,
       modelRegistry: ctx.modelRegistry as AgentSession["modelRegistry"],
       thinkingLevel: settings.thinkingLevel,
-      // Match pi's default coding-agent toolset (read/bash/edit/write).
-      tools: ["read", "bash", "edit", "write"],
-      resourceLoader: createBtwResourceLoader(ctx),
+      // Match pi's default coding-agent toolset (read/bash/edit/write) plus configure_btw.
+      tools: ["read", "bash", "edit", "write", "configure_btw"],
+      customTools: [configureBtwTool],
+      resourceLoader: createBtwResourceLoader(ctx, [BTW_SYSTEM_PROMPT, identityPrompt]),
     });
 
     const { messages: seedMessages, sideThreadStartIndex } = buildBtwSeedState(ctx, pendingThread, mode, settings.model);
@@ -1730,6 +2209,7 @@ export default function (pi: ExtensionAPI) {
               overlayRuntime?.handle?.unfocus();
               overlayRuntime?.refresh?.();
             },
+            () => pendingModelDisambiguation,
           );
 
           overlay.focused = runtime.handle?.isFocused() ?? true;
@@ -1794,12 +2274,59 @@ export default function (pi: ExtensionAPI) {
     syncUi(ctx);
   }
 
+  async function applyModelAndThinkingFlags(
+    ctx: ExtensionCommandContext,
+    modelQuery: string | undefined,
+    thinkingLevel: SessionThinkingLevel | undefined,
+    pendingQuestion: string | undefined,
+    save: boolean,
+    mode: BtwThreadMode,
+  ): Promise<{ proceed: boolean }> {
+    if (thinkingLevel) {
+      await setBtwThinkingOverride(ctx, (thinkingLevel as string) === "clear" ? null : thinkingLevel);
+    }
+
+    if (modelQuery) {
+      if (modelQuery.toLowerCase() === "clear") {
+        await setBtwModelOverride(ctx, null);
+      } else {
+        const res = await resolveBtwModelQuery(ctx, modelQuery);
+        if (res.status === "not_found") {
+          setOverlayStatus(res.error, ctx);
+          notify(ctx, res.error, "error");
+          await ensureOverlay(ctx);
+          return { proceed: false };
+        }
+        if (res.status === "ambiguous") {
+          pendingModelDisambiguation = {
+            query: modelQuery,
+            candidates: res.candidates,
+            pendingQuestion,
+            save,
+            mode,
+          };
+          setOverlayStatus(`Multiple models match "${modelQuery}". Choose one below.`, ctx);
+          await ensureOverlay(ctx);
+          return { proceed: false };
+        }
+        await setBtwModelOverride(ctx, res.model);
+      }
+    }
+
+    return { proceed: true };
+  }
+
   async function dispatchBtwCommand(name: string, args: string, ctx: ExtensionCommandContext): Promise<boolean> {
     const trimmedArgs = args.trim();
 
     if (name === "btw") {
       debugMode = false;
-      const { question, save } = parseBtwArgs(trimmedArgs);
+      const { question, save, modelQuery, thinkingLevel } = parseBtwArgs(trimmedArgs);
+      const flagResult = await applyModelAndThinkingFlags(ctx, modelQuery, thinkingLevel, question || undefined, save, "contextual");
+      if (!flagResult.proceed) {
+        return true;
+      }
+
       if (!question) {
         await ensureBtwSession(ctx, pendingMode);
         await ensureOverlay(ctx);
@@ -1832,7 +2359,12 @@ export default function (pi: ExtensionAPI) {
       }
 
       debugMode = true;
-      const { question, save } = parseBtwArgs(trimmedArgs);
+      const { question, save, modelQuery, thinkingLevel } = parseBtwArgs(trimmedArgs);
+      const flagResult = await applyModelAndThinkingFlags(ctx, modelQuery, thinkingLevel, question || undefined, save, pendingMode);
+      if (!flagResult.proceed) {
+        return true;
+      }
+
       if (!question) {
         await ensureBtwSession(ctx, pendingMode);
         setOverlayStatus("BTW debug view enabled.", ctx);
@@ -1847,9 +2379,14 @@ export default function (pi: ExtensionAPI) {
 
     if (name === "btw:tangent") {
       debugMode = false;
-      const { question, save } = parseBtwArgs(trimmedArgs);
+      const { question, save, modelQuery, thinkingLevel } = parseBtwArgs(trimmedArgs);
       if (pendingMode !== "tangent") {
         await resetThread(ctx, true, "tangent");
+      }
+
+      const flagResult = await applyModelAndThinkingFlags(ctx, modelQuery, thinkingLevel, question || undefined, save, "tangent");
+      if (!flagResult.proceed) {
+        return true;
       }
 
       if (!question) {
@@ -1865,7 +2402,12 @@ export default function (pi: ExtensionAPI) {
     if (name === "btw:new") {
       debugMode = false;
       await resetThread(ctx, true, "contextual");
-      const { question, save } = parseBtwArgs(trimmedArgs);
+      const { question, save, modelQuery, thinkingLevel } = parseBtwArgs(trimmedArgs);
+      const flagResult = await applyModelAndThinkingFlags(ctx, modelQuery, thinkingLevel, question || undefined, save, "contextual");
+      if (!flagResult.proceed) {
+        return true;
+      }
+
       if (question) {
         await runBtw(ctx, question, save, "contextual");
       } else {
@@ -1882,38 +2424,6 @@ export default function (pi: ExtensionAPI) {
       await resetThread(ctx);
       dismissOverlay();
       notify(ctx, "Cleared BTW thread.", "info");
-      return true;
-    }
-
-    if (name === "btw:model") {
-      const parsed = parseBtwModelArgs(trimmedArgs);
-      if (parsed.action === "invalid") {
-        setOverlayStatus(parsed.message, ctx);
-        notify(ctx, parsed.message, "error");
-        return true;
-      }
-
-      if (parsed.action === "show") {
-        const settings = await resolveBtwSettings(ctx);
-        const message = describeResolvedModel(settings);
-        setOverlayStatus(message, ctx);
-        notify(ctx, message, settings.model ? "info" : "warning");
-        return true;
-      }
-
-      if (parsed.action === "clear") {
-        await setBtwModelOverride(ctx, null);
-        return true;
-      }
-      const ref = parsed.model;
-      const resolved = ctx.modelRegistry.find(ref.provider, ref.id);
-      if (!resolved) {
-        const message = `Unknown model ${ref.provider}/${ref.id}. Use /login or /models to add it before setting it as the BTW override.`;
-        setOverlayStatus(message, ctx);
-        notify(ctx, message, "error");
-        return true;
-      }
-      await setBtwModelOverride(ctx, resolved);
       return true;
     }
 
@@ -2024,7 +2534,7 @@ export default function (pi: ExtensionAPI) {
   function parseOverlayBtwCommand(value: string): { name: string; args: string; bare: boolean } | null {
     const trimmed = value.trim();
     const match = trimmed.match(
-      /^\/(?:btw:(new|tangent|clear|inject|summarize|model|thinking|debug|copy|sync)|btw\b|(new|tangent|clear|inject|summarize|model|thinking|debug|copy|sync)\b)(?:\s+(.*))?$/i,
+      /^\/(?:btw:(new|tangent|clear|inject|summarize|thinking|debug|copy|sync)|btw\b|(new|tangent|clear|inject|summarize|thinking|debug|copy|sync)\b)(?:\s+(.*))?$/i,
     );
     if (!match) {
       return null;
@@ -2040,6 +2550,33 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
+function parseModelSwitchIntent(text: string): { modelQuery?: string; thinking?: SessionThinkingLevel } | null {
+  const t = text.trim();
+
+  const thinkMatch = t.match(
+    /^(?:(?:can you\s+)?(?:set|change|turn|switch)\s+(?:the\s+)?thinking(?:\s+level)?(?:\s+to)?\s+|(?:thinking(?:\s+level)?(?:\s*[:=]\s*|\s+)))(off|low|medium|high|xhigh|max|clear)(?:\s+please)?$/i,
+  );
+  if (thinkMatch) {
+    return { thinking: thinkMatch[1].toLowerCase() as SessionThinkingLevel };
+  }
+
+  const modelMatch = t.match(
+    /^(?:can you\s+)?(?:please\s+)?(?:use|switch(?:\s+model)?(?:\s+to)?|change(?:\s+model)?(?:\s+to)?|set\s+model\s+to)\s+(?:the\s+)?(.+?)(?:\s+model)?(?:\s+please)?$/i,
+  );
+  if (modelMatch) {
+    const raw = modelMatch[1].trim();
+    const withThinking = raw.match(
+      /^(.+?)\s+(?:with|and)\s+(?:thinking\s+(?:level\s+)?(?:to\s+)?)?(off|low|medium|high|xhigh|max|clear)$/i,
+    );
+    if (withThinking) {
+      return { modelQuery: withThinking[1].trim(), thinking: withThinking[2].toLowerCase() as SessionThinkingLevel };
+    }
+    return { modelQuery: raw };
+  }
+
+  return null;
+}
+
   async function submitFromOverlay(ctx: ExtensionCommandContext | ExtensionContext, value: string): Promise<void> {
     const question = value.trim();
     if (!question) {
@@ -2053,6 +2590,122 @@ export default function (pi: ExtensionAPI) {
     }
 
     const cmdCtx = ctx as ExtensionCommandContext;
+
+    if (pendingModelDisambiguation) {
+      setOverlayDraft("");
+      const input = question.toLowerCase();
+      if (input === "cancel" || input === "/clear") {
+        pendingModelDisambiguation = null;
+        setOverlayStatus("Model selection cancelled.", cmdCtx);
+        syncUi(cmdCtx);
+        return;
+      }
+
+      const num = parseInt(input, 10);
+      let chosen: SessionModel | undefined;
+      if (!isNaN(num) && num >= 1 && num <= pendingModelDisambiguation.candidates.length) {
+        chosen = pendingModelDisambiguation.candidates[num - 1];
+      } else {
+        chosen = pendingModelDisambiguation.candidates.find(
+          (c: SessionModel) =>
+            c.id.toLowerCase() === input ||
+            `${c.provider}/${c.id}`.toLowerCase() === input ||
+            c.provider.toLowerCase() === input,
+        );
+      }
+
+      if (!chosen) {
+        setOverlayStatus(
+          `Invalid selection. Enter 1-${pendingModelDisambiguation.candidates.length} or type cancel.`,
+          cmdCtx,
+        );
+        syncUi(cmdCtx);
+        return;
+      }
+
+      const saved = pendingModelDisambiguation;
+      pendingModelDisambiguation = null;
+      await setBtwModelOverride(cmdCtx, chosen);
+
+      if (saved.pendingQuestion) {
+        setOverlayStatus("⏳ thinking...", cmdCtx);
+        syncUi(cmdCtx);
+        await runBtw(cmdCtx, saved.pendingQuestion, saved.save, saved.mode);
+      } else {
+        setOverlayStatus(`BTW model set to ${formatModelRef(chosen)}.`, cmdCtx);
+        syncUi(cmdCtx);
+      }
+      return;
+    }
+
+    // Allow flags like --model or -m or --thinking or -t directly in the overlay composer
+    if (/^(?:--model|-m\s|--thinking|-t\s)/i.test(question)) {
+      setOverlayDraft("");
+      await dispatchBtwCommand("btw", question, cmdCtx);
+      return;
+    }
+
+    // Direct conversational model or thinking switch intent (instant local execution)
+    const switchIntent = parseModelSwitchIntent(question);
+    if (switchIntent) {
+      if (switchIntent.thinking && !switchIntent.modelQuery) {
+        setOverlayDraft("");
+        await setBtwThinkingOverride(cmdCtx, (switchIntent.thinking as string) === "clear" ? null : switchIntent.thinking);
+        const settings = await resolveBtwSettings(cmdCtx);
+        appendPersistedTranscriptTurn(transcriptState, {
+          question,
+          thinking: "",
+          answer: `Switched BTW thinking level to \`${settings.thinkingLevel}\`.`,
+          provider: settings.model?.provider ?? "unknown",
+          model: settings.model?.id ?? "unknown",
+          api: settings.model?.api ?? "openai-responses",
+          thinkingLevel: settings.thinkingLevel,
+          timestamp: Date.now(),
+        });
+        setOverlayStatus("Ready for a follow-up.", cmdCtx);
+        syncUi(cmdCtx);
+        return;
+      }
+
+      if (switchIntent.modelQuery) {
+        const res = await resolveBtwModelQuery(cmdCtx, switchIntent.modelQuery);
+        if (res.status === "resolved") {
+          setOverlayDraft("");
+          await setBtwModelOverride(cmdCtx, res.model);
+          if (switchIntent.thinking) {
+            await setBtwThinkingOverride(cmdCtx, (switchIntent.thinking as string) === "clear" ? null : switchIntent.thinking);
+          }
+          const settings = await resolveBtwSettings(cmdCtx);
+          appendPersistedTranscriptTurn(transcriptState, {
+            question,
+            thinking: "",
+            answer: `Switched BTW model to \`${formatModelRef(res.model)}\`. It will take effect on your next message.`,
+            provider: res.model.provider,
+            model: res.model.id,
+            api: res.model.api,
+            thinkingLevel: settings.thinkingLevel,
+            timestamp: Date.now(),
+          });
+          setOverlayStatus("Ready for a follow-up.", cmdCtx);
+          syncUi(cmdCtx);
+          return;
+        }
+
+        if (res.status === "ambiguous") {
+          setOverlayDraft("");
+          pendingModelDisambiguation = {
+            query: switchIntent.modelQuery,
+            candidates: res.candidates,
+            save: false,
+            mode: pendingMode,
+          };
+          setOverlayStatus(`Multiple models match "${switchIntent.modelQuery}". Choose one below.`, cmdCtx);
+          syncUi(cmdCtx);
+          return;
+        }
+      }
+    }
+
     const btwCommand = parseOverlayBtwCommand(question);
     if (btwCommand) {
       setOverlayDraft("");
@@ -2080,6 +2733,7 @@ export default function (pi: ExtensionAPI) {
     await disposeBtwSession();
     pendingThread = [];
     pendingMode = mode;
+    pendingModelDisambiguation = null;
     debugMode = false;
     transcriptState = createEmptyTranscriptState();
     setOverlayDraft("");
@@ -2255,6 +2909,10 @@ export default function (pi: ExtensionAPI) {
       notify(ctx, errorMessage, "error");
       await disposeBtwSession();
     } finally {
+      if (pendingSessionDispose) {
+        pendingSessionDispose = false;
+        await disposeBtwSession();
+      }
       syncUi(ctx);
     }
   }
@@ -2447,13 +3105,6 @@ export default function (pi: ExtensionAPI) {
     description: "Summarize the BTW thread, then inject the summary into the main agent.",
     handler: async (args, ctx) => {
       await dispatchBtwCommand("btw:summarize", args, ctx);
-    },
-  });
-
-  pi.registerCommand("btw:model", {
-    description: "Show, set, or clear the BTW-only model override.",
-    handler: async (args, ctx) => {
-      await dispatchBtwCommand("btw:model", args, ctx);
     },
   });
 

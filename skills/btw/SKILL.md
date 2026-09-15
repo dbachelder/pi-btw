@@ -21,16 +21,13 @@ Prefer the BTW workflow when the user wants to:
 Use these commands in your guidance to the user:
 
 ```text
-/btw <question>
-/btw --save <question>
-/btw:new [question]
-/btw:tangent <question>
-/btw:tangent --save <question>
+/btw [--model <m>] [--thinking <t>] [--save] <question>
+/btw:new [--model <m>] [--thinking <t>] [--save] [question]
+/btw:tangent [--model <m>] [--thinking <t>] [--save] <question>
 /btw:debug [on | off | <question>]
 /btw:copy
 /btw:sync
 /btw:clear
-/btw:model [<provider> <model> <api> | clear]
 /btw:thinking [<level> | clear]
 /btw:inject [instructions]
 /btw:summarize [instructions]
@@ -133,11 +130,20 @@ Use this when the thread is long and only the distilled outcome should go back i
 Recommend:
 
 ```text
-/btw:model <provider> <model> <api>
-/btw:thinking <level>
+/btw --model <name> --thinking <level> <question>
 ```
 
-Use these when the main thread should keep its current model or thinking level, but BTW should run with a different cost/speed profile.
+Or adjust it directly inside the BTW popup window using natural language:
+
+```text
+"switch to gpt-5-mini with low thinking"
+```
+
+Use these when the main thread should keep its current model or thinking level,
+but BTW should run with a different cost/speed profile. Model queries support
+fuzzy search and provider aliases (e.g. `copilot/gpt-5.4`, `gpt-5-mini`,
+`claude`). If a query is ambiguous across authenticated providers, the popup
+prompts you to pick one.
 
 ### To view thinking and tool executions
 
@@ -164,7 +170,7 @@ details. Subsequent `/btw` invocations automatically switch debug mode back off.
 - Prefer `/btw:inject` when precise wording, detailed tradeoffs, or a full plan matters.
 - Suggest `/btw:new` before starting a totally unrelated side topic when main-session context is still useful.
 - Suggest `/btw:clear` when the widget/thread should be dismissed.
-- Suggest `/btw:model` or `/btw:thinking` when the user wants BTW to be cheaper, faster, or less deliberative than the main thread.
+- Suggest `--model` or `--thinking` flags (or natural language in the popup) when the user wants BTW to be cheaper, faster, or less deliberative than the main thread.
 
 ## Response style
 
@@ -203,6 +209,5 @@ When helping the user use BTW:
 ### Example: make BTW cheaper than the main thread
 
 ```text
-/btw:model openai gpt-5-mini openai-responses
-/btw:thinking low
+/btw --model gpt-5-mini --thinking low what are the risks of this change?
 ```
