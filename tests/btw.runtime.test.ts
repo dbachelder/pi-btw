@@ -472,6 +472,7 @@ function createHarness(
       bold: (text: string) => string;
     };
     keybindingMatches?: (data: string, id: string) => boolean;
+    tuiMode?: "regular" | "fullscreen";
   } = {},
 ) {
   const commands = new Map<string, RegisteredCommand>();
@@ -488,6 +489,7 @@ function createHarness(
   const tui = {
     requestRender: vi.fn(),
     terminal: { write: (data: string) => terminalWrites.push(data) },
+    mode: options.tuiMode,
   };
   const theme = options.theme ?? {
     fg: (_name: string, text: string) => text,
@@ -536,13 +538,17 @@ function createHarness(
     },
     custom: async (factory: any, options?: any) => {
       let done!: (result: unknown) => void;
+      let component: any;
       const resultPromise = new Promise((resolve) => {
-        done = (result: unknown) => resolve(result);
+        done = (result: unknown) => {
+          component?.dispose?.();
+          resolve(result);
+        };
       });
       const handle = new FakeOverlayHandle();
       overlayHandles.push(handle);
       options?.onHandle?.(handle);
-      const component = await factory(tui as any, theme as any, keybindings as any, done);
+      component = await factory(tui as any, theme as any, keybindings as any, done);
       overlays.push({ factoryOptions: options, done, component });
       return resultPromise;
     },
@@ -1654,8 +1660,8 @@ describe("btw runtime behavior", () => {
     expect(harness.widgets.some((entry) => entry.key === "btw" && typeof entry.content === "function")).toBe(false);
   });
 
-  it("does not change Pi-owned terminal mouse reporting when the overlay opens or closes", async () => {
-    const harness = createHarness();
+  it("does not change Pi-owned terminal mouse reporting in fullscreen mode", async () => {
+    const harness = createHarness([], { tuiMode: "fullscreen" });
 
     await harness.runSessionStart();
     await harness.command("btw", "");
@@ -1666,6 +1672,26 @@ describe("btw runtime behavior", () => {
 
     expect(harness.terminalWrites).toEqual([]);
   });
+
+  for (const tuiMode of [undefined, "regular"] as const) {
+    it(`balances BTW-owned terminal mouse reporting in ${tuiMode ?? "legacy"} mode`, async () => {
+      const harness = createHarness([], { tuiMode });
+
+      await harness.runSessionStart();
+      await harness.command("btw", "");
+
+      expect(harness.terminalWrites).toEqual(["\x1b[?1000h\x1b[?1006h"]);
+
+      const overlay = harness.latestOverlayComponent();
+      overlay.input.onEscape?.();
+      await flushAsyncWork();
+
+      expect(harness.terminalWrites).toEqual([
+        "\x1b[?1000h\x1b[?1006h",
+        "\x1b[?1000l\x1b[?1006l",
+      ]);
+    });
+  }
 
   it("toggles BTW overlay focus with the registered focus shortcuts without closing it", async () => {
     const harness = createHarness();

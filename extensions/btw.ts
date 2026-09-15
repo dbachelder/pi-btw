@@ -1120,6 +1120,8 @@ function buildTranscriptBadge(
   return theme.bg(background, theme.fg(foreground, theme.bold(` ${label} `)));
 }
 
+type BtwTui = TUI & { mode?: "regular" | "fullscreen" };
+
 class BtwOverlayComponent extends Container implements Focusable {
   private readonly input: Input;
   private readonly transcript: Container;
@@ -1135,6 +1137,7 @@ class BtwOverlayComponent extends Container implements Focusable {
   private readonly onUnfocusCallback: () => void;
   private readonly tui: TUI;
   private readonly theme: ExtensionContext["ui"]["theme"];
+  private readonly managesMouseReporting: boolean;
   private transcriptLines: string[] = [];
   private transcriptScrollOffset = 0;
   private transcriptViewportHeight = 8;
@@ -1168,6 +1171,9 @@ class BtwOverlayComponent extends Container implements Focusable {
     super();
     this.tui = tui;
     this.theme = theme;
+    // Fullscreen Pi owns mouse reporting for the entire terminal session. Regular
+    // and legacy TUI hosts do not, so BTW must manage it while the overlay exists.
+    this.managesMouseReporting = (tui as BtwTui).mode !== "fullscreen";
     this.readTranscriptEntries = readTranscriptEntries;
     this.getStatus = getStatus;
     this.getMode = getMode;
@@ -1190,6 +1196,10 @@ class BtwOverlayComponent extends Container implements Focusable {
     };
 
     this.hintsText = new Text("", 1, 0);
+
+    if (this.managesMouseReporting) {
+      this.tui.terminal?.write?.("\x1b[?1000h\x1b[?1006h");
+    }
 
     const originalHandleInput = this.input.handleInput.bind(this.input);
     this.input.handleInput = (data: string) => {
@@ -1255,7 +1265,12 @@ class BtwOverlayComponent extends Container implements Focusable {
     this.tui.requestRender();
   }
 
-  // Pi owns terminal mouse modes; consume only mouse events delivered by the host.
+  dispose(): void {
+    if (this.managesMouseReporting) {
+      this.tui.terminal?.write?.("\x1b[?1000l\x1b[?1006l");
+    }
+  }
+
   private getMouseScrollDelta(data: string): number | null {
     const match = data.match(/^\x1b\[<(\d+);\d+;\d+[Mm]$/);
     if (!match) {
