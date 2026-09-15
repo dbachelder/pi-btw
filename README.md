@@ -79,7 +79,8 @@ pi install /absolute/path/to/pi-btw
 
 - `Alt+/` toggles focus between BTW and the main editor without closing the overlay
 - `Ctrl+Alt+W` is a fallback focus toggle for terminals that do not deliver `Alt+/` as a usable shortcut
-- `Esc` still dismisses BTW immediately while the overlay is focused
+- while BTW is streaming, the first `Esc` aborts the request and keeps its partial transcript visible; press `Esc` again to dismiss
+- while BTW is idle, `Esc` dismisses the overlay immediately
 - BTW now opens top-centered so the main session remains visible underneath it
 
 ### `/btw:new [question]`
