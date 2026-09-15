@@ -204,6 +204,8 @@ type BtwResourceLoader = Pick<
   | "reload"
 >;
 
+type BtwHostContext = { mode?: "tui" | "rpc" | "print" };
+
 type OverlayRuntime = {
   handle?: OverlayHandle;
   refresh?: () => void;
@@ -1128,6 +1130,24 @@ function saveVisibleBtwNote(
   return "saved";
 }
 
+function canRenderBtwOverlay(ctx: ExtensionContext | ExtensionCommandContext): boolean {
+  const mode = (ctx as ExtensionContext & BtwHostContext).mode;
+  if (mode !== undefined) {
+    return ctx.hasUI && mode === "tui";
+  }
+
+  // Pi 0.74 does not expose ctx.mode. In that runtime RPC uses a non-TTY
+  // stdout while the interactive host has a real terminal.
+  return ctx.hasUI && process.stdout.isTTY === true;
+}
+
+function notifyInlineQuestionRequired(
+  ctx: ExtensionCommandContext,
+  command: "/btw" | "/btw:tangent" | "/btw:new",
+): void {
+  notify(ctx, `${command} cannot open its composer outside Pi's TUI. Pass the question inline instead.`, "warning");
+}
+
 function notify(ctx: ExtensionContext | ExtensionCommandContext, message: string, level: "info" | "warning" | "error"): void {
   if (ctx.hasUI) {
     ctx.ui.notify(message, level);
@@ -1779,7 +1799,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function ensureOverlay(ctx: ExtensionCommandContext | ExtensionContext): Promise<void> {
-    if (!ctx.hasUI) {
+    if (!canRenderBtwOverlay(ctx)) {
       return;
     }
     lastUiContext = ctx;
@@ -1889,6 +1909,10 @@ export default function (pi: ExtensionAPI) {
     if (name === "btw") {
       const { question, save } = parseBtwArgs(trimmedArgs);
       if (!question) {
+        if (!canRenderBtwOverlay(ctx)) {
+          notifyInlineQuestionRequired(ctx, "/btw");
+          return true;
+        }
         await ensureBtwSession(ctx, pendingMode);
         await ensureOverlay(ctx);
         return true;
@@ -1904,6 +1928,10 @@ export default function (pi: ExtensionAPI) {
 
     if (name === "btw:tangent") {
       const { question, save } = parseBtwArgs(trimmedArgs);
+      if (!question && !canRenderBtwOverlay(ctx)) {
+        notifyInlineQuestionRequired(ctx, "/btw:tangent");
+        return true;
+      }
       if (pendingMode !== "tangent") {
         await resetThread(ctx, true, "tangent");
       }
@@ -1919,8 +1947,13 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (name === "btw:new") {
-      await resetThread(ctx, true, "contextual");
       const { question, save } = parseBtwArgs(trimmedArgs);
+      if (!question && !canRenderBtwOverlay(ctx)) {
+        notifyInlineQuestionRequired(ctx, "/btw:new");
+        return true;
+      }
+
+      await resetThread(ctx, true, "contextual");
       if (question) {
         await runBtw(ctx, question, save, "contextual");
       } else {
@@ -2205,6 +2238,7 @@ export default function (pi: ExtensionAPI) {
 
     const session = sessionRuntime.session;
     const wasBusy = !ctx.isIdle();
+    const overlayAvailable = canRenderBtwOverlay(ctx);
     pendingMode = mode;
     const thinkingLevel = settings.thinkingLevel;
 
@@ -2248,8 +2282,15 @@ export default function (pi: ExtensionAPI) {
       pendingThread.push(details);
       pi.appendEntry(BTW_ENTRY_TYPE, details);
 
-      const saveState = saveVisibleBtwNote(pi, details, saveRequested, wasBusy);
-      if (saveState === "saved") {
+      const saveState = saveVisibleBtwNote(pi, details, saveRequested || !overlayAvailable, wasBusy);
+      if (!overlayAvailable) {
+        const message =
+          saveState === "queued"
+            ? "BTW response queued to display after the current turn finishes."
+            : "Displayed BTW response in the session.";
+        notify(ctx, message, "info");
+        setOverlayStatus(message, ctx);
+      } else if (saveState === "saved") {
         notify(ctx, "Saved BTW note to the session.", "info");
         setOverlayStatus("Saved BTW note to the session.", ctx);
       } else if (saveState === "queued") {
