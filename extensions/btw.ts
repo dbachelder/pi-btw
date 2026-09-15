@@ -119,8 +119,10 @@ type ResolvedBtwSettings = {
   fallbackReason?: string;
 };
 
+type BtwTurnOutcome = "completed" | "aborted" | "failed";
+
 type BtwTranscriptEntry =
-  | { id: number; turnId: number; type: "turn-boundary"; phase: "start" | "end" }
+  | { id: number; turnId: number; type: "turn-boundary"; phase: "start" | "end"; outcome?: BtwTurnOutcome }
   | { id: number; turnId: number; type: "user-message"; text: string }
   | { id: number; turnId: number; type: "thinking"; text: string; streaming: boolean }
   | { id: number; turnId: number; type: "assistant-text"; text: string; streaming: boolean }
@@ -153,6 +155,8 @@ type BtwSessionRuntime = {
   mode: BtwThreadMode;
   subscriptions: Set<() => void>;
   sideThreadStartIndex: number;
+  abortPromise?: Promise<void>;
+  promptQueue: Promise<void>;
 };
 
 type BtwModelRuntime = {
@@ -553,17 +557,29 @@ function ensureTranscriptTurn(state: BtwTranscriptState): number {
   return turnId;
 }
 
-function finishTranscriptTurn(state: BtwTranscriptState, turnId?: number | null): void {
+function finishTranscriptTurn(
+  state: BtwTranscriptState,
+  turnId?: number | null,
+  outcome: BtwTurnOutcome = "completed",
+): void {
   const resolvedTurnId = turnId ?? state.currentTurnId;
   if (resolvedTurnId === null || resolvedTurnId === undefined) {
     return;
   }
 
-  const hasEndBoundary = state.entries.some(
-    (entry) => entry.turnId === resolvedTurnId && entry.type === "turn-boundary" && entry.phase === "end",
+  const endBoundary = state.entries.find(
+    (entry): entry is Extract<BtwTranscriptEntry, { type: "turn-boundary" }> =>
+      entry.turnId === resolvedTurnId && entry.type === "turn-boundary" && entry.phase === "end",
   );
-  if (!hasEndBoundary) {
-    appendTranscriptEntry(state, { type: "turn-boundary", turnId: resolvedTurnId, phase: "end" } as Omit<Extract<BtwTranscriptEntry, { type: "turn-boundary" }>, "id">);
+  if (endBoundary) {
+    endBoundary.outcome = outcome;
+  } else {
+    appendTranscriptEntry(state, {
+      type: "turn-boundary",
+      turnId: resolvedTurnId,
+      phase: "end",
+      outcome,
+    } as Omit<Extract<BtwTranscriptEntry, { type: "turn-boundary" }>, "id">);
   }
 
   for (const entry of state.entries) {
@@ -579,26 +595,6 @@ function finishTranscriptTurn(state: BtwTranscriptState, turnId?: number | null)
   state.lastTurnId = resolvedTurnId;
   if (state.currentTurnId === resolvedTurnId) {
     state.currentTurnId = null;
-  }
-}
-
-function removeTranscriptTurn(state: BtwTranscriptState, turnId: number | null): void {
-  if (turnId === null) {
-    return;
-  }
-
-  state.entries = state.entries.filter((entry) => entry.turnId !== turnId);
-  for (const [toolCallId, toolCall] of state.toolCalls.entries()) {
-    if (toolCall.turnId === turnId) {
-      state.toolCalls.delete(toolCallId);
-    }
-  }
-
-  if (state.currentTurnId === turnId) {
-    state.currentTurnId = null;
-  }
-  if (state.lastTurnId === turnId) {
-    state.lastTurnId = null;
   }
 }
 
@@ -884,7 +880,10 @@ function applyTranscriptEvent(state: BtwTranscriptState, event: AgentSessionEven
       return;
     }
     case "turn_end": {
-      finishTranscriptTurn(state);
+      const stopReason = event.message.role === "assistant" ? event.message.stopReason : "stop";
+      const outcome: BtwTurnOutcome =
+        stopReason === "aborted" ? "aborted" : stopReason === "error" ? "failed" : "completed";
+      finishTranscriptTurn(state, undefined, outcome);
       return;
     }
     default:
@@ -905,7 +904,7 @@ function appendPersistedTranscriptTurn(state: BtwTranscriptState, details: BtwDe
 function setTranscriptFailure(state: BtwTranscriptState, message: string): void {
   const turnId = state.currentTurnId ?? state.lastTurnId ?? ensureTranscriptTurn(state);
   upsertTranscriptTextEntry(state, turnId, "assistant-text", `❌ ${message}`, false);
-  finishTranscriptTurn(state, turnId);
+  finishTranscriptTurn(state, turnId, "failed");
 }
 
 function hasStreamingTranscriptEntry(entries: BtwTranscript): boolean {
@@ -917,7 +916,18 @@ function hasStreamingTranscriptEntry(entries: BtwTranscript): boolean {
 }
 
 function getCompletedExchangeCount(entries: BtwTranscript): number {
-  return entries.filter((entry) => entry.type === "assistant-text" && !entry.streaming).length;
+  const completedTurnIds = new Set(
+    entries.flatMap((entry) =>
+      entry.type === "turn-boundary" &&
+      entry.phase === "end" &&
+      (entry.outcome === undefined || entry.outcome === "completed")
+        ? [entry.turnId]
+        : [],
+    ),
+  );
+  return entries.filter(
+    (entry) => entry.type === "assistant-text" && !entry.streaming && completedTurnIds.has(entry.turnId),
+  ).length;
 }
 
 function buildOverlayTranscript(
@@ -1090,18 +1100,18 @@ function extractBtwHandoffThread(sessionRuntime: BtwSessionRuntime): BtwHandoffE
   const exchanges: BtwHandoffExchange[] = [];
   let currentUser = "";
   let currentAssistant = "";
+  let excludeCurrent = false;
 
   const pushCurrent = () => {
-    if (!currentUser && !currentAssistant) {
-      return;
+    if (!excludeCurrent && (currentUser || currentAssistant)) {
+      exchanges.push({
+        user: currentUser.trim() || "(No user prompt)",
+        assistant: currentAssistant.trim() || "(No assistant response)",
+      });
     }
-
-    exchanges.push({
-      user: currentUser.trim() || "(No user prompt)",
-      assistant: currentAssistant.trim() || "(No assistant response)",
-    });
     currentUser = "";
     currentAssistant = "";
+    excludeCurrent = false;
   };
 
   for (const message of threadMessages) {
@@ -1109,18 +1119,25 @@ function extractBtwHandoffThread(sessionRuntime: BtwSessionRuntime): BtwHandoffE
       continue;
     }
 
-    const text = extractMessageText(message).trim();
-    if (!text) {
-      continue;
-    }
-
     if (message.role === "user") {
+      const text = extractMessageText(message).trim();
+      if (!text) {
+        continue;
+      }
       pushCurrent();
       currentUser = text;
       continue;
     }
 
-    currentAssistant = currentAssistant ? `${currentAssistant}\n\n${text}` : text;
+    if (message.stopReason === "aborted" || message.stopReason === "error") {
+      excludeCurrent = true;
+      continue;
+    }
+
+    const text = extractMessageText(message).trim();
+    if (text) {
+      currentAssistant = currentAssistant ? `${currentAssistant}\n\n${text}` : text;
+    }
   }
 
   pushCurrent();
@@ -1527,6 +1544,12 @@ export default function (pi: ExtensionAPI) {
   let overlayRuntime: OverlayRuntime | null = null;
   let lastUiContext: ExtensionContext | ExtensionCommandContext | null = null;
   let activeBtwSession: BtwSessionRuntime | null = null;
+  let btwLifecycleGeneration = 0;
+  let btwSubmissionQueue = Promise.resolve();
+
+  function invalidateBtwLifecycle(): void {
+    btwLifecycleGeneration += 1;
+  }
 
   function syncUi(ctx?: ExtensionContext | ExtensionCommandContext): void {
     const activeCtx = ctx ?? lastUiContext;
@@ -1643,6 +1666,15 @@ export default function (pi: ExtensionAPI) {
     sessionRuntime.subscriptions.add(unsubscribe);
   }
 
+  function requestBtwSessionAbort(sessionRuntime: BtwSessionRuntime): Promise<void> {
+    sessionRuntime.abortPromise ??= Promise.resolve()
+      .then(() => sessionRuntime.session.abort())
+      .catch(() => {
+        // Ignore abort errors during BTW cancellation/replacement/shutdown.
+      });
+    return sessionRuntime.abortPromise;
+  }
+
   async function disposeBtwSession(): Promise<void> {
     const current = activeBtwSession;
     activeBtwSession = null;
@@ -1651,19 +1683,36 @@ export default function (pi: ExtensionAPI) {
     }
 
     clearBtwSessionSubscriptions(current);
-
-    try {
-      await current.session.abort();
-    } catch {
-      // Ignore abort errors during BTW session replacement/shutdown.
-    }
-
+    await requestBtwSessionAbort(current);
     current.session.dispose();
   }
 
   async function dismissOverlaySession(): Promise<void> {
+    invalidateBtwLifecycle();
     dismissOverlay();
     await disposeBtwSession();
+  }
+
+  /**
+   * Escape behaves differently depending on whether the BTW side session is
+   * currently doing work:
+   *
+   * - streaming: the first Escape aborts the in-flight request but keeps the
+   *   overlay open (so the partial transcript stays readable and the thread
+   *   remains usable). A second Escape dismisses, even while cancellation settles.
+   * - idle: Escape dismisses the overlay immediately (previous behavior).
+   */
+  async function dismissOrAbortOverlaySession(): Promise<void> {
+    const sessionRuntime = activeBtwSession;
+    if (sessionRuntime?.session.isStreaming && !sessionRuntime.abortPromise) {
+      setOverlayStatus("⏹ Aborting. Press Esc again to dismiss the BTW overlay.");
+      await requestBtwSessionAbort(sessionRuntime);
+      if (activeBtwSession === sessionRuntime && overlayRuntime) {
+        setOverlayStatus("⏹ Aborted. Press Esc again to dismiss the BTW overlay.");
+      }
+      return;
+    }
+    await dismissOverlaySession();
   }
 
   async function resolveBtwModel(
@@ -1763,6 +1812,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function setBtwModelOverride(ctx: ExtensionCommandContext, nextModel: SessionModel | null): Promise<void> {
+    invalidateBtwLifecycle();
     btwModelOverride = nextModel;
     const details: BtwModelOverrideDetails = nextModel
       ? { action: "set", timestamp: Date.now(), provider: nextModel.provider, id: nextModel.id, api: nextModel.api }
@@ -1781,6 +1831,7 @@ export default function (pi: ExtensionAPI) {
     ctx: ExtensionCommandContext,
     nextThinkingLevel: SessionThinkingLevel | null,
   ): Promise<void> {
+    invalidateBtwLifecycle();
     btwThinkingOverride = nextThinkingLevel;
     const details: BtwThinkingOverrideDetails = nextThinkingLevel
       ? { action: "set", timestamp: Date.now(), thinkingLevel: nextThinkingLevel }
@@ -1822,7 +1873,7 @@ export default function (pi: ExtensionAPI) {
       session.agent.state.messages = seedMessages as typeof session.state.messages;
     }
 
-    return { session, mode, subscriptions: new Set(), sideThreadStartIndex };
+    return { session, mode, subscriptions: new Set(), sideThreadStartIndex, promptQueue: Promise.resolve() };
   }
 
   async function ensureBtwSession(ctx: ExtensionCommandContext, mode: BtwThreadMode): Promise<BtwSessionRuntime | null> {
@@ -1888,7 +1939,7 @@ export default function (pi: ExtensionAPI) {
               void submitFromOverlay(ctx, value);
             },
             () => {
-              void dismissOverlaySession();
+              void dismissOrAbortOverlaySession();
             },
             () => {
               overlayRuntime?.handle?.unfocus();
@@ -2061,6 +2112,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (name === "btw:inject") {
+      await btwSubmissionQueue;
       if (pendingThread.length === 0) {
         notify(ctx, "No BTW thread to inject.", "warning");
         return true;
@@ -2089,6 +2141,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (name === "btw:summarize") {
+      await btwSubmissionQueue;
       if (pendingThread.length === 0) {
         notify(ctx, "No BTW thread to summarize.", "warning");
         return true;
@@ -2164,6 +2217,7 @@ export default function (pi: ExtensionAPI) {
     persist = true,
     mode: BtwThreadMode = "contextual",
   ): Promise<void> {
+    invalidateBtwLifecycle();
     await disposeBtwSession();
     pendingThread = [];
     pendingMode = mode;
@@ -2178,6 +2232,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function restoreThread(ctx: ExtensionContext): Promise<void> {
+    invalidateBtwLifecycle();
     await disposeBtwSession();
     pendingThread = [];
     pendingMode = "contextual";
@@ -2252,8 +2307,30 @@ export default function (pi: ExtensionAPI) {
     saveRequested: boolean,
     mode: BtwThreadMode,
   ): Promise<void> {
+    const generation = btwLifecycleGeneration;
+    const submission = btwSubmissionQueue.then(async () => {
+      if (generation !== btwLifecycleGeneration) {
+        return;
+      }
+      await executeBtw(ctx, question, saveRequested, mode, generation);
+    });
+    btwSubmissionQueue = submission.catch(() => {});
+    await submission;
+  }
+
+  async function executeBtw(
+    ctx: ExtensionCommandContext,
+    question: string,
+    saveRequested: boolean,
+    mode: BtwThreadMode,
+    generation: number,
+  ): Promise<void> {
+    const isCurrentGeneration = () => generation === btwLifecycleGeneration;
     lastUiContext = ctx;
     const settings = await resolveBtwSettings(ctx);
+    if (!isCurrentGeneration()) {
+      return;
+    }
     const model = settings.model;
     if (!model) {
       const message = settings.fallbackReason || "No active model selected.";
@@ -2263,6 +2340,9 @@ export default function (pi: ExtensionAPI) {
     }
 
     const auth = (await ctx.modelRegistry.getApiKeyAndHeaders(model)) as BtwResolvedRequestAuth;
+    if (!isCurrentGeneration()) {
+      return;
+    }
     if (!hasUsableModelAuth(ctx, model, auth)) {
       const message = auth.ok ? `No credentials available for ${model.provider}/${model.id}.` : auth.error;
       setOverlayStatus(message, ctx);
@@ -2272,6 +2352,12 @@ export default function (pi: ExtensionAPI) {
     }
 
     const sessionRuntime = await ensureBtwSession(ctx, mode);
+    if (!isCurrentGeneration()) {
+      if (sessionRuntime && activeBtwSession === sessionRuntime) {
+        await disposeBtwSession();
+      }
+      return;
+    }
     if (!sessionRuntime) {
       setOverlayStatus("No active model selected.", ctx);
       notify(ctx, "No active model selected.", "error");
@@ -2284,19 +2370,54 @@ export default function (pi: ExtensionAPI) {
     pendingMode = mode;
     const thinkingLevel = settings.thinkingLevel;
 
+    let releasePromptTurn!: () => void;
+    const previousPromptTurns = sessionRuntime.promptQueue;
+    const currentPromptTurn = new Promise<void>((resolve) => {
+      releasePromptTurn = resolve;
+    });
+    sessionRuntime.promptQueue = previousPromptTurns.then(() => currentPromptTurn);
+
+    if (session.isStreaming || sessionRuntime.abortPromise) {
+      setOverlayStatus("⏳ waiting for the current BTW turn to finish...", ctx);
+    }
+    await previousPromptTurns;
+    if (activeBtwSession !== sessionRuntime) {
+      releasePromptTurn();
+      return;
+    }
+
+    if (sessionRuntime.abortPromise) {
+      setOverlayStatus("⏳ waiting for cancellation to finish...", ctx);
+      await sessionRuntime.abortPromise;
+      if (activeBtwSession !== sessionRuntime) {
+        releasePromptTurn();
+        return;
+      }
+    }
+
+    if (!isCurrentGeneration()) {
+      releasePromptTurn();
+      return;
+    }
+
+    sessionRuntime.abortPromise = undefined;
     setOverlayStatus("⏳ streaming...", ctx);
     await ensureOverlay(ctx);
 
     try {
       await session.prompt(question, { source: "extension" });
+      if (!isCurrentGeneration()) {
+        return;
+      }
 
       const response = getLastAssistantMessage(session);
       if (!response) {
         throw new Error("BTW request finished without a response.");
       }
       if (response.stopReason === "aborted") {
-        removeTranscriptTurn(transcriptState, transcriptState.lastTurnId ?? transcriptState.currentTurnId);
-        setOverlayStatus("Request aborted.", ctx);
+        const abortedTurnId = transcriptState.currentTurnId ?? transcriptState.lastTurnId;
+        finishTranscriptTurn(transcriptState, abortedTurnId, "aborted");
+        setOverlayStatus("⏹ Aborted. Press Esc again to dismiss the BTW overlay.", ctx);
         return;
       }
       if (response.stopReason === "error") {
@@ -2342,12 +2463,16 @@ export default function (pi: ExtensionAPI) {
         setOverlayStatus("Ready for a follow-up. Hidden BTW thread updated.", ctx);
       }
     } catch (error) {
+      if (!isCurrentGeneration()) {
+        return;
+      }
       const errorMessage = error instanceof Error ? error.message : String(error);
       setTranscriptFailure(transcriptState, errorMessage);
       setOverlayStatus("Request failed. Thread preserved for retry or follow-up.", ctx);
       notify(ctx, errorMessage, "error");
       await disposeBtwSession();
     } finally {
+      releasePromptTurn();
       syncUi(ctx);
     }
   }
@@ -2359,7 +2484,20 @@ export default function (pi: ExtensionAPI) {
   async function getBtwHandoffThread(
     ctx: ExtensionCommandContext,
   ): Promise<{ sessionRuntime: BtwSessionRuntime | null; thread: BtwHandoffExchange[] }> {
+    const pendingSubmissions = btwSubmissionQueue;
+    await pendingSubmissions;
+
     const sessionRuntime = activeBtwSession ?? (await ensureBtwSession(ctx, pendingMode));
+    if (sessionRuntime) {
+      const pendingPromptTurns = sessionRuntime.promptQueue;
+      const pendingAbort = sessionRuntime.abortPromise;
+      await pendingPromptTurns;
+      await pendingAbort;
+      if (activeBtwSession !== sessionRuntime) {
+        throw new Error("BTW session closed before handoff completed.");
+      }
+    }
+
     const thread = sessionRuntime ? extractBtwHandoffThread(sessionRuntime) : [];
     const resolvedThread = thread.length > 0 ? thread : getPendingThreadForHandoff();
 
@@ -2487,6 +2625,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
+    invalidateBtwLifecycle();
     await disposeBtwSession();
     dismissOverlay();
   });

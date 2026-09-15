@@ -212,6 +212,28 @@ function createBlockingToolStream() {
   };
 }
 
+function createBlockingPartialAbortStream() {
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+
+  return {
+    release,
+    stream: async function* () {
+      yield { type: "text_delta" as const, delta: "Partial answer" };
+      await blocked;
+      yield {
+        type: "error" as const,
+        error: {
+          ...makeAssistantMessage("Partial answer"),
+          stopReason: "aborted" as const,
+        },
+      };
+    },
+  };
+}
+
 function createBlockingSuccessStream(answer: string) {
   let release!: () => void;
   const blocked = new Promise<void>((resolve) => {
@@ -536,7 +558,7 @@ function createHarness(
   let hasCredentials = true;
   let mainThinkingLevel: string = "off";
   let credentialSource: string | undefined;
-  let authResolver: ((model: { provider: string; id: string; api: string }) => TestAuthResult) | null = null;
+  let authResolver: ((model: { provider: string; id: string; api: string }) => TestAuthResult | Promise<TestAuthResult>) | null = null;
   let configuredAuthResolver: ((model: { provider: string; id: string; api: string }) => boolean) | null = null;
   let credentialResolver: ((model: { provider: string; id: string; api: string }) => string | undefined) | null = null;
   // Models that ctx.modelRegistry.find(provider, id) should return for /btw:model resolution.
@@ -660,6 +682,9 @@ function createHarness(
         }
         if (authResolver) {
           const auth = authResolver(requestedModel);
+          if (auth instanceof Promise) {
+            return false;
+          }
           return (
             auth.ok &&
             (!!auth.apiKey || !!Object.keys(auth.headers ?? {}).length || !!Object.keys(auth.env ?? {}).length)
@@ -780,7 +805,7 @@ function createHarness(
     setCredentialResolver(value: ((model: { provider: string; id: string; api: string }) => string | undefined) | null) {
       credentialResolver = value;
     },
-    setAuthResolver(value: ((model: { provider: string; id: string; api: string }) => TestAuthResult) | null) {
+    setAuthResolver(value: ((model: { provider: string; id: string; api: string }) => TestAuthResult | Promise<TestAuthResult>) | null) {
       authResolver = value;
     },
     setConfiguredAuthResolver(value: ((model: { provider: string; id: string; api: string }) => boolean) | null) {
@@ -1373,10 +1398,12 @@ describe("btw runtime behavior", () => {
     expect(harness.overlayHandles.at(-1)?.hideCalls).toBe(1);
   });
 
-  it("aborts, disposes, and unsubscribes the active BTW sub-session when Escape dismisses mid-stream", async () => {
+  it("aborts mid-stream on first Escape but keeps the overlay open, then dismisses on second Escape", async () => {
     const harness = createHarness();
     const blocking = createBlockingToolStream();
-    promptStreamMock.mockImplementation(() => blocking.stream());
+    promptStreamMock
+      .mockImplementationOnce(() => blocking.stream())
+      .mockImplementationOnce(() => streamAnswer("Recovered after abort"));
 
     await harness.runSessionStart();
     const pendingCommand = harness.command("btw", "first question");
@@ -1390,17 +1417,286 @@ describe("btw runtime behavior", () => {
     expect(firstRecord.getIsStreaming()).toBe(true);
     expect(firstRecord.getListenerCount()).toBe(1);
 
+    // First Escape: abort the in-flight request, keep the overlay open.
     overlay.input.onEscape?.();
     await flushAsyncWork();
 
     expect(firstRecord.session.abort).toHaveBeenCalledTimes(1);
-    expect(firstRecord.session.dispose).toHaveBeenCalledTimes(1);
+    expect(firstRecord.session.dispose).not.toHaveBeenCalled();
+    expect(firstRecord.getListenerCount()).toBe(1);
+    expect(harness.overlayHandles.at(-1)?.hideCalls).toBe(0);
+    expect(overlay.statusText.text).toContain("Press Esc again to dismiss");
+
+    // The aborted request settles without persisting a completed exchange, while
+    // its partial user/tool transcript remains readable.
+    blocking.release();
+    await pendingCommand;
     expect(firstRecord.getIsStreaming()).toBe(false);
+    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(0);
+    expect(transcriptText(overlay)).toContain("first question");
+    expect(transcriptText(overlay)).toContain("read");
+
+    // The same side session remains usable for a successful follow-up.
+    overlay.input.onSubmit?.("follow-up after abort");
+    await flushAsyncWork();
+
+    expect(firstRecord.session.prompt).toHaveBeenLastCalledWith("follow-up after abort", { source: "extension" });
+    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(1);
+    expect(transcriptText(overlay)).toContain("first question");
+    expect(transcriptText(overlay)).toContain("follow-up after abort");
+    expect(transcriptText(overlay)).toContain("Recovered after abort");
+
+    // Second Escape (now idle): dismiss and dispose as before.
+    overlay.input.onEscape?.();
+    await flushAsyncWork();
+
+    expect(firstRecord.session.dispose).toHaveBeenCalledTimes(1);
     expect(firstRecord.getListenerCount()).toBe(0);
     expect(harness.overlayHandles.at(-1)?.hideCalls).toBe(1);
+  });
+
+  it("keeps partial assistant output visible without counting or persisting an aborted exchange", async () => {
+    const harness = createHarness();
+    const blocking = createBlockingPartialAbortStream();
+    promptStreamMock.mockImplementation(() => blocking.stream());
+
+    await harness.runSessionStart();
+    const pendingCommand = harness.command("btw", "partial question");
+    await flushAsyncWork();
+
+    const overlay = harness.latestOverlayComponent();
+    expect(transcriptText(overlay)).toContain("Partial answer");
+
+    overlay.input.onEscape?.();
+    await flushAsyncWork();
+    blocking.release();
+    await pendingCommand;
+
+    expect(transcriptText(overlay)).toContain("Partial answer");
+    expect(findLatest(transcriptEntries(overlay), (entry: any) => entry.type === "assistant-text")).toMatchObject({
+      text: "Partial answer",
+      streaming: false,
+    });
+    expect(overlay.summaryText.text).toContain("0 exchanges");
+    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(0);
+  });
+
+  it("waits for abort settlement before submitting a follow-up", async () => {
+    const harness = createHarness();
+    const blocking = createBlockingToolStream();
+    promptStreamMock
+      .mockImplementationOnce(() => blocking.stream())
+      .mockImplementationOnce(() => streamAnswer("First follow-up after cancellation"))
+      .mockImplementationOnce(() => streamAnswer("Second follow-up after cancellation"));
+
+    await harness.runSessionStart();
+    const pendingCommand = harness.command("btw", "cancel this");
+    await flushAsyncWork();
+
+    const overlay = harness.latestOverlayComponent();
+    const record = subSessionRecords[0];
+    let releaseAbort!: () => void;
+    const abortPending = new Promise<void>((resolve) => {
+      releaseAbort = resolve;
+    });
+    record.session.abort.mockImplementationOnce(() => abortPending);
+
+    overlay.input.onEscape?.();
+    await flushAsyncWork();
+    overlay.input.onSubmit?.("first follow-up while cancelling");
+    overlay.input.onSubmit?.("second follow-up while cancelling");
+    await flushAsyncWork();
+
+    expect(record.session.prompt).toHaveBeenCalledTimes(1);
+    expect(record.session.abort).toHaveBeenCalledTimes(1);
+    expect(record.session.dispose).not.toHaveBeenCalled();
+    expect(transcriptText(overlay)).not.toContain("Agent is already processing");
 
     blocking.release();
     await pendingCommand;
+    releaseAbort();
+    await flushAsyncWork();
+    await flushAsyncWork();
+
+    expect(record.session.prompt).toHaveBeenCalledTimes(3);
+    expect(record.session.prompt).toHaveBeenNthCalledWith(2, "first follow-up while cancelling", { source: "extension" });
+    expect(record.session.prompt).toHaveBeenNthCalledWith(3, "second follow-up while cancelling", { source: "extension" });
+    expect(record.session.abort).toHaveBeenCalledTimes(1);
+    expect(record.session.dispose).not.toHaveBeenCalled();
+    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(2);
+    expect(transcriptText(overlay)).toContain("First follow-up after cancellation");
+    expect(transcriptText(overlay)).toContain("Second follow-up after cancellation");
+    expect(transcriptText(overlay)).not.toContain("Agent is already processing");
+  });
+
+  it("does not revive a dismissed session after delayed prompt preflight", async () => {
+    const harness = createHarness();
+
+    await harness.runSessionStart();
+    await harness.command("btw", "");
+
+    const overlay = harness.latestOverlayComponent();
+    const record = subSessionRecords[0];
+    let releaseAuth!: (auth: TestAuthResult) => void;
+    const authPending = new Promise<TestAuthResult>((resolve) => {
+      releaseAuth = resolve;
+    });
+    harness.setAuthResolver(() => authPending);
+    harness.setConfiguredAuthResolver(() => true);
+
+    overlay.input.onSubmit?.("stale preflight follow-up");
+    await flushAsyncWork();
+    overlay.input.onEscape?.();
+    await flushAsyncWork();
+
+    expect(harness.overlayHandles.at(-1)?.hideCalls).toBe(1);
+    expect(record.session.dispose).toHaveBeenCalledTimes(1);
+    expect(record.session.prompt).not.toHaveBeenCalled();
+
+    releaseAuth({ ok: true, headers: { Authorization: "Bearer delayed" } });
+    await flushAsyncWork();
+    await flushAsyncWork();
+
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(1);
+    expect(record.session.prompt).not.toHaveBeenCalled();
+    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(0);
+    expect(harness.overlays).toHaveLength(1);
+  });
+
+  it("dismisses on a rapid second Escape while the first abort is still settling", async () => {
+    const harness = createHarness();
+    const blocking = createBlockingToolStream();
+    promptStreamMock.mockImplementation(() => blocking.stream());
+
+    await harness.runSessionStart();
+    const pendingCommand = harness.command("btw", "slow abort");
+    await flushAsyncWork();
+
+    const overlay = harness.latestOverlayComponent();
+    const record = subSessionRecords[0];
+    let releaseAbort!: () => void;
+    const abortPending = new Promise<void>((resolve) => {
+      releaseAbort = resolve;
+    });
+    record.session.abort.mockImplementationOnce(() => abortPending);
+
+    overlay.input.onEscape?.();
+    await flushAsyncWork();
+    expect(record.getIsStreaming()).toBe(true);
+    expect(overlay.statusText.text).toContain("Aborting");
+
+    overlay.input.onEscape?.();
+    await flushAsyncWork();
+    expect(harness.overlayHandles.at(-1)?.hideCalls).toBe(1);
+    expect(record.getListenerCount()).toBe(0);
+    expect(record.session.dispose).not.toHaveBeenCalled();
+
+    blocking.release();
+    await pendingCommand;
+    releaseAbort();
+    await flushAsyncWork();
+
+    expect(record.session.abort).toHaveBeenCalledTimes(1);
+    expect(record.session.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  for (const handoffCommand of ["btw:inject", "btw:summarize"] as const) {
+    it(`waits for a first pending turn before ${handoffCommand}`, async () => {
+      const harness = createHarness();
+      const blocking = createBlockingSuccessStream("First pending answer");
+      promptStreamMock.mockImplementationOnce(() => blocking.stream());
+      if (handoffCommand === "btw:summarize") {
+        promptStreamMock.mockImplementationOnce(() => streamAnswer("Pending turn summary"));
+      }
+
+      await harness.runSessionStart();
+      const pendingTurn = harness.command("btw", "first pending question");
+      await flushAsyncWork();
+      const handoff = harness.command(handoffCommand, "");
+      await flushAsyncWork();
+
+      expect(harness.sentUserMessages).toHaveLength(0);
+      expect(harness.notifications.some((entry) => entry.message.includes("No BTW thread"))).toBe(false);
+
+      blocking.release();
+      await pendingTurn;
+      await handoff;
+
+      expect(harness.sentUserMessages).toHaveLength(1);
+      const content = String(harness.sentUserMessages[0]?.content);
+      if (handoffCommand === "btw:inject") {
+        expect(content).toContain("first pending question");
+        expect(content).toContain("First pending answer");
+      } else {
+        expect(content).toContain("Pending turn summary");
+      }
+    });
+  }
+
+  it("waits for cancellation before extracting a handoff", async () => {
+    const harness = createHarness();
+    const blocking = createBlockingToolStream();
+    promptStreamMock
+      .mockImplementationOnce(() => streamAnswer("Existing answer"))
+      .mockImplementationOnce(() => blocking.stream());
+
+    await harness.runSessionStart();
+    await harness.command("btw", "existing question");
+
+    const overlay = harness.latestOverlayComponent();
+    const record = subSessionRecords[0];
+    overlay.input.onSubmit?.("cancelling question");
+    await flushAsyncWork();
+
+    let releaseAbort!: () => void;
+    const abortPending = new Promise<void>((resolve) => {
+      releaseAbort = resolve;
+    });
+    record.session.abort.mockImplementationOnce(() => abortPending);
+
+    overlay.input.onEscape?.();
+    await flushAsyncWork();
+    const handoff = harness.command("btw:inject", "");
+    await flushAsyncWork();
+
+    expect(harness.sentUserMessages).toHaveLength(0);
+
+    blocking.release();
+    await flushAsyncWork();
+    releaseAbort();
+    await handoff;
+
+    expect(harness.sentUserMessages).toHaveLength(1);
+    expect(harness.sentUserMessages[0]?.content).toContain("existing question");
+    expect(harness.sentUserMessages[0]?.content).toContain("Existing answer");
+    expect(harness.sentUserMessages[0]?.content).not.toContain("cancelling question");
+  });
+
+  it("excludes an aborted turn from a later handoff", async () => {
+    const harness = createHarness();
+    const blocking = createBlockingToolStream();
+    promptStreamMock
+      .mockImplementationOnce(() => blocking.stream())
+      .mockImplementationOnce(() => streamAnswer("Follow-up answer"));
+
+    await harness.runSessionStart();
+    const pendingCommand = harness.command("btw", "aborted question");
+    await flushAsyncWork();
+
+    const overlay = harness.latestOverlayComponent();
+    overlay.input.onEscape?.();
+    await flushAsyncWork();
+    blocking.release();
+    await pendingCommand;
+
+    overlay.input.onSubmit?.("completed follow-up");
+    await flushAsyncWork();
+    await harness.command("btw:inject", "");
+
+    expect(harness.sentUserMessages).toHaveLength(1);
+    expect(harness.sentUserMessages[0]?.content).toContain("completed follow-up");
+    expect(harness.sentUserMessages[0]?.content).toContain("Follow-up answer");
+    expect(harness.sentUserMessages[0]?.content).not.toContain("aborted question");
   });
 
   it("allows main-session input to proceed while the BTW sub-session is streaming", async () => {
@@ -1441,6 +1737,23 @@ describe("btw runtime behavior", () => {
 
     mainTurn.finish();
     expect(harness.baseCtx.isIdle()).toBe(true);
+  });
+
+  it("dismisses immediately on Escape when the side session is idle", async () => {
+    const harness = createHarness();
+
+    await harness.runSessionStart();
+    await harness.command("btw", "");
+
+    const overlay = harness.latestOverlayComponent();
+    const record = subSessionRecords[0];
+    expect(record.getIsStreaming()).toBe(false);
+
+    overlay.input.onEscape?.();
+    await flushAsyncWork();
+
+    expect(record.session.dispose).toHaveBeenCalledTimes(1);
+    expect(harness.overlayHandles.at(-1)?.hideCalls).toBe(1);
   });
 
   it("ignores late session events after overlay dismissal disposes the sub-session", async () => {
