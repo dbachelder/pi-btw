@@ -50,6 +50,10 @@ vi.mock("@earendil-works/pi-coding-agent", async () => {
 type CustomEntry = { type: "custom"; customType: string; data?: unknown };
 type SessionEntry = CustomEntry | { type: string; role?: string; customType?: string; content?: unknown; [key: string]: unknown };
 
+type TestAuthResult =
+  | { ok: true; apiKey?: string; headers?: Record<string, string>; env?: Record<string, string> }
+  | { ok: false; error: string };
+
 type StreamContext = {
   systemPrompt: string;
   messages: Array<{ role: string; content: Array<{ type: string; text?: string; thinking?: string }> }>;
@@ -512,6 +516,8 @@ function createHarness(
   let hasCredentials = true;
   let mainThinkingLevel: string = "off";
   let credentialSource: string | undefined;
+  let authResolver: ((model: { provider: string; id: string; api: string }) => TestAuthResult) | null = null;
+  let configuredAuthResolver: ((model: { provider: string; id: string; api: string }) => boolean) | null = null;
   let credentialResolver: ((model: { provider: string; id: string; api: string }) => string | undefined) | null = null;
   // Models that ctx.modelRegistry.find(provider, id) should return for /btw:model resolution.
   // Tests that exercise overrides should call harness.registerModel(...) so the resolved
@@ -618,11 +624,30 @@ function createHarness(
     modelRegistry: {
       runtime: modelRegistryRuntime,
       getApiKeyAndHeaders: vi.fn(async (requestedModel: { provider: string; id: string; api: string }) => {
+        if (authResolver) {
+          return authResolver(requestedModel);
+        }
         if (credentialResolver) {
           const key = credentialResolver(requestedModel);
           return key ? { ok: true, apiKey: key, headers: undefined } : { ok: true, apiKey: undefined, headers: undefined };
         }
         return hasCredentials ? { ok: true, apiKey: "test-key", headers: undefined } : { ok: true, apiKey: undefined, headers: undefined };
+      }),
+      hasConfiguredAuth: vi.fn((requestedModel: { provider: string; id: string; api: string }) => {
+        if (configuredAuthResolver) {
+          return configuredAuthResolver(requestedModel);
+        }
+        if (authResolver) {
+          const auth = authResolver(requestedModel);
+          return (
+            auth.ok &&
+            (!!auth.apiKey || !!Object.keys(auth.headers ?? {}).length || !!Object.keys(auth.env ?? {}).length)
+          );
+        }
+        if (credentialResolver) {
+          return !!credentialResolver(requestedModel);
+        }
+        return hasCredentials;
       }),
       // pi 0.74 ExtensionContext.modelRegistry.find(provider, modelId) -> Model<Api> | undefined.
       // The mock looks up entries from `registeredModels`; falls back to a default api so legacy
@@ -733,6 +758,12 @@ function createHarness(
     setCredentialResolver(value: ((model: { provider: string; id: string; api: string }) => string | undefined) | null) {
       credentialResolver = value;
     },
+    setAuthResolver(value: ((model: { provider: string; id: string; api: string }) => TestAuthResult) | null) {
+      authResolver = value;
+    },
+    setConfiguredAuthResolver(value: ((model: { provider: string; id: string; api: string }) => boolean) | null) {
+      configuredAuthResolver = value;
+    },
     setCredentialSource(value: string | undefined) {
       credentialSource = value;
     },
@@ -801,6 +832,56 @@ describe("btw runtime behavior", () => {
     expect(subSession.bindExtensions).not.toHaveBeenCalled();
     expect(subSession.getActiveToolNames()).toEqual(["read", "bash", "edit", "write"]);
     expect(subSession.prompt).toHaveBeenCalledWith("first question", { source: "extension" });
+  });
+
+  it("accepts configured keyless auth for normal BTW prompts", async () => {
+    const harness = createHarness();
+    harness.setAuthResolver(() => ({ ok: true }));
+    harness.setConfiguredAuthResolver(() => true);
+
+    await harness.runSessionStart();
+    await harness.command("btw", "credential-chain question");
+
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(1);
+    expect(subSessionRecords[0]?.session.prompt).toHaveBeenCalledWith("credential-chain question", { source: "extension" });
+    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(1);
+    expect(harness.notifications.some((entry) => entry.message.includes("No credentials"))).toBe(false);
+  });
+
+  it("accepts header-based auth for a BTW model override", async () => {
+    const harness = createHarness();
+    harness.setAuthResolver((requestedModel) =>
+      requestedModel.provider === "fast-provider"
+        ? { ok: true, headers: { Authorization: "Bearer subscription-token" } }
+        : { ok: true, apiKey: "main-key" },
+    );
+
+    await harness.runSessionStart();
+    await harness.command("btw:model", "fast-provider fast-model custom-api");
+    await harness.command("btw", "subscription question");
+
+    expect(createAgentSessionMock.mock.calls[0][0].model).toEqual({
+      provider: "fast-provider",
+      id: "fast-model",
+      api: "custom-api",
+    });
+  });
+
+  it("accepts environment-based auth when summarizing", async () => {
+    const harness = createHarness();
+    promptStreamMock
+      .mockImplementationOnce(() => streamAnswer("First answer"))
+      .mockImplementationOnce(() => streamAnswer("Environment-auth summary"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+    harness.setAuthResolver(() => ({ ok: true, env: { AWS_PROFILE: "bedrock" } }));
+    await harness.command("btw:summarize", "handoff this");
+
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(2);
+    expect(harness.sentUserMessages[0]?.content).toBe(
+      "Here is a summary of a side conversation I had. handoff this\n\nEnvironment-auth summary",
+    );
   });
 
   it("copies a registered custom provider into BTW and summary child runtimes", async () => {
