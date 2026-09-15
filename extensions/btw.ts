@@ -1769,7 +1769,6 @@ export default function (pi: ExtensionAPI) {
       if (activeBtwSession) {
         clearBtwSessionSubscriptions(activeBtwSession);
       }
-      runtime.handle?.hide();
       if (overlayRuntime === runtime) {
         overlayRuntime = null;
       }

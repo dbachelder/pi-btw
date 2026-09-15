@@ -541,6 +541,9 @@ function createHarness(
       let component: any;
       const resultPromise = new Promise((resolve) => {
         done = (result: unknown) => {
+          // Match pi's custom-overlay close callback: pop the topmost overlay,
+          // then dispose the component after resolving the custom UI promise.
+          overlayHandles.at(-1)?.hide();
           component?.dispose?.();
           resolve(result);
         };
