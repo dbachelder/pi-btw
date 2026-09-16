@@ -2222,21 +2222,32 @@ describe("btw runtime behavior", () => {
     expect(windowOverlay.statusText.text).toContain("Window mode");
   });
 
-  it("keeps the box frame glyphs in full-width mode so the dialog still reads as a panel", async () => {
+  it("keeps the box frame in window mode but drops all border glyphs in full-width mode", async () => {
     const harness = createHarness();
     promptStreamMock.mockImplementation(() => streamAnswer("Framed answer"));
 
     await harness.runSessionStart();
     await harness.command("btw", "overlay question");
 
+    // Window mode: full box frame with corners and vertical bars.
+    const windowRender = harness.latestOverlayComponent().render(80);
+    expect(windowRender[0]).toContain("┌");
+    expect(windowRender.at(-1)).toContain("└");
+    expect(windowRender.some((line: string) => line.includes("│"))).toBe(true);
+
     const overlay = harness.latestOverlayComponent();
     overlay.handleInput("\x1bw");
     await flushAsyncWork();
 
-    const rendered = harness.latestOverlayComponent().render(80);
-    expect(rendered[0]).toContain("┌");
-    expect(rendered.at(-1)).toContain("└");
-    expect(rendered.some((line: string) => line.includes("│"))).toBe(true);
+    // Full-width mode: horizontal rules only, no corners and no side bars, so a
+    // Shift+drag selection can't pick up border glyphs beside the text.
+    const fullRender = harness.latestOverlayComponent().render(80);
+    expect(fullRender[0]).toContain("─");
+    expect(fullRender[0]).not.toContain("┌");
+    expect(fullRender[0]).not.toContain("┐");
+    expect(fullRender.at(-1)).not.toContain("└");
+    expect(fullRender.at(-1)).not.toContain("┘");
+    expect(fullRender.every((line: string) => !line.includes("│"))).toBe(true);
   });
 
   it("does not change Pi-owned terminal mouse reporting in fullscreen mode", async () => {

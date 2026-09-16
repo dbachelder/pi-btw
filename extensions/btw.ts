@@ -1256,6 +1256,7 @@ class BtwOverlayComponent extends Container implements Focusable {
   private readonly readTranscriptEntries: () => BtwTranscript;
   private readonly getStatus: () => string | null;
   private readonly getMode: () => BtwThreadMode;
+  private readonly getWidthMode: () => BtwOverlayWidthMode;
   private readonly onSubmitCallback: (value: string) => void;
   private readonly onDismissCallback: () => void;
   private readonly onUnfocusCallback: () => void;
@@ -1291,6 +1292,7 @@ class BtwOverlayComponent extends Container implements Focusable {
     readTranscriptEntries: () => BtwTranscript,
     getStatus: () => string | null,
     getMode: () => BtwThreadMode,
+    getWidthMode: () => BtwOverlayWidthMode,
     onSubmit: (value: string) => void,
     onDismiss: () => void,
     onUnfocus: () => void,
@@ -1306,6 +1308,7 @@ class BtwOverlayComponent extends Container implements Focusable {
     this.readTranscriptEntries = readTranscriptEntries;
     this.getStatus = getStatus;
     this.getMode = getMode;
+    this.getWidthMode = getWidthMode;
     this.onSubmitCallback = onSubmit;
     this.onDismissCallback = onDismiss;
     this.onUnfocusCallback = onUnfocus;
@@ -1354,17 +1357,33 @@ class BtwOverlayComponent extends Container implements Focusable {
     this.refresh();
   }
 
+  private get borderless(): boolean {
+    // Full-width mode drops the vertical bars and corner glyphs so a terminal
+    // Shift+drag selection captures only the dialog's own text — with side
+    // borders, the leftmost/rightmost columns would land inside the drag.
+    return this.getWidthMode() === "full";
+  }
+
   private frameLine(content: string, innerWidth: number): string {
     const truncated = truncateToWidth(content, innerWidth, "");
     const padding = Math.max(0, innerWidth - visibleWidth(truncated));
+    if (this.borderless) {
+      return `${truncated}${" ".repeat(padding)}`;
+    }
     return `${this.theme.fg("border", "│")}${truncated}${" ".repeat(padding)}${this.theme.fg("border", "│")}`;
   }
 
   private ruleLine(innerWidth: number): string {
+    if (this.borderless) {
+      return this.theme.fg("border", "─".repeat(innerWidth));
+    }
     return this.theme.fg("border", `├${"─".repeat(innerWidth)}┤`);
   }
 
   private borderLine(innerWidth: number, edge: "top" | "bottom"): string {
+    if (this.borderless) {
+      return this.theme.fg("border", "─".repeat(innerWidth));
+    }
     const left = edge === "top" ? "┌" : "└";
     const right = edge === "top" ? "┐" : "┘";
     return this.theme.fg("border", `${left}${"─".repeat(innerWidth)}${right}`);
@@ -1448,7 +1467,8 @@ class BtwOverlayComponent extends Container implements Focusable {
   }
 
   private inputFrameLine(dialogWidth: number): string {
-    const targetWidth = Math.max(1, dialogWidth - 2);
+    const borderColumns = this.borderless ? 0 : 2;
+    const targetWidth = Math.max(1, dialogWidth - borderColumns);
     const previousFocused = this.input.focused;
     // Input.render() emits CURSOR_MARKER when focused. In overlay mode that APC marker
     // can skew width/composition on this one row before the TUI strips it, producing a
@@ -1459,6 +1479,9 @@ class BtwOverlayComponent extends Container implements Focusable {
       const renderedInputLine = this.input.render(targetWidth)[0] ?? "";
       const inputLine = truncateToWidth(renderedInputLine, targetWidth, "");
       const padding = Math.max(0, targetWidth - visibleWidth(inputLine));
+      if (this.borderless) {
+        return `${inputLine}${" ".repeat(padding)}`;
+      }
       return `${this.theme.fg("border", "│")}${inputLine}${" ".repeat(padding)}${this.theme.fg("border", "│")}`;
     } finally {
       this.input.focused = previousFocused;
@@ -1471,7 +1494,8 @@ class BtwOverlayComponent extends Container implements Focusable {
 
   override render(width: number): string[] {
     const dialogWidth = Math.max(24, width);
-    const innerWidth = Math.max(22, dialogWidth - 2);
+    const borderColumns = this.borderless ? 0 : 2;
+    const innerWidth = Math.max(22, dialogWidth - borderColumns);
     const contentWidth = Math.max(1, innerWidth - BTW_BLOCK_INDENT.length);
     if (contentWidth !== this.contentWidth) {
       this.contentWidth = contentWidth;
@@ -2013,6 +2037,7 @@ export default function (pi: ExtensionAPI) {
             () => transcriptState.entries,
             () => overlayStatus,
             () => pendingMode,
+            () => overlayWidthMode,
             (value) => {
               void submitFromOverlay(ctx, value);
             },
