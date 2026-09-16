@@ -1,7 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, RegisteredCommand } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import btwExtension from "../extensions/btw";
+import btwExtension, {
+  describeFocusShortcuts,
+  isValidFocusShortcut,
+  resolveBtwFocusShortcuts,
+} from "../extensions/btw";
 
 const {
   promptStreamMock,
@@ -15,7 +19,7 @@ const {
   promptStreamMock: vi.fn(),
   createAgentSessionMock: vi.fn(),
   sessionManagerInMemoryMock: vi.fn(() => ({ type: "in-memory-session" })),
-  modelRuntimeExport: {} as { create?: ReturnType<typeof vi.fn> },
+  modelRuntimeExport: {} as { create: ReturnType<typeof vi.fn> },
   modelRuntimeCreateMock: vi.fn(),
   modelRuntimeRecords: [] as Array<{
     registerProvider: ReturnType<typeof vi.fn>;
@@ -517,7 +521,7 @@ function createHarness(
     };
     keybindingMatches?: (data: string, id: string) => boolean;
     tuiMode?: "regular" | "fullscreen";
-    contextMode?: "tui" | "rpc" | "print";
+    contextMode?: "tui" | "rpc" | "json" | "print";
   } = {},
 ) {
   const commands = new Map<string, RegisteredCommand>();
@@ -695,17 +699,15 @@ function createHarness(
         }
         return hasCredentials;
       }),
-      // pi 0.74 ExtensionContext.modelRegistry.find(provider, modelId) -> Model<Api> | undefined.
-      // The mock looks up entries from `registeredModels`; falls back to a default api so legacy
-      // tests that don't register a model still get a non-null result.
+      // Resolve explicitly registered fixtures, falling back to the harness model shape.
       find: vi.fn((provider: string, id: string) => {
         const key = `${provider}/${id}`;
         const known = registeredModels.get(key);
         if (known) return known;
         return { provider, id, api: "anthropic-messages" } as any;
       }),
-      // Pi 0.84+ ModelRegistry methods delegate through this.runtime. Keep the
-      // receiver dependency here so detached method calls fail in tests too.
+      // ModelRegistry methods delegate through runtime state. Keep the receiver
+      // dependency here so detached method calls fail in tests too.
       getRegisteredProviderConfig: vi.fn(function (
         this: { runtime: typeof modelRegistryRuntime },
         provider: string,
@@ -873,6 +875,8 @@ describe("btw runtime behavior", () => {
     expect(options.resourceLoader.getAppendSystemPrompt()[0]).toContain(
       "You are having an aside conversation with the user, separate from their main working session.",
     );
+    expect(options.resourceLoader.getSystemPromptSource()).toBeUndefined();
+    expect(options.resourceLoader.getAppendSystemPromptSources()).toEqual([]);
 
     const subSession = subSessionRecords[0]?.session;
     expect(subSession).toBeDefined();
@@ -1026,52 +1030,6 @@ describe("btw runtime behavior", () => {
     expect(createAgentSessionMock.mock.calls[0][0].modelRuntime).toBe(modelRuntimeRecords[0]);
   });
 
-  it("uses legacy modelRegistry while preserving BTW model and thinking overrides", async () => {
-    const harness = createHarness();
-    harness.registerModel("legacy-provider", "legacy-model", "custom-api");
-    harness.registerProviderConfig("legacy-provider", { api: "custom-api", streamSimple: vi.fn() });
-    delete modelRuntimeExport.create;
-
-    await harness.runSessionStart();
-    await harness.command("btw:model", "legacy-provider legacy-model custom-api");
-    await harness.command("btw:thinking", "low");
-    await harness.command("btw", "first question");
-    await harness.command("btw:summarize", "handoff this");
-
-    expect(modelRuntimeCreateMock).not.toHaveBeenCalled();
-    expect(createAgentSessionMock).toHaveBeenCalledTimes(2);
-
-    const [btwOptions, summaryOptions] = createAgentSessionMock.mock.calls.map(([options]) => options);
-    expect(btwOptions).toMatchObject({
-      model: { provider: "legacy-provider", id: "legacy-model", api: "custom-api" },
-      thinkingLevel: "low",
-      modelRegistry: harness.baseCtx.modelRegistry,
-    });
-    expect(btwOptions).not.toHaveProperty("modelRuntime");
-    expect(summaryOptions).toMatchObject({
-      model: { provider: "legacy-provider", id: "legacy-model", api: "custom-api" },
-      thinkingLevel: "off",
-      modelRegistry: harness.baseCtx.modelRegistry,
-    });
-    expect(summaryOptions).not.toHaveProperty("modelRuntime");
-  });
-
-  it("uses legacy modelRegistry when the registry lacks runtime provider introspection", async () => {
-    const harness = createHarness();
-    delete (harness.baseCtx.modelRegistry as { getRegisteredProviderConfig?: unknown }).getRegisteredProviderConfig;
-
-    await harness.runSessionStart();
-    await harness.command("btw", "first question");
-    await harness.command("btw:summarize", "handoff this");
-
-    expect(modelRuntimeCreateMock).not.toHaveBeenCalled();
-    expect(createAgentSessionMock).toHaveBeenCalledTimes(2);
-    for (const [options] of createAgentSessionMock.mock.calls) {
-      expect(options.modelRegistry).toBe(harness.baseCtx.modelRegistry);
-      expect(options).not.toHaveProperty("modelRuntime");
-    }
-  });
-
   it("uses BTW-specific model and thinking overrides for BTW prompts", async () => {
     const harness = createHarness();
     harness.setMainThinkingLevel("high");
@@ -1157,9 +1115,8 @@ describe("btw runtime behavior", () => {
         },
       },
     ]);
-    // pi 0.74: ctx.modelRegistry.find(provider, id) is the source of truth for the
-    // resolved Model. Register the saved override so restoration produces a Model whose
-    // .api matches what the persisted session was created with.
+    // Register the saved override so restoration resolves a model whose API matches
+    // the persisted session entry.
     harness.registerModel("saved-provider", "saved-model", "saved-api");
 
     await harness.runSessionStart();
@@ -2145,29 +2102,6 @@ describe("btw runtime behavior", () => {
     expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(1);
   });
 
-  it("detects legacy Pi RPC mode when ctx.mode is absent and stdout is not a TTY", async () => {
-    const descriptor = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
-    Object.defineProperty(process.stdout, "isTTY", { value: false, configurable: true });
-
-    try {
-      const harness = createHarness();
-      delete (harness.baseCtx as { mode?: string }).mode;
-      promptStreamMock.mockImplementation(() => streamAnswer("Legacy RPC answer"));
-
-      await harness.runSessionStart();
-      await harness.command("btw", "legacy rpc question");
-
-      expect(harness.overlays).toHaveLength(0);
-      expect(harness.sentMessages).toHaveLength(1);
-    } finally {
-      if (descriptor) {
-        Object.defineProperty(process.stdout, "isTTY", descriptor);
-      } else {
-        delete (process.stdout as { isTTY?: boolean }).isTTY;
-      }
-    }
-  });
-
   it("does not duplicate an explicitly saved RPC response and queues it while the main session is busy", async () => {
     const harness = createHarness([], { contextMode: "rpc" });
     promptStreamMock.mockImplementation(() => streamAnswer("Busy RPC answer"));
@@ -2249,25 +2183,23 @@ describe("btw runtime behavior", () => {
     expect(harness.terminalWrites).toEqual([]);
   });
 
-  for (const tuiMode of [undefined, "regular"] as const) {
-    it(`balances BTW-owned terminal mouse reporting in ${tuiMode ?? "legacy"} mode`, async () => {
-      const harness = createHarness([], { tuiMode });
+  it("balances BTW-owned terminal mouse reporting in regular mode", async () => {
+    const harness = createHarness([], { tuiMode: "regular" });
 
-      await harness.runSessionStart();
-      await harness.command("btw", "");
+    await harness.runSessionStart();
+    await harness.command("btw", "");
 
-      expect(harness.terminalWrites).toEqual(["\x1b[?1000h\x1b[?1006h"]);
+    expect(harness.terminalWrites).toEqual(["\x1b[?1000h\x1b[?1006h"]);
 
-      const overlay = harness.latestOverlayComponent();
-      overlay.input.onEscape?.();
-      await flushAsyncWork();
+    const overlay = harness.latestOverlayComponent();
+    overlay.input.onEscape?.();
+    await flushAsyncWork();
 
-      expect(harness.terminalWrites).toEqual([
-        "\x1b[?1000h\x1b[?1006h",
-        "\x1b[?1000l\x1b[?1006l",
-      ]);
-    });
-  }
+    expect(harness.terminalWrites).toEqual([
+      "\x1b[?1000h\x1b[?1006h",
+      "\x1b[?1000l\x1b[?1006l",
+    ]);
+  });
 
   it("toggles BTW overlay focus with the registered focus shortcuts without closing it", async () => {
     const harness = createHarness();
@@ -2291,6 +2223,20 @@ describe("btw runtime behavior", () => {
     expect(handle?.isFocused()).toBe(true);
     expect(handle?.isHidden()).toBe(false);
     expect(overlay.focused).toBe(true);
+
+    // Kitty keyboard protocol: slash (47) with Super modifier (8 + 1).
+    overlay.handleInput("\x1b[47;9u");
+    expect(handle?.isFocused()).toBe(false);
+    expect(handle?.isHidden()).toBe(false);
+    expect(overlay.focused).toBe(false);
+
+    await harness.shortcut("super+/");
+    expect(handle?.isFocused()).toBe(true);
+    expect(handle?.isHidden()).toBe(false);
+    expect(overlay.focused).toBe(true);
+
+    overlay.refresh();
+    expect(overlay.hintsText.text).toContain("Super+/");
   });
 
   it("marks the overlay input focused when BTW opens so the cursor stays in the composer", async () => {
@@ -3005,3 +2951,54 @@ describe("btw runtime behavior", () => {
     }
   });
 });
+describe("configurable BTW focus shortcuts", () => {
+  it("uses the built-in defaults when PI_BTW_FOCUS_KEYS is unset or blank", () => {
+    expect(resolveBtwFocusShortcuts({})).toEqual(["alt+/", "super+/", "ctrl+alt+w"]);
+    expect(resolveBtwFocusShortcuts({ PI_BTW_FOCUS_KEYS: "   " })).toEqual([
+      "alt+/",
+      "super+/",
+      "ctrl+alt+w",
+    ]);
+  });
+
+  it("replaces the defaults with a normalized, de-duplicated override list", () => {
+    expect(
+      resolveBtwFocusShortcuts({ PI_BTW_FOCUS_KEYS: "Ctrl+/ , ctrl+alt+b, CTRL+/ " }),
+    ).toEqual(["ctrl+/", "ctrl+alt+b"]);
+  });
+
+  it("drops unparseable entries but keeps the valid ones", () => {
+    expect(
+      resolveBtwFocusShortcuts({ PI_BTW_FOCUS_KEYS: "cmd+/,ctrl+/,control+x,super+enter" }),
+    ).toEqual(["ctrl+/", "super+enter"]);
+  });
+
+  it("falls back to defaults when no override entry is usable", () => {
+    expect(resolveBtwFocusShortcuts({ PI_BTW_FOCUS_KEYS: "cmd+/, bogus+++" })).toEqual([
+      "alt+/",
+      "super+/",
+      "ctrl+alt+w",
+    ]);
+  });
+
+  it("validates identifiers against the pi-tui key grammar", () => {
+    expect(isValidFocusShortcut("ctrl+/")).toBe(true);
+    expect(isValidFocusShortcut("super+enter")).toBe(true);
+    expect(isValidFocusShortcut("f5")).toBe(true);
+    expect(isValidFocusShortcut("a")).toBe(true);
+    expect(isValidFocusShortcut("cmd+/")).toBe(false);
+    expect(isValidFocusShortcut("control+x")).toBe(false);
+    expect(isValidFocusShortcut("ctrl+ctrl+/")).toBe(false);
+    expect(isValidFocusShortcut("ctrl+")).toBe(false);
+    expect(isValidFocusShortcut("")).toBe(false);
+  });
+
+  it("describes shortcuts with a human-readable label", () => {
+    expect(describeFocusShortcuts(["alt+/", "super+/", "ctrl+alt+w"])).toBe(
+      "Alt+/, Super+/ or Ctrl+Alt+W",
+    );
+    expect(describeFocusShortcuts(["ctrl+/"])).toBe("Ctrl+/");
+    expect(describeFocusShortcuts([])).toBe("");
+  });
+});
+

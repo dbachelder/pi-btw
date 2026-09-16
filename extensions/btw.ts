@@ -1,11 +1,12 @@
-import * as piCodingAgent from "@earendil-works/pi-coding-agent";
 import {
   buildSessionContext,
   createAgentSession,
   createExtensionRuntime,
   getMarkdownTheme,
+  ModelRuntime,
   SessionManager,
   type AgentSession,
+  type CreateAgentSessionOptions,
   type AgentSessionEvent,
   type ExtensionAPI,
   type ExtensionCommandContext,
@@ -15,7 +16,6 @@ import {
 import {
   type AssistantMessage,
   type Message,
-  type Provider,
   type ThinkingLevel as AiThinkingLevel,
   type UserMessage,
 } from "@earendil-works/pi-ai";
@@ -32,6 +32,7 @@ import {
   wrapTextWithAnsi,
   type Focusable,
   type KeybindingsManager,
+  type KeyId,
   type MarkdownTheme,
   type OverlayHandle,
   type TUI,
@@ -42,7 +43,109 @@ const BTW_ENTRY_TYPE = "btw-thread-entry";
 const BTW_RESET_TYPE = "btw-thread-reset";
 const BTW_MODEL_OVERRIDE_TYPE = "btw-model-override";
 const BTW_THINKING_OVERRIDE_TYPE = "btw-thinking-override";
-const BTW_FOCUS_SHORTCUTS = [Key.alt("/"), Key.ctrlAlt("w")] as const;
+const BTW_DEFAULT_FOCUS_SHORTCUTS: readonly KeyId[] = [Key.alt("/"), Key.super("/"), Key.ctrlAlt("w")];
+const BTW_FOCUS_KEYS_ENV = "PI_BTW_FOCUS_KEYS";
+const BTW_FOCUS_MODIFIERS = new Set(["ctrl", "shift", "alt", "super"]);
+// Mirrors the SpecialKey union in @earendil-works/pi-tui keys.d.ts (lower-cased).
+const BTW_FOCUS_SPECIAL_KEYS = new Set([
+  "escape", "esc", "enter", "return", "tab", "space", "backspace", "delete", "insert", "clear",
+  "home", "end", "pageup", "pagedown", "up", "down", "left", "right",
+  "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12",
+]);
+// Symbols from the SymbolKey union (letters/digits are matched directly).
+const BTW_FOCUS_SYMBOL_KEYS = new Set([
+  "`", "-", "=", "[", "]", "\\", ";", "'", ",", ".", "/", "!", "@", "#", "$", "%", "^", "&", "*",
+  "(", ")", "_", "+", "|", "~", "{", "}", ":", "<", ">", "?",
+]);
+
+/**
+ * Resolve the BTW overlay focus-toggle shortcuts.
+ *
+ * Users whose window manager or terminal claims the default shortcuts can override them by
+ * setting PI_BTW_FOCUS_KEYS to a comma-separated list of pi-tui key identifiers
+ * (e.g. "ctrl+/,ctrl+alt+b"). Blank, duplicate, or unparseable entries are ignored; if no
+ * usable entries remain, the defaults are kept so focus toggling never becomes impossible.
+ */
+export function resolveBtwFocusShortcuts(env: NodeJS.ProcessEnv = process.env): KeyId[] {
+  const raw = env[BTW_FOCUS_KEYS_ENV];
+  if (typeof raw !== "string" || raw.trim() === "") {
+    return [...BTW_DEFAULT_FOCUS_SHORTCUTS];
+  }
+
+  const seen = new Set<string>();
+  const shortcuts: KeyId[] = [];
+  for (const part of raw.split(",")) {
+    const candidate = part.trim().toLowerCase();
+    if (!candidate || seen.has(candidate) || !isValidFocusShortcut(candidate)) {
+      continue;
+    }
+    seen.add(candidate);
+    shortcuts.push(candidate as KeyId);
+  }
+
+  return shortcuts.length > 0 ? shortcuts : [...BTW_DEFAULT_FOCUS_SHORTCUTS];
+}
+
+/**
+ * Validate a candidate against the pi-tui KeyId grammar: zero or more distinct recognized
+ * modifiers followed by exactly one base key (letter, digit, symbol, or named special key).
+ * Rejects typos like "cmd+/" or "control+x" and duplicate/empty segments.
+ */
+export function isValidFocusShortcut(candidate: string): boolean {
+  const segments = candidate.split("+");
+  const base = segments.pop();
+  if (base === undefined || !isValidFocusBaseKey(base)) {
+    return false;
+  }
+
+  const seen = new Set<string>();
+  for (const segment of segments) {
+    if (!BTW_FOCUS_MODIFIERS.has(segment) || seen.has(segment)) {
+      return false;
+    }
+    seen.add(segment);
+  }
+
+  return true;
+}
+
+function isValidFocusBaseKey(base: string): boolean {
+  if (base.length === 1) {
+    return /[a-z0-9]/.test(base) || BTW_FOCUS_SYMBOL_KEYS.has(base);
+  }
+  return BTW_FOCUS_SPECIAL_KEYS.has(base);
+}
+
+function formatFocusShortcutLabel(shortcut: KeyId): string {
+  return shortcut
+    .split("+")
+    .map((segment) => {
+      switch (segment) {
+        case "ctrl":
+          return "Ctrl";
+        case "alt":
+          return "Alt";
+        case "shift":
+          return "Shift";
+        case "super":
+          return "Super";
+        default:
+          return segment.length === 1 ? segment.toUpperCase() : segment;
+      }
+    })
+    .join("+");
+}
+
+export function describeFocusShortcuts(shortcuts: readonly KeyId[]): string {
+  const labels = shortcuts.map(formatFocusShortcutLabel);
+  if (labels.length <= 1) {
+    return labels[0] ?? "";
+  }
+  return `${labels.slice(0, -1).join(", ")} or ${labels[labels.length - 1]}`;
+}
+
+const BTW_FOCUS_SHORTCUTS: readonly KeyId[] = resolveBtwFocusShortcuts();
+const BTW_FOCUS_SHORTCUTS_LABEL = describeFocusShortcuts(BTW_FOCUS_SHORTCUTS);
 
 function matchesBtwFocusShortcut(data: string): boolean {
   return BTW_FOCUS_SHORTCUTS.some((shortcut) => matchesKey(data, shortcut));
@@ -159,60 +262,6 @@ type BtwSessionRuntime = {
   promptQueue: Promise<void>;
 };
 
-type BtwModelRuntime = {
-  registerProvider: (providerId: string, config: unknown) => void;
-  refresh: (options: { allowNetwork: boolean }) => Promise<unknown>;
-  setRuntimeApiKey?: (providerId: string, apiKey: string) => Promise<void>;
-  registerNativeProvider?: (provider: Provider) => void;
-};
-
-type ModelRuntimeConstructor = {
-  create: (options?: { allowModelNetwork?: boolean }) => Promise<BtwModelRuntime>;
-};
-
-type ModelRegistryWithRuntimeSupport = {
-  getRegisteredProviderConfig?: (providerId: string) => unknown;
-  getRegisteredNativeProvider?: (providerId: string) => Provider | undefined;
-  getProviderAuthStatus?: (providerId: string) => { source?: string } | undefined;
-};
-
-type BtwResolvedRequestAuth =
-  | {
-      ok: true;
-      apiKey?: string;
-      headers?: Record<string, string>;
-      env?: Record<string, string>;
-    }
-  | { ok: false; error: string };
-
-type BtwModelRuntimeOptions = {
-  modelRuntime?: BtwModelRuntime;
-  modelRegistry?: ExtensionCommandContext["modelRegistry"];
-};
-
-type BtwCreateAgentSessionOptions = BtwModelRuntimeOptions & {
-  sessionManager: ReturnType<typeof SessionManager.inMemory>;
-  model: SessionModel;
-  thinkingLevel: SessionThinkingLevel;
-  tools: string[];
-  resourceLoader: ResourceLoader;
-};
-
-type BtwResourceLoader = Pick<
-  ResourceLoader,
-  | "getExtensions"
-  | "getSkills"
-  | "getPrompts"
-  | "getThemes"
-  | "getAgentsFiles"
-  | "getSystemPrompt"
-  | "getAppendSystemPrompt"
-  | "extendResources"
-  | "reload"
->;
-
-type BtwHostContext = { mode?: "tui" | "rpc" | "print" };
-
 type OverlayRuntime = {
   handle?: OverlayHandle;
   refresh?: () => void;
@@ -244,42 +293,30 @@ function createBtwResourceLoader(
   const extensionsResult = { extensions: [], errors: [], runtime: createExtensionRuntime() };
   const systemPrompt = stripDynamicSystemPromptFooter(ctx.getSystemPrompt());
 
-  const resourceLoader: BtwResourceLoader = {
+  const resourceLoader: ResourceLoader = {
     getExtensions: () => extensionsResult,
     getSkills: () => ({ skills: [], diagnostics: [] }),
     getPrompts: () => ({ prompts: [], diagnostics: [] }),
     getThemes: () => ({ themes: [], diagnostics: [] }),
     getAgentsFiles: () => ({ agentsFiles: [] }),
     getSystemPrompt: () => systemPrompt,
+    getSystemPromptSource: () => undefined,
     getAppendSystemPrompt: () => appendSystemPrompt,
+    getAppendSystemPromptSources: () => [],
     extendResources: () => {},
-    reload: async () => {},
+    reload: async (_options) => {},
   };
 
-  return Object.assign(resourceLoader, {
-    getSystemPromptSource: () => undefined,
-    getAppendSystemPromptSources: () => [],
-  });
+  return resourceLoader;
 }
 
 async function createBtwModelRuntimeOptions(
   ctx: ExtensionCommandContext,
   model: SessionModel,
-): Promise<BtwModelRuntimeOptions> {
-  const registry = ctx.modelRegistry as typeof ctx.modelRegistry & ModelRegistryWithRuntimeSupport;
-  const ModelRuntime = (piCodingAgent as { ModelRuntime?: ModelRuntimeConstructor }).ModelRuntime;
-
-  if (
-    !ModelRuntime ||
-    typeof ModelRuntime.create !== "function" ||
-    typeof registry.getRegisteredProviderConfig !== "function"
-  ) {
-    return { modelRegistry: ctx.modelRegistry };
-  }
-
-  const nativeProvider = registry.getRegisteredNativeProvider?.(model.provider);
-  const providerConfig = registry.getRegisteredProviderConfig(model.provider);
-  const hasRuntimeApiKey = registry.getProviderAuthStatus?.(model.provider)?.source === "runtime";
+): Promise<Pick<CreateAgentSessionOptions, "modelRuntime">> {
+  const nativeProvider = ctx.modelRegistry.getRegisteredNativeProvider(model.provider);
+  const providerConfig = ctx.modelRegistry.getRegisteredProviderConfig(model.provider);
+  const hasRuntimeApiKey = ctx.modelRegistry.getProviderAuthStatus(model.provider).source === "runtime";
 
   if (!nativeProvider && !providerConfig && !hasRuntimeApiKey) {
     return {};
@@ -287,9 +324,6 @@ async function createBtwModelRuntimeOptions(
 
   const modelRuntime = await ModelRuntime.create({ allowModelNetwork: false });
   if (nativeProvider) {
-    if (!modelRuntime.registerNativeProvider) {
-      throw new Error(`Pi does not support native provider ${model.provider}.`);
-    }
     modelRuntime.registerNativeProvider(nativeProvider);
   } else if (providerConfig) {
     modelRuntime.registerProvider(model.provider, providerConfig);
@@ -300,9 +334,6 @@ async function createBtwModelRuntimeOptions(
   if (hasRuntimeApiKey) {
     const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
     if (auth.ok && auth.apiKey) {
-      if (!modelRuntime.setRuntimeApiKey) {
-        throw new Error(`Pi does not support runtime API key propagation for ${model.provider}.`);
-      }
       await modelRuntime.setRuntimeApiKey(model.provider, auth.apiKey);
     }
   }
@@ -310,14 +341,14 @@ async function createBtwModelRuntimeOptions(
   return { modelRuntime };
 }
 
-function hasResolvedAuthValues(values?: Record<string, string>): boolean {
-  return !!values && Object.values(values).some((value) => value.length > 0);
+function hasResolvedAuthValues(values?: Record<string, string | null | undefined>): boolean {
+  return !!values && Object.values(values).some((value) => typeof value === "string" && value.length > 0);
 }
 
 function hasUsableModelAuth(
   ctx: ExtensionCommandContext,
   model: SessionModel,
-  auth: BtwResolvedRequestAuth,
+  auth: Awaited<ReturnType<ExtensionCommandContext["modelRegistry"]["getApiKeyAndHeaders"]>>,
 ): boolean {
   if (!auth.ok) {
     return false;
@@ -1171,14 +1202,7 @@ function saveVisibleBtwNote(
 }
 
 function canRenderBtwOverlay(ctx: ExtensionContext | ExtensionCommandContext): boolean {
-  const mode = (ctx as ExtensionContext & BtwHostContext).mode;
-  if (mode !== undefined) {
-    return ctx.hasUI && mode === "tui";
-  }
-
-  // Pi 0.74 does not expose ctx.mode. In that runtime RPC uses a non-TTY
-  // stdout while the interactive host has a real terminal.
-  return ctx.hasUI && process.stdout.isTTY === true;
+  return ctx.hasUI && ctx.mode === "tui";
 }
 
 function notifyInlineQuestionRequired(
@@ -1211,8 +1235,6 @@ function buildTranscriptBadge(
 ): string {
   return theme.bg(background, theme.fg(foreground, theme.bold(` ${label} `)));
 }
-
-type BtwTui = TUI & { mode?: "regular" | "fullscreen" };
 
 class BtwOverlayComponent extends Container implements Focusable {
   private readonly input: Input;
@@ -1266,9 +1288,9 @@ class BtwOverlayComponent extends Container implements Focusable {
     this.tui = tui;
     this.theme = theme;
     this.markdownTheme = getMarkdownTheme();
-    // Fullscreen Pi owns mouse reporting for the entire terminal session. Regular
-    // and legacy TUI hosts do not, so BTW must manage it while the overlay exists.
-    this.managesMouseReporting = (tui as BtwTui).mode !== "fullscreen";
+    // Fullscreen Pi owns mouse reporting for the entire terminal session. In
+    // regular mode BTW manages it while the overlay exists.
+    this.managesMouseReporting = tui.mode !== "fullscreen";
     this.readTranscriptEntries = readTranscriptEntries;
     this.getStatus = getStatus;
     this.getMode = getMode;
@@ -1527,7 +1549,7 @@ class BtwOverlayComponent extends Container implements Focusable {
     const status = this.getStatus() ?? "Ready. Enter submits; Escape dismisses without clearing.";
     this.statusTextValue = status;
     this.statusText.setText(this.statusTextValue);
-    this.hintsTextValue = "Scroll wheel ↑↓ PgUp/PgDn · Enter · Alt+/ focus · Esc";
+    this.hintsTextValue = `Scroll wheel ↑↓ PgUp/PgDn · Enter · ${BTW_FOCUS_SHORTCUTS_LABEL} focus · Esc`;
     this.hintsText.setText(this.hintsTextValue);
     this.tui.requestRender();
   }
@@ -1720,7 +1742,7 @@ export default function (pi: ExtensionAPI) {
     notifyOnFallback = false,
   ): Promise<ResolvedBtwModel> {
     if (btwModelOverride) {
-      const auth = (await ctx.modelRegistry.getApiKeyAndHeaders(btwModelOverride)) as BtwResolvedRequestAuth;
+      const auth = await ctx.modelRegistry.getApiKeyAndHeaders(btwModelOverride);
       if (hasUsableModelAuth(ctx, btwModelOverride, auth)) {
         return {
           model: btwModelOverride,
@@ -1857,7 +1879,7 @@ export default function (pi: ExtensionAPI) {
 
     const modelRuntimeOptions = await createBtwModelRuntimeOptions(ctx, settings.model);
 
-    const sessionOptions: BtwCreateAgentSessionOptions = {
+    const sessionOptions: CreateAgentSessionOptions = {
       sessionManager: SessionManager.inMemory(),
       model: settings.model,
       ...modelRuntimeOptions,
@@ -1866,7 +1888,7 @@ export default function (pi: ExtensionAPI) {
       tools: ["read", "bash", "edit", "write"],
       resourceLoader: createBtwResourceLoader(ctx),
     };
-    const { session } = await createAgentSession(sessionOptions as Parameters<typeof createAgentSession>[0]);
+    const { session } = await createAgentSession(sessionOptions);
 
     const { messages: seedMessages, sideThreadStartIndex } = buildBtwSeedState(ctx, pendingThread, mode, settings.model);
     if (seedMessages.length > 0) {
@@ -2339,7 +2361,7 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    const auth = (await ctx.modelRegistry.getApiKeyAndHeaders(model)) as BtwResolvedRequestAuth;
+    const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
     if (!isCurrentGeneration()) {
       return;
     }
@@ -2515,14 +2537,14 @@ export default function (pi: ExtensionAPI) {
       throw new Error(settings.fallbackReason || "No active model selected.");
     }
 
-    const auth = (await ctx.modelRegistry.getApiKeyAndHeaders(model)) as BtwResolvedRequestAuth;
+    const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
     if (!hasUsableModelAuth(ctx, model, auth)) {
       throw new Error(auth.ok ? `No credentials available for ${model.provider}/${model.id}.` : auth.error);
     }
 
     const modelRuntimeOptions = await createBtwModelRuntimeOptions(ctx, model);
 
-    const sessionOptions: BtwCreateAgentSessionOptions = {
+    const sessionOptions: CreateAgentSessionOptions = {
       sessionManager: SessionManager.inMemory(),
       model,
       ...modelRuntimeOptions,
@@ -2530,7 +2552,7 @@ export default function (pi: ExtensionAPI) {
       tools: [],
       resourceLoader: createBtwResourceLoader(ctx, [BTW_SUMMARIZE_SYSTEM_PROMPT]),
     };
-    const { session } = await createAgentSession(sessionOptions as Parameters<typeof createAgentSession>[0]);
+    const { session } = await createAgentSession(sessionOptions);
 
     try {
       await session.prompt(formatThread(thread), { source: "extension" });
