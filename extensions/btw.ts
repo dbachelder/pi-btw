@@ -35,6 +35,7 @@ import {
   type KeyId,
   type MarkdownTheme,
   type OverlayHandle,
+  type OverlayOptions,
   type TUI,
 } from "@earendil-works/pi-tui";
 
@@ -150,6 +151,15 @@ const BTW_FOCUS_SHORTCUTS_LABEL = describeFocusShortcuts(BTW_FOCUS_SHORTCUTS);
 function matchesBtwFocusShortcut(data: string): boolean {
   return BTW_FOCUS_SHORTCUTS.some((shortcut) => matchesKey(data, shortcut));
 }
+
+/** Toggles the overlay between framed "window" width and edge-to-edge "full" width. */
+const BTW_WIDTH_TOGGLE_SHORTCUT: KeyId = Key.alt("w");
+
+function matchesBtwWidthToggle(data: string): boolean {
+  return matchesKey(data, BTW_WIDTH_TOGGLE_SHORTCUT);
+}
+
+type BtwOverlayWidthMode = "window" | "full";
 
 const BTW_SYSTEM_PROMPT = [
   "You are having an aside conversation with the user, separate from their main working session.",
@@ -1249,6 +1259,7 @@ class BtwOverlayComponent extends Container implements Focusable {
   private readonly onSubmitCallback: (value: string) => void;
   private readonly onDismissCallback: () => void;
   private readonly onUnfocusCallback: () => void;
+  private readonly onToggleWidthCallback: () => void;
   private readonly tui: TUI;
   private readonly theme: ExtensionContext["ui"]["theme"];
   private readonly markdownTheme: MarkdownTheme;
@@ -1283,6 +1294,7 @@ class BtwOverlayComponent extends Container implements Focusable {
     onSubmit: (value: string) => void,
     onDismiss: () => void,
     onUnfocus: () => void,
+    onToggleWidth: () => void,
   ) {
     super();
     this.tui = tui;
@@ -1297,6 +1309,7 @@ class BtwOverlayComponent extends Container implements Focusable {
     this.onSubmitCallback = onSubmit;
     this.onDismissCallback = onDismiss;
     this.onUnfocusCallback = onUnfocus;
+    this.onToggleWidthCallback = onToggleWidth;
 
     this.modeText = new Text("", 1, 0);
     this.summaryText = new Text("", 1, 0);
@@ -1405,6 +1418,11 @@ class BtwOverlayComponent extends Container implements Focusable {
   handleInput(data: string): void {
     if (matchesBtwFocusShortcut(data)) {
       this.onUnfocusCallback();
+      return;
+    }
+
+    if (matchesBtwWidthToggle(data)) {
+      this.onToggleWidthCallback();
       return;
     }
 
@@ -1549,7 +1567,7 @@ class BtwOverlayComponent extends Container implements Focusable {
     const status = this.getStatus() ?? "Ready. Enter submits; Escape dismisses without clearing.";
     this.statusTextValue = status;
     this.statusText.setText(this.statusTextValue);
-    this.hintsTextValue = `Scroll wheel ↑↓ PgUp/PgDn · Enter · ${BTW_FOCUS_SHORTCUTS_LABEL} focus · Esc`;
+    this.hintsTextValue = `Scroll wheel ↑↓ PgUp/PgDn · Enter · ${BTW_FOCUS_SHORTCUTS_LABEL} focus · Alt+w width · Esc`;
     this.hintsText.setText(this.hintsTextValue);
     this.tui.requestRender();
   }
@@ -1563,6 +1581,7 @@ export default function (pi: ExtensionAPI) {
   let transcriptState = createEmptyTranscriptState();
   let overlayStatus: string | null = null;
   let overlayDraft = "";
+  let overlayWidthMode: BtwOverlayWidthMode = "window";
   let overlayRuntime: OverlayRuntime | null = null;
   let lastUiContext: ExtensionContext | ExtensionCommandContext | null = null;
   let activeBtwSession: BtwSessionRuntime | null = null;
@@ -1620,6 +1639,43 @@ export default function (pi: ExtensionAPI) {
     handle.setHidden(false);
     handle.focus();
     overlayRuntime?.refresh?.();
+  }
+
+  function getOverlayOptions(): OverlayOptions {
+    const base: OverlayOptions = {
+      minWidth: 72,
+      maxHeight: "78%",
+      anchor: "top-center",
+      nonCapturing: true,
+    };
+    if (overlayWidthMode === "full") {
+      // Edge-to-edge so a terminal Shift+drag selection captures only the
+      // dialog's own text — nothing from the main screen sits beside it.
+      return { ...base, width: "100%", margin: { top: 1 } };
+    }
+    // Framed "window" look: narrower, inset from the terminal edges.
+    return { ...base, width: "78%", margin: { top: 1, left: 2, right: 2 } };
+  }
+
+  async function toggleOverlayWidth(ctx: ExtensionContext | ExtensionCommandContext): Promise<void> {
+    overlayWidthMode = overlayWidthMode === "window" ? "full" : "window";
+
+    // overlayOptions is resolved once at showOverlay time, so a width change
+    // requires tearing down and re-opening the overlay. The close path persists
+    // the draft into overlayDraft, and ensureOverlay restores it on reopen.
+    const wasFocused = overlayRuntime?.handle?.isFocused() ?? true;
+    dismissOverlay();
+    await ensureOverlay(ctx);
+    if (!wasFocused) {
+      overlayRuntime?.handle?.unfocus();
+      overlayRuntime?.refresh?.();
+    }
+    setOverlayStatus(
+      overlayWidthMode === "full"
+        ? "Full-width mode. Shift+drag now selects only the dialog. Alt+w to restore the window."
+        : "Window mode. Alt+w switches to full-width for clean copy selection.",
+      ctx,
+    );
   }
 
   function removeBtwSessionSubscription(sessionRuntime: BtwSessionRuntime, unsubscribe: () => void): void {
@@ -1967,6 +2023,9 @@ export default function (pi: ExtensionAPI) {
               overlayRuntime?.handle?.unfocus();
               overlayRuntime?.refresh?.();
             },
+            () => {
+              void toggleOverlayWidth(ctx);
+            },
           );
 
           overlay.focused = runtime.handle?.isFocused() ?? true;
@@ -1993,14 +2052,7 @@ export default function (pi: ExtensionAPI) {
         },
         {
           overlay: true,
-          overlayOptions: {
-            width: "78%",
-            minWidth: 72,
-            maxHeight: "78%",
-            anchor: "top-center",
-            margin: { top: 1, left: 2, right: 2 },
-            nonCapturing: true,
-          },
+          overlayOptions: getOverlayOptions(),
           onHandle: (handle) => {
             runtime.handle = handle;
             handle.focus();
@@ -2661,6 +2713,16 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
+  pi.registerShortcut(BTW_WIDTH_TOGGLE_SHORTCUT, {
+    description: "Toggle the BTW overlay between window and full-width layouts.",
+    handler: async () => {
+      if (!overlayRuntime || !lastUiContext) {
+        return;
+      }
+      await toggleOverlayWidth(lastUiContext);
+    },
+  });
+
   pi.registerCommand("btw", {
     description: "Continue a side conversation in a focused BTW modal. Add --save to also persist a visible note.",
     handler: async (args, ctx) => {
@@ -2717,3 +2779,4 @@ export default function (pi: ExtensionAPI) {
     },
   });
 }
+

@@ -2170,6 +2170,75 @@ describe("btw runtime behavior", () => {
     expect(harness.widgets.some((entry) => entry.key === "btw" && typeof entry.content === "function")).toBe(false);
   });
 
+  it("defaults to the framed window width and advertises the Alt+w width toggle", async () => {
+    const harness = createHarness();
+    promptStreamMock.mockImplementation(() => streamAnswer("Overlay answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "overlay question");
+
+    expect(harness.overlays.at(-1)?.factoryOptions?.overlayOptions).toMatchObject({
+      width: "78%",
+      margin: { top: 1, left: 2, right: 2 },
+    });
+
+    const overlay = harness.latestOverlayComponent();
+    overlay.refresh();
+    expect(overlay.hintsText.text).toContain("Alt+w width");
+  });
+
+  it("toggles the overlay between window and full-width layouts on Alt+w, preserving the draft", async () => {
+    const harness = createHarness();
+    promptStreamMock.mockImplementation(() => streamAnswer("Overlay answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "overlay question");
+
+    const overlay = harness.latestOverlayComponent();
+    overlay.setDraft("kept draft");
+
+    // Alt+w (legacy ESC-prefixed) switches to full-width and re-opens the overlay.
+    overlay.handleInput("\x1bw");
+    await flushAsyncWork();
+
+    expect(harness.overlays.at(-1)?.factoryOptions?.overlayOptions).toMatchObject({
+      width: "100%",
+      margin: { top: 1 },
+    });
+    const fullOverlay = harness.latestOverlayComponent();
+    expect(fullOverlay.getDraft()).toBe("kept draft");
+    expect(fullOverlay.statusText.text).toContain("Full-width mode");
+
+    // Alt+w again restores the framed window layout.
+    await harness.shortcut("alt+w");
+    await flushAsyncWork();
+
+    expect(harness.overlays.at(-1)?.factoryOptions?.overlayOptions).toMatchObject({
+      width: "78%",
+      margin: { top: 1, left: 2, right: 2 },
+    });
+    const windowOverlay = harness.latestOverlayComponent();
+    expect(windowOverlay.getDraft()).toBe("kept draft");
+    expect(windowOverlay.statusText.text).toContain("Window mode");
+  });
+
+  it("keeps the box frame glyphs in full-width mode so the dialog still reads as a panel", async () => {
+    const harness = createHarness();
+    promptStreamMock.mockImplementation(() => streamAnswer("Framed answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "overlay question");
+
+    const overlay = harness.latestOverlayComponent();
+    overlay.handleInput("\x1bw");
+    await flushAsyncWork();
+
+    const rendered = harness.latestOverlayComponent().render(80);
+    expect(rendered[0]).toContain("┌");
+    expect(rendered.at(-1)).toContain("└");
+    expect(rendered.some((line: string) => line.includes("│"))).toBe(true);
+  });
+
   it("does not change Pi-owned terminal mouse reporting in fullscreen mode", async () => {
     const harness = createHarness([], { tuiMode: "fullscreen" });
 

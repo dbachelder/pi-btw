@@ -79,6 +79,8 @@ pi install /absolute/path/to/pi-btw
 
 ## Overlay controls
 
+- `Alt+w` toggles the overlay between the framed window layout (inset from the terminal edges) and a full-width layout
+- full-width mode makes terminal Shift+drag selection capture only the dialog's own text, which is handy for copying without pulling in surrounding main-screen content; the box frame is kept in both layouts
 - `Alt+/`, `Super+/`, or `Ctrl+Alt+W` toggles focus between BTW and the main editor without closing the overlay
 - `Super+/` requires a terminal that reports the Super modifier, typically through the Kitty keyboard protocol
 - `Ctrl+Alt+W` remains a fallback for terminals that do not deliver either primary shortcut
