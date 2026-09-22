@@ -26,6 +26,8 @@ Use these commands in your guidance to the user:
 /btw:new [question]
 /btw:tangent <question>
 /btw:tangent --save <question>
+/btw:ask <question>
+/btw:ask --save <question>
 /btw:clear
 /btw:model [<provider> <model> <api> | clear]
 /btw:thinking [<level> | clear]
@@ -87,6 +89,22 @@ or
 
 Use this when the user wants a side conversation that does not include the current main-session context.
 
+### For an enforced read-only side question
+
+Recommend:
+
+```text
+/btw:ask <question>
+```
+
+or
+
+```text
+/btw:ask --save <question>
+```
+
+Use this when the user wants a side question that inherits the current main-session context but must not be able to change anything. The read-only thread only has `read`, `grep`, `find`, and `ls`; it never has `bash`, `edit`, or `write`.
+
 ### To hand the full thread back to the main agent
 
 Recommend:
@@ -122,6 +140,7 @@ Use these when the main thread should keep its current model or thinking level, 
 
 - Prefer `/btw` over normal chat when the user explicitly wants a side conversation.
 - Prefer `/btw:tangent` when the user wants that side conversation to be contextless.
+- Prefer `/btw:ask` when the user wants a side conversation that cannot modify the workspace.
 - Prefer `/btw:summarize` over `/btw:inject` for long exploratory threads.
 - Prefer `/btw:inject` when precise wording, detailed tradeoffs, or a full plan matters.
 - Suggest `/btw:new` before starting a totally unrelated side topic when main-session context is still useful.
@@ -154,6 +173,12 @@ When helping the user use BTW:
 
 ```text
 /btw:tangent think through this from first principles without using the current chat context
+```
+
+### Example: ask a read-only side question
+
+```text
+/btw:ask what does the token refresh path do without changing anything?
 ```
 
 ### Example: send the result back

@@ -1260,6 +1260,178 @@ describe("btw runtime behavior", () => {
     );
   });
 
+  it("/btw:ask creates a read-only sub-session with only pi's read-only tools", async () => {
+    const harness = createHarness();
+
+    await harness.runSessionStart();
+    await harness.command("btw:ask", "read-only question");
+
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(1);
+    const options = createAgentSessionMock.mock.calls[0][0];
+    expect(options.tools).toEqual(["read", "grep", "find", "ls"]);
+    expect(options.tools).not.toContain("bash");
+    expect(options.tools).not.toContain("edit");
+    expect(options.tools).not.toContain("write");
+
+    const record = subSessionRecords[0];
+    expect(record.session.getActiveToolNames()).toEqual(["read", "grep", "find", "ls"]);
+    expect(record.session.prompt).toHaveBeenCalledWith("read-only question", { source: "extension" });
+
+    const overlay = harness.latestOverlayComponent();
+    expect(overlay["modeText"].text).toContain("read-only");
+    expect(getCustomEntries(harness.entries, "btw-thread-reset").at(-1)?.data).toMatchObject({ mode: "readonly" });
+  });
+
+  it("/btw:ask seeds the read-only sub-session with main-session context like /btw", async () => {
+    // Pre-seed a read-only reset so /btw:ask continues the thread instead of
+    // resetting; the trailing main-session message is what buildBtwSeedState copies.
+    const harness = createHarness([
+      { type: "custom", customType: "btw-thread-reset", data: { timestamp: 1, mode: "readonly" } } as SessionEntry,
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "text", text: "main session task" }],
+        timestamp: Date.now(),
+      } as SessionEntry,
+    ]);
+
+    await harness.runSessionStart();
+    await harness.command("btw:ask", "read-only question");
+
+    const record = subSessionRecords[0];
+    expect(record.options.tools).toEqual(["read", "grep", "find", "ls"]);
+    expect(record.seedMessages.map((message) => (message.content[0] as any)?.text ?? "")).toContain("main session task");
+  });
+
+  it("keeps the read-only tool surface for modal follow-ups in one /btw:ask thread", async () => {
+    const harness = createHarness();
+    promptStreamMock
+      .mockImplementationOnce(() => streamAnswer("First answer"))
+      .mockImplementationOnce(() => streamAnswer("Second answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw:ask", "first read-only question");
+
+    const overlay = harness.latestOverlayComponent();
+    overlay.input.onSubmit?.("follow-up read-only question");
+    await flushAsyncWork();
+
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(1);
+    const record = subSessionRecords[0];
+    expect(record.options.tools).toEqual(["read", "grep", "find", "ls"]);
+    expect(record.session.getActiveToolNames()).toEqual(["read", "grep", "find", "ls"]);
+    expect(record.session.prompt).toHaveBeenLastCalledWith("follow-up read-only question", { source: "extension" });
+    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(2);
+  });
+
+  it("disposes and recreates the sub-session when switching between contextual, read-only, and tangent modes", async () => {
+    const harness = createHarness();
+    promptStreamMock.mockImplementation(() => streamAnswer("mode answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "contextual start");
+    await harness.command("btw:ask", "read-only start");
+    await harness.command("btw", "contextual again");
+    await harness.command("btw:tangent", "tangent start");
+
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(4);
+    const records = subSessionRecords.slice(0, 4);
+    expect(records.map((record) => record.options.tools)).toEqual([
+      ["read", "bash", "edit", "write"],
+      ["read", "grep", "find", "ls"],
+      ["read", "bash", "edit", "write"],
+      ["read", "bash", "edit", "write"],
+    ]);
+
+    for (const record of records.slice(0, 3)) {
+      expect(record.session.abort).toHaveBeenCalledTimes(1);
+      expect(record.session.dispose).toHaveBeenCalledTimes(1);
+    }
+    expect(records[3].session.dispose).not.toHaveBeenCalled();
+
+    const overlay = harness.latestOverlayComponent();
+    expect(overlay["modeText"].text).toContain("BTW tangent");
+    const resets = getCustomEntries(harness.entries, "btw-thread-reset");
+    expect(resets.map((entry) => (entry.data as any)?.mode)).toEqual(["readonly", "contextual", "tangent"]);
+  });
+
+  it("persists the read-only mode and restores it across a reload", async () => {
+    const firstHarness = createHarness();
+    promptStreamMock.mockImplementation(() => streamAnswer("read-only answer"));
+
+    await firstHarness.runSessionStart();
+    await firstHarness.command("btw:ask", "read-only question");
+
+    expect(getCustomEntries(firstHarness.entries, "btw-thread-reset").at(-1)?.data).toMatchObject({ mode: "readonly" });
+
+    const restoredHarness = createHarness(firstHarness.entries);
+    await restoredHarness.runEvent("session_start");
+    await restoredHarness.command("btw:ask", "");
+
+    const overlay = restoredHarness.latestOverlayComponent();
+    expect(overlay["modeText"].text).toContain("read-only");
+    expect(transcriptText(overlay)).toContain("You  read-only question");
+    expect(createAgentSessionMock.mock.calls.at(-1)?.[0].tools).toEqual(["read", "grep", "find", "ls"]);
+    expect(getCustomEntries(restoredHarness.entries, "btw-thread-reset")).toHaveLength(1);
+  });
+
+  it("supports --save on /btw:ask while keeping the read-only tool surface", async () => {
+    const harness = createHarness();
+    promptStreamMock.mockImplementation(() => streamAnswer("Saved answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw:ask", "--save saved read-only question");
+
+    expect(harness.sentMessages).toHaveLength(1);
+    expect(harness.sentMessages[0]).toEqual({
+      message: expect.objectContaining({
+        customType: "btw-note",
+        content: "**Question**\n\nsaved read-only question\n\n**Answer**\n\nSaved answer",
+      }),
+      options: undefined,
+    });
+    expect(subSessionRecords[0].options.tools).toEqual(["read", "grep", "find", "ls"]);
+    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(1);
+  });
+
+  it("opens a read-only composer from a composer-only /btw:ask", async () => {
+    const harness = createHarness();
+
+    await harness.runSessionStart();
+    await harness.command("btw:ask", "");
+
+    expect(harness.overlays).toHaveLength(1);
+    const overlay = harness.latestOverlayComponent();
+    expect(overlay["modeText"].text).toContain("read-only");
+    expect(createAgentSessionMock.mock.calls.at(-1)?.[0].tools).toEqual(["read", "grep", "find", "ls"]);
+    const resets = getCustomEntries(harness.entries, "btw-thread-reset");
+    expect(resets).toHaveLength(1);
+    expect(resets.at(-1)?.data).toMatchObject({ mode: "readonly" });
+  });
+
+  it("in-modal /btw:ask reuses command semantics and switches the thread to read-only", async () => {
+    const harness = createHarness();
+    promptStreamMock
+      .mockImplementationOnce(() => streamAnswer("First answer"))
+      .mockImplementationOnce(() => streamAnswer("Read-only answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+
+    const overlay = harness.latestOverlayComponent();
+    overlay.input.onSubmit?.("/btw:ask read-only follow-up");
+    await flushAsyncWork();
+
+    const resets = getCustomEntries(harness.entries, "btw-thread-reset");
+    expect(resets).toHaveLength(1);
+    expect(resets.at(-1)?.data).toMatchObject({ mode: "readonly" });
+    expect(subSessionRecords.at(-1)?.options.tools).toEqual(["read", "grep", "find", "ls"]);
+    expect(overlay["modeText"].text).toContain("read-only");
+    const transcript = transcriptText(overlay);
+    expect(transcript).toContain("You  read-only follow-up");
+    expect(transcript).not.toContain("You  first question");
+  });
+
   it("preserves BTW overlay recoverability after agent prompt failure", async () => {
     const harness = createHarness();
     promptStreamMock
