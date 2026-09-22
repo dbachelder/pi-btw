@@ -1,4 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, RegisteredCommand } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import btwExtension, {
@@ -3300,3 +3303,52 @@ describe("configurable BTW focus shortcuts", () => {
   });
 });
 
+describe("Pi SessionManager context integration", () => {
+  it("initializes AgentSession messages from the child SessionManager", async () => {
+    const {
+      createAgentSession: createActualAgentSession,
+      createExtensionRuntime,
+      SessionManager: ActualSessionManager,
+    } = await vi.importActual<typeof import("@earendil-works/pi-coding-agent")>("@earendil-works/pi-coding-agent");
+    const agentDir = await mkdtemp(join(tmpdir(), "pi-btw-agent-test-"));
+    const sessionManager = ActualSessionManager.inMemory(process.cwd());
+    const seedMessage = {
+      role: "user" as const,
+      content: [{ type: "text" as const, text: "inherited main-session context" }],
+      timestamp: Date.now(),
+    };
+    sessionManager.appendMessage(seedMessage);
+
+    const runtime = createExtensionRuntime();
+    const resourceLoader = {
+      getExtensions: () => ({ extensions: [], errors: [], runtime }),
+      getSkills: () => ({ skills: [], diagnostics: [] }),
+      getPrompts: () => ({ prompts: [], diagnostics: [] }),
+      getThemes: () => ({ themes: [], diagnostics: [] }),
+      getAgentsFiles: () => ({ agentsFiles: [] }),
+      getSystemPrompt: () => "",
+      getSystemPromptSource: () => undefined,
+      getAppendSystemPrompt: () => [],
+      getAppendSystemPromptSources: () => [],
+      extendResources: () => {},
+      reload: async () => {},
+    };
+
+    let disposeSession: (() => void | Promise<void>) | undefined;
+    try {
+      const { session } = await createActualAgentSession({
+        agentDir,
+        sessionManager,
+        resourceLoader: resourceLoader as any,
+        tools: [],
+        noTools: "all",
+      });
+      disposeSession = () => session.dispose();
+
+      expect(session.state.messages).toEqual([seedMessage]);
+    } finally {
+      await disposeSession?.();
+      await rm(agentDir, { recursive: true, force: true });
+    }
+  });
+});
