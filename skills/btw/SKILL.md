@@ -22,6 +22,7 @@ Use these commands in your guidance to the user:
 
 ```text
 /btw <question>
+/side <question>
 /btw --save <question>
 /btw:new [question]
 /btw:tangent <question>
@@ -35,6 +36,8 @@ Use these commands in your guidance to the user:
 /btw:summarize [instructions]
 ```
 
+`/side` is an alias for `/btw` and shares the same thread, overlay, and settings. `/btw` is canonical; the lifecycle commands stay in the `/btw:*` namespace.
+
 ## How to guide the user
 
 ### For a quick side question
@@ -46,6 +49,8 @@ Recommend:
 ```
 
 Use this when the user wants an immediate aside and does not need a visible saved note.
+
+Users coming from Codex may reach for `/side` instead; it is an alias for `/btw` and can be used anywhere `/btw` is used.
 
 ### For a saved one-off note
 

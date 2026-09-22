@@ -2795,6 +2795,13 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("side", {
+    description: "Alias for /btw: continue a side conversation in a focused BTW modal.",
+    handler: async (args, ctx) => {
+      await dispatchBtwCommand("btw", args, ctx);
+    },
+  });
+
   pi.registerCommand("btw:tangent", {
     description: "Start or continue a contextless BTW tangent in the focused BTW modal.",
     handler: async (args, ctx) => {
