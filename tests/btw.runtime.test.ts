@@ -18,7 +18,17 @@ const {
 } = vi.hoisted(() => ({
   promptStreamMock: vi.fn(),
   createAgentSessionMock: vi.fn(),
-  sessionManagerInMemoryMock: vi.fn(() => ({ type: "in-memory-session" })),
+  sessionManagerInMemoryMock: vi.fn(() => {
+    const messages: any[] = [];
+    return {
+      type: "in-memory-session",
+      appendMessage: vi.fn((message: any) => {
+        messages.push(structuredClone(message));
+        return `entry-${messages.length}`;
+      }),
+      buildSessionContext: vi.fn(() => ({ messages: messages.map((message) => structuredClone(message)) })),
+    };
+  }),
   modelRuntimeExport: {} as { create: ReturnType<typeof vi.fn> },
   modelRuntimeCreateMock: vi.fn(),
   modelRuntimeRecords: [] as Array<{
@@ -336,8 +346,10 @@ function buildMockSystemPrompt(options: any): string {
 
 function createMockAgentSession(options: any) {
   const listeners = new Set<(event: any) => void>();
-  let seedMessages: any[] = [];
-  let stateMessages: any[] = [];
+  const seedMessages: any[] = (options.sessionManager?.buildSessionContext?.().messages ?? []).map((message: any) =>
+    structuredClone(message),
+  );
+  let stateMessages: any[] = seedMessages.map((message: any) => structuredClone(message));
   let isStreaming = false;
 
   const emit = (event: any) => {
@@ -361,11 +373,6 @@ function createMockAgentSession(options: any) {
       state: {
         get messages() {
           return stateMessages;
-        },
-        set messages(messages: any[]) {
-          seedMessages = messages.map((message) => structuredClone(message));
-          stateMessages = seedMessages.map((message) => structuredClone(message));
-          record.seedMessages = seedMessages;
         },
       },
     },
@@ -1243,10 +1250,15 @@ describe("btw runtime behavior", () => {
     await harness.runSessionStart();
     await harness.command("btw", "contextual start");
 
-    const seedTexts = subSessionRecords[0].seedMessages.map((message) => (message.content[0] as any)?.text ?? "");
+    const record = subSessionRecords[0];
+    const seedTexts = record.seedMessages.map((message) => (message.content[0] as any)?.text ?? "");
+    const promptTexts = record.promptCalls[0].context.messages.map((message) => (message.content[0] as any)?.text ?? "");
     expect(seedTexts).toContain("main session task");
     expect(seedTexts).toContain("main session answer");
     expect(seedTexts).not.toContain("saved btw note");
+    expect(record.options.sessionManager.appendMessage).toHaveBeenCalledTimes(2);
+    expect(promptTexts).toContain("main session task");
+    expect(promptTexts).toContain("main session answer");
   });
 
   it("switching to tangent recreates the sub-session without inherited main-session context", async () => {
@@ -1275,6 +1287,9 @@ describe("btw runtime behavior", () => {
     expect(tangentRecord.seedMessages.map((message) => (message.content[0] as any)?.text ?? "")).not.toContain(
       "main session task",
     );
+    expect(
+      tangentRecord.promptCalls[0].context.messages.map((message) => (message.content[0] as any)?.text ?? ""),
+    ).not.toContain("main session task");
   });
 
   it("/btw:ask creates a read-only sub-session with only pi's read-only tools", async () => {
@@ -1318,6 +1333,9 @@ describe("btw runtime behavior", () => {
     const record = subSessionRecords[0];
     expect(record.options.tools).toEqual(["read", "grep", "find", "ls"]);
     expect(record.seedMessages.map((message) => (message.content[0] as any)?.text ?? "")).toContain("main session task");
+    expect(record.promptCalls[0].context.messages.map((message) => (message.content[0] as any)?.text ?? "")).toContain(
+      "main session task",
+    );
   });
 
   it("keeps the read-only tool surface for modal follow-ups in one /btw:ask thread", async () => {
@@ -2598,14 +2616,25 @@ describe("btw runtime behavior", () => {
   });
 
   it("/btw:new appends a reset marker, disposes the old sub-session, clears prior hidden thread state, stays contextual, and reopens a fresh thread", async () => {
-    const harness = createHarness();
+    const harness = createHarness([
+      {
+        id: "leaf",
+        type: "message",
+        role: "user",
+        content: [{ type: "text", text: "main session task" }],
+        timestamp: Date.now(),
+      } as SessionEntry,
+    ]);
     promptStreamMock
       .mockImplementationOnce((_record: unknown, _text: string, context: StreamContext) => {
-        expect(context.messages.map((message) => (message.content[0] as any)?.text ?? "")).toContain("first question");
+        const texts = context.messages.map((message) => (message.content[0] as any)?.text ?? "");
+        expect(texts).toContain("main session task");
+        expect(texts).toContain("first question");
         return streamAnswer("First answer");
       })
       .mockImplementationOnce((_record: unknown, _text: string, context: StreamContext) => {
         const texts = context.messages.map((message) => (message.content[0] as any)?.text ?? "");
+        expect(texts).toContain("main session task");
         expect(texts).not.toContain("first question");
         expect(texts).not.toContain("First answer");
         expect(texts).toContain("replacement question");
