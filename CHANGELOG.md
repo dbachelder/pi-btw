@@ -2,6 +2,30 @@
 
 All notable changes to this project are documented here.
 
+## [0.6.0] - 2026-09-22
+
+Requires Pi 0.85.1 or newer.
+
+### Added
+- **Read-only side questions**: `/btw:ask` opens an enforced read-only side
+  thread. It inherits the current main-session context like `/btw`, but its
+  child session exposes only pi's built-in read-only tools (`read`, `grep`,
+  `find`, `ls`) — `bash`, `edit`, and `write` are never available, so the
+  boundary is structural rather than prompt-based. The overlay labels the
+  thread as read-only, the mode persists with the hidden BTW thread state, and
+  switching between `/btw`, `/btw:tangent`, and `/btw:ask` recreates the child
+  session so the tool surface always matches the active mode. Supports
+  `--save` and continuous follow-ups. (@RooTooRD, #45; implemented in #47)
+- **`/side` alias**: `/side` is registered as an alias for the `/btw` entry
+  command, matching the equivalent command in Codex. It shares the same thread,
+  overlay, persistence, model, and thinking settings as `/btw`; the `/btw:*`
+  lifecycle namespace stays canonical. (@RooTooRD, #44; implemented in #46)
+
+### Documentation
+- Added a **DeepSeek Harness** section covering the `pi2dsh` bridge on DSH Web,
+  including the `dsh-work-x` suite and the minimal `pi2dsh` + `pi-btw` install.
+  (@weijiafu14, #35; #43)
+
 ## [0.5.0] - 2026-09-15
 
 Requires Pi 0.85.1 or newer.
