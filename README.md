@@ -11,6 +11,7 @@ A small [pi](https://github.com/earendil-works/pi-mono) extension that adds a `/
 - opens a parallel side conversation without interrupting the main run
 - runs that side conversation as a real pi sub-session with `read` / `bash` / `edit` / `write` tool access
 - keeps a continuous BTW thread by default
+- accepts `/side` as an alias for the `/btw` entry command
 - supports `/btw:tangent` for a contextless side thread that does not inherit the current main-session conversation
 - opens a focused BTW modal shell with its own composer and transcript
 - keeps the BTW overlay open while you switch focus back to the main editor with `Alt+/`, `Super+/`, or `Ctrl+Alt+W` (all remappable)
@@ -51,6 +52,7 @@ pi install /absolute/path/to/pi-btw
 
 ```text
 /btw what file defines this route?
+/side what file defines this route?
 /btw how would you refactor this parser?
 /btw --save summarize the last error in one sentence
 /btw:new let's start a fresh thread about auth
@@ -76,6 +78,12 @@ pi install /absolute/path/to/pi-btw
 - composer-only `/btw` requires the TUI; pass the question inline on RPC/SDK hosts
 - persists the BTW exchange as hidden thread state
 - with `--save`, also saves that single exchange as a visible session note
+
+### `/side [--save] <question>`
+
+- alias for `/btw`, matching the equivalent command in Codex
+- shares the same thread, overlay, persistence, model, and thinking settings as `/btw`
+- `/btw` stays canonical; lifecycle commands remain under the `/btw:*` namespace, so there is no `/side:new` or `/side:clear`
 
 ## Overlay controls
 

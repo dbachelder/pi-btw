@@ -885,6 +885,23 @@ describe("btw runtime behavior", () => {
     expect(subSession.prompt).toHaveBeenCalledWith("first question", { source: "extension" });
   });
 
+  it("treats /side as an alias for /btw on the same contextual sub-session", async () => {
+    const harness = createHarness();
+
+    await harness.runSessionStart();
+    await harness.command("side", "first question");
+    await harness.command("btw", "follow-up question");
+
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(1);
+    const options = createAgentSessionMock.mock.calls[0][0];
+    expect(options.tools).toEqual(["read", "bash", "edit", "write"]);
+
+    const subSession = subSessionRecords[0]?.session;
+    expect(subSession.prompt).toHaveBeenNthCalledWith(1, "first question", { source: "extension" });
+    expect(subSession.prompt).toHaveBeenNthCalledWith(2, "follow-up question", { source: "extension" });
+    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(2);
+  });
+
   it("accepts configured keyless auth for normal BTW prompts", async () => {
     const harness = createHarness();
     harness.setAuthResolver(() => ({ ok: true }));
