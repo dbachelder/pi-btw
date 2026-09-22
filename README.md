@@ -210,10 +210,6 @@ To use it without installing:
 pi -e /path/to/pi-btw
 ```
 
-## License
-
-MIT
-
 ## DeepSeek Harness
 
 pi-btw also runs unmodified on [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) through the [pi2dsh](https://github.com/weijiafu14/pi2dsh) compatibility bridge.
@@ -224,6 +220,17 @@ For DSH Web, install the **dsh-work-x** suite, which includes pi-btw, pi2dsh, a 
 dsh plugin --profile web add dsh-work-x
 ```
 
+To install just the bridge and this extension instead:
+
+```bash
+dsh plugin --profile web add pi2dsh
+dsh plugin --profile web add pi-btw
+```
+
 Restart DSH after installation, then use `/btw <question>` to start a side conversation. The suite presents it in a browser side-chat window backed by a native DSH child session. DSH uses hyphens for the command family: for example, `/btw:inject` becomes `/btw-inject`.
 
 See the [DSH side-conversation guide](https://github.com/weijiafu14/pi2dsh/tree/main/examples/side-conversation) for CLI-only installation, usage, and screenshots, and the [versioned validation results](https://github.com/weijiafu14/pi2dsh/tree/main/community/release-0.25.1) for the tested releases. Report DSH integration problems to [pi2dsh](https://github.com/weijiafu14/pi2dsh/issues).
+
+## License
+
+MIT
