@@ -1975,9 +1975,17 @@ export default function (pi: ExtensionAPI) {
     }
 
     const modelRuntimeOptions = await createBtwModelRuntimeOptions(ctx, settings.model);
+    const sessionManager = SessionManager.inMemory();
+    const { messages: seedMessages, sideThreadStartIndex } = buildBtwSeedState(ctx, pendingThread, mode, settings.model);
+
+    // The session manager is the source of provider context. Seed it before
+    // creating the AgentSession so its initial context includes these messages.
+    for (const message of seedMessages) {
+      sessionManager.appendMessage(message);
+    }
 
     const sessionOptions: CreateAgentSessionOptions = {
-      sessionManager: SessionManager.inMemory(),
+      sessionManager,
       model: settings.model,
       ...modelRuntimeOptions,
       thinkingLevel: settings.thinkingLevel,
@@ -1986,11 +1994,6 @@ export default function (pi: ExtensionAPI) {
       resourceLoader: createBtwResourceLoader(ctx),
     };
     const { session } = await createAgentSession(sessionOptions);
-
-    const { messages: seedMessages, sideThreadStartIndex } = buildBtwSeedState(ctx, pendingThread, mode, settings.model);
-    if (seedMessages.length > 0) {
-      session.agent.state.messages = seedMessages as typeof session.state.messages;
-    }
 
     return { session, mode, subscriptions: new Set(), sideThreadStartIndex, promptQueue: Promise.resolve() };
   }
