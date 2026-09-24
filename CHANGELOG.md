@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented here.
 
+## [0.6.1] - 2026-09-23
+
+Requires Pi 0.85.1 or newer.
+
+### Fixed
+- **Contextual BTW threads on Pi 0.87+**: `/btw`, `/btw:new`, and `/btw:ask`
+  inherit the main-session context again. Child sessions now seed Pi's
+  `SessionManager` before creation instead of assigning
+  `session.agent.state.messages` afterward, which Pi 0.87.0 stopped honoring as
+  the source of provider context. `/btw:tangent` stays intentionally
+  contextless. (@evanqhuang, #48, #49)
+
 ## [0.6.0] - 2026-09-22
 
 Requires Pi 0.85.1 or newer.
