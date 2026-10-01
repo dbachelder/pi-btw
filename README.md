@@ -177,6 +177,50 @@ BTW is implemented as an actual pi sub-session with its own in-memory session st
 - child prompts preserve the main session's instructions and append an authoritative list of their own tools; inherited tool/skill instructions and historical tool calls do not grant additional capabilities
 - handoff commands (`/btw:inject` and `/btw:summarize`) read from the BTW sub-session thread rather than maintaining a separate manual transcript model
 
+### Opt-in extension tools
+
+BTW loads no extensions by default. To enable tools such as `web_search` and
+`fetch_content` in `/btw`, `/side`, and `/btw:tangent`, create
+`~/.pi/agent/btw.json` (or `btw.json` in your `PI_CODING_AGENT_DIR`):
+
+```json
+{
+  "extensions": ["npm:pi-web-access"]
+}
+```
+
+A trusted project's `.pi/btw.json` can override this list. Lists replace rather
+than merge; `{"extensions": []}` disables global BTW extensions for that
+project. An omitted `extensions` key inherits the global list. Untrusted
+projects do not contribute configuration. Config is read when a child session
+is created; use `/btw:clear` to apply changes to an existing thread.
+
+Sources can be Pi `npm:` or `git:` packages, or local extension files/package
+directories. Local paths are relative to the config file's directory. Remote
+packages are resolved into a separate BTW cache under the agent directory's
+`btw/` folder and can be installed on first use. Pin a source version when you
+need reproducible behavior.
+
+Only listed sources are loaded. BTW runs their lifecycle handlers headlessly
+(`ctx.hasUI === false`) and exposes their tools alongside `read`, `bash`,
+`edit`, and `write`, including tools registered at startup. The capability
+note follows the child's active tools. Load/startup errors stop child creation
+and are reported with the failing source; clear, mode/model changes, and parent
+shutdown run extension cleanup before disposal.
+
+Choose extensions that support headless sessions. Tools requiring interactive
+dialogs (such as `ask_user`) need additional UI integration. BTW does not import
+extension skills, prompt templates, themes, widgets, or shortcuts into its UI.
+Extensions are trusted code, not sandboxed: separate package installs avoid
+sharing the parent's cached extension factory, but extensions may still use
+shared files or external services. A local source already registered by the
+parent is rejected; use an `npm:` or `git:` source for a separate install.
+
+`/btw:ask` never reads this configuration or loads extension tools, so it retains
+its built-in read-only tool set. `/btw:summarize` remains tool-free. Extension
+configuration is machine/project configuration, not persisted in hidden
+conversation-history entries.
+
 ### In-modal slash behavior
 
 Inside the BTW modal composer, slash handling is split at the BTW/session boundary:

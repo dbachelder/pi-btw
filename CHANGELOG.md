@@ -4,6 +4,13 @@ All notable changes to this project are documented here.
 
 ## Unreleased
 
+### Added
+- Opt-in headless extension tools for `/btw`, `/side`, and `/btw:tangent`, via
+  global/project `btw.json` extension allowlists. Sources are selected before
+  initialization, remote packages use a separate BTW cache, and extension
+  startup/shutdown are handled with the child lifecycle. `/btw:ask` remains
+  restricted to its built-in read-only tools; summarize remains tool-free. (#50)
+
 ### Fixed
 - BTW child prompts now state their actual tool capabilities, overriding tool
   claims inherited from the main session. This includes the restricted

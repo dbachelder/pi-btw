@@ -2,6 +2,7 @@ import {
   buildSessionContext,
   createAgentSession,
   createExtensionRuntime,
+  getAgentDir,
   getMarkdownTheme,
   ModelRuntime,
   SessionManager,
@@ -38,6 +39,7 @@ import {
   type OverlayOptions,
   type TUI,
 } from "@earendil-works/pi-tui";
+import { loadBtwExtensionResources, readBtwExtensionSources } from "./btw-extension-tools";
 
 const BTW_MESSAGE_TYPE = "btw-note";
 const BTW_ENTRY_TYPE = "btw-thread-entry";
@@ -270,6 +272,7 @@ type BtwSessionRuntime = {
   sideThreadStartIndex: number;
   abortPromise?: Promise<void>;
   promptQueue: Promise<void>;
+  hasExtensions: boolean;
 };
 
 type OverlayRuntime = {
@@ -298,24 +301,28 @@ function stripDynamicSystemPromptFooter(systemPrompt: string): string {
 
 function createBtwResourceLoader(
   ctx: ExtensionCommandContext,
-  tools: readonly string[],
+  tools: readonly string[] | (() => readonly string[]),
   appendSystemPrompt: string[] = [BTW_SYSTEM_PROMPT],
+  extensionResources?: ResourceLoader,
 ): ResourceLoader {
-  const extensionsResult = { extensions: [], errors: [], runtime: createExtensionRuntime() };
+  const extensionsResult = extensionResources?.getExtensions() ?? { extensions: [], errors: [], runtime: createExtensionRuntime() };
   const systemPrompt = stripDynamicSystemPromptFooter(ctx.getSystemPrompt());
   // Preserve the parent's project/custom instructions, but override capability
   // claims in its rendered prompt and in the history seeded into this child.
-  const capabilities = [
-    "<btw_capabilities>",
-    tools.length > 0
-      ? `Available tools in this BTW session: ${tools.join(", ")}.`
-      : "No tools are available in this BTW session.",
-    "This capability list is authoritative for this child session.",
-    "Tool and skill instructions inherited from the main session may describe tools that are unavailable here.",
-    "Previous tool calls in inherited conversation are historical context, not available capabilities.",
-    "Only call tools listed above; do not infer additional tools from the main session.",
-    "</btw_capabilities>",
-  ].join("\n");
+  const capabilities = () => {
+    const availableTools = typeof tools === "function" ? tools() : tools;
+    return [
+      "<btw_capabilities>",
+      availableTools.length > 0
+        ? `Available tools in this BTW session: ${availableTools.join(", ")}.`
+        : "No tools are available in this BTW session.",
+      "This capability list is authoritative for this child session.",
+      "Tool and skill instructions inherited from the main session may describe tools that are unavailable here.",
+      "Previous tool calls in inherited conversation are historical context, not available capabilities.",
+      "Only call tools listed above; do not infer additional tools from the main session.",
+      "</btw_capabilities>",
+    ].join("\n");
+  };
 
   const resourceLoader: ResourceLoader = {
     getExtensions: () => extensionsResult,
@@ -325,7 +332,7 @@ function createBtwResourceLoader(
     getAgentsFiles: () => ({ agentsFiles: [] }),
     getSystemPrompt: () => systemPrompt,
     getSystemPromptSource: () => undefined,
-    getAppendSystemPrompt: () => [...appendSystemPrompt, capabilities],
+    getAppendSystemPrompt: () => [...appendSystemPrompt, capabilities()],
     getAppendSystemPromptSources: () => [],
     extendResources: () => {},
     reload: async (_options) => {},
@@ -1642,6 +1649,7 @@ export default function (pi: ExtensionAPI) {
   let activeBtwSession: BtwSessionRuntime | null = null;
   let btwLifecycleGeneration = 0;
   let btwSubmissionQueue = Promise.resolve();
+  let btwSessionCreationQueue = Promise.resolve();
 
   function invalidateBtwLifecycle(): void {
     btwLifecycleGeneration += 1;
@@ -1817,7 +1825,17 @@ export default function (pi: ExtensionAPI) {
 
     clearBtwSessionSubscriptions(current);
     await requestBtwSessionAbort(current);
-    current.session.dispose();
+    await disposeChildSession(current.session, current.hasExtensions);
+  }
+
+  async function disposeChildSession(session: AgentSession, hasExtensions: boolean): Promise<void> {
+    try {
+      if (hasExtensions) {
+        await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+      }
+    } finally {
+      session.dispose();
+    }
   }
 
   async function dismissOverlaySession(): Promise<void> {
@@ -1988,8 +2006,23 @@ export default function (pi: ExtensionAPI) {
       throw new Error(settings.fallbackReason || "No active model selected.");
     }
 
+    const agentDir = getAgentDir();
+    const sources = mode === "readonly" ? [] : await readBtwExtensionSources({
+      cwd: ctx.cwd,
+      agentDir,
+      projectTrusted: ctx.isProjectTrusted(),
+    });
     const modelRuntimeOptions = await createBtwModelRuntimeOptions(ctx, settings.model);
-    const sessionManager = SessionManager.inMemory();
+    const extensionResources = sources.length > 0 ? await loadBtwExtensionResources({
+      cwd: ctx.cwd,
+      agentDir,
+      sources,
+      parentExtensionPaths: [
+        ...pi.getAllTools().map((tool) => tool.sourceInfo.path),
+        ...pi.getCommands().flatMap((command) => command.sourceInfo ? [command.sourceInfo.path] : []),
+      ],
+    }) : undefined;
+    const sessionManager = SessionManager.inMemory(ctx.cwd);
     const { messages: seedMessages, sideThreadStartIndex } = buildBtwSeedState(ctx, pendingThread, mode, settings.model);
 
     // The session manager is the source of provider context. Seed it before
@@ -1998,23 +2031,85 @@ export default function (pi: ExtensionAPI) {
       sessionManager.appendMessage(message);
     }
 
+    const builtinTools = BTW_TOOLS_BY_MODE[mode];
+    let childSession: AgentSession | undefined;
     const sessionOptions: CreateAgentSessionOptions = {
+      cwd: ctx.cwd,
       sessionManager,
       model: settings.model,
       ...modelRuntimeOptions,
       thinkingLevel: settings.thinkingLevel,
-      // Read-only mode narrows this to pi's built-in read-only toolset.
-      tools: [...BTW_TOOLS_BY_MODE[mode]],
-      resourceLoader: createBtwResourceLoader(ctx, BTW_TOOLS_BY_MODE[mode]),
+      // Extension sessions need a live registry for tools registered at startup
+      // or later. Read-only sessions keep the structural built-in allowlist.
+      ...(extensionResources ? { noTools: "builtin" as const } : { tools: [...builtinTools] }),
+      resourceLoader: createBtwResourceLoader(
+        ctx, () => childSession?.getActiveToolNames() ?? builtinTools, [BTW_SYSTEM_PROMPT], extensionResources,
+      ),
     };
-    const { session } = await createAgentSession(sessionOptions);
+    const { session, extensionsResult } = await createAgentSession(sessionOptions);
+    childSession = session;
+    const hasExtensions = !!extensionResources;
+    if (hasExtensions) {
+      try {
+        if (extensionsResult.errors.length > 0) {
+          throw new Error(extensionsResult.errors.map((error) => `${error.path}: ${error.error}`).join("\n"));
+        }
+        const collectToolNames = () => {
+          const builtinNames = new Set(["read", "bash", "edit", "write", "grep", "find", "ls", "powershell"]);
+          const extensionNames = new Set<string>();
+          for (const extension of extensionsResult.extensions) {
+            for (const name of extension.tools.keys()) {
+              if (builtinNames.has(name) || extensionNames.has(name)) {
+                throw new Error(`BTW extension tool name collision: ${name}.`);
+              }
+              extensionNames.add(name);
+            }
+          }
+          return [...extensionNames];
+        };
+        session.setActiveToolsByName([...builtinTools, ...collectToolNames()]);
+        const startupErrors: string[] = [];
+        let starting = true;
+        await session.bindExtensions({
+          onError: (error) => {
+            const message = `${error.extensionPath}: ${error.error}`;
+            if (starting) startupErrors.push(message);
+            else notify(ctx, `BTW extension error: ${message}`, "error");
+          },
+        });
+        starting = false;
+        if (startupErrors.length > 0) throw new Error(startupErrors.join("\n"));
+        collectToolNames();
+      } catch (error) {
+        try {
+          await session.abort();
+        } finally {
+          await disposeChildSession(session, true);
+        }
+        throw error;
+      }
+    }
 
-    return { session, mode, subscriptions: new Set(), sideThreadStartIndex, promptQueue: Promise.resolve() };
+    return { session, mode, subscriptions: new Set(), sideThreadStartIndex, promptQueue: Promise.resolve(), hasExtensions };
   }
 
-  async function ensureBtwSession(ctx: ExtensionCommandContext, mode: BtwThreadMode): Promise<BtwSessionRuntime | null> {
+  function ensureBtwSession(ctx: ExtensionCommandContext, mode: BtwThreadMode): Promise<BtwSessionRuntime | null> {
+    const generation = btwLifecycleGeneration;
+    // Composer-only commands can overlap while npm resolution is in flight.
+    // Serialize creation so they reuse one child and never race package installs.
+    const creation = btwSessionCreationQueue.then(() => createOrReuseBtwSession(ctx, mode, generation));
+    btwSessionCreationQueue = creation.then(() => {}, () => {});
+    return creation;
+  }
+
+  async function createOrReuseBtwSession(
+    ctx: ExtensionCommandContext,
+    mode: BtwThreadMode,
+    generation: number,
+  ): Promise<BtwSessionRuntime | null> {
+    if (generation !== btwLifecycleGeneration) return null;
     const settings = await resolveBtwSettings(ctx, true);
-    if (!settings.model) {
+    if (generation !== btwLifecycleGeneration || !settings.model) {
       return null;
     }
 
@@ -2023,7 +2118,22 @@ export default function (pi: ExtensionAPI) {
     }
 
     await disposeBtwSession();
-    activeBtwSession = await createBtwSubSession(ctx, mode, settings);
+    if (generation !== btwLifecycleGeneration) return null;
+    try {
+      const created = await createBtwSubSession(ctx, mode, settings);
+      if (generation !== btwLifecycleGeneration) {
+        await requestBtwSessionAbort(created);
+        await disposeChildSession(created.session, created.hasExtensions);
+        return null;
+      }
+      activeBtwSession = created;
+    } catch (error) {
+      if (generation !== btwLifecycleGeneration) return null;
+      const message = `Could not start BTW session: ${error instanceof Error ? error.message : String(error)}`;
+      setOverlayStatus(message, ctx);
+      notify(ctx, message, "error");
+      return null;
+    }
     return activeBtwSession;
   }
 
@@ -2515,8 +2625,6 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     if (!sessionRuntime) {
-      setOverlayStatus("No active model selected.", ctx);
-      notify(ctx, "No active model selected.", "error");
       return;
     }
 

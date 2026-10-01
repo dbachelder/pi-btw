@@ -18,6 +18,8 @@ const {
   modelRuntimeCreateMock,
   modelRuntimeRecords,
   subSessionRecords,
+  readBtwExtensionSourcesMock,
+  loadBtwExtensionResourcesMock,
 } = vi.hoisted(() => ({
   promptStreamMock: vi.fn(),
   createAgentSessionMock: vi.fn(),
@@ -49,6 +51,13 @@ const {
     getListenerCount: () => number;
     getIsStreaming: () => boolean;
   }>,
+  readBtwExtensionSourcesMock: vi.fn(),
+  loadBtwExtensionResourcesMock: vi.fn(),
+}));
+
+vi.mock("../extensions/btw-extension-tools", () => ({
+  readBtwExtensionSources: readBtwExtensionSourcesMock,
+  loadBtwExtensionResources: loadBtwExtensionResourcesMock,
 }));
 
 const markdownTheme = {
@@ -354,6 +363,7 @@ function createMockAgentSession(options: any) {
   );
   let stateMessages: any[] = seedMessages.map((message: any) => structuredClone(message));
   let isStreaming = false;
+  let activeTools: string[] = [...(options.tools ?? [])];
 
   const emit = (event: any) => {
     for (const listener of listeners) {
@@ -485,13 +495,15 @@ function createMockAgentSession(options: any) {
     dispose: vi.fn(() => {
       listeners.clear();
     }),
-    bindExtensions: vi.fn(),
-    getActiveToolNames: vi.fn(() => (options.tools ?? []) as string[]),
+    bindExtensions: vi.fn(async () => {}),
+    extensionRunner: { emit: vi.fn(async () => {}) },
+    setActiveToolsByName: vi.fn((tools: string[]) => { activeTools = tools; }),
+    getActiveToolNames: vi.fn(() => activeTools),
   };
 
   record.session = session;
   subSessionRecords.push(record);
-  return { session, extensionsResult: { extensions: [], errors: [], runtime: {} } };
+  return { session, extensionsResult: options.resourceLoader.getExtensions() };
 }
 
 async function flushAsyncWork() {
@@ -674,6 +686,8 @@ function createHarness(
   btwExtension(api);
 
   const baseCtx = {
+    cwd: "/test/project",
+    isProjectTrusted: () => true,
     hasUI: true,
     mode: options.contextMode ?? "tui",
     ui: ui as any,
@@ -851,6 +865,8 @@ describe("btw runtime behavior", () => {
     modelRuntimeExport.create = modelRuntimeCreateMock;
     modelRuntimeRecords.length = 0;
     subSessionRecords.length = 0;
+    readBtwExtensionSourcesMock.mockReset().mockResolvedValue([]);
+    loadBtwExtensionResourcesMock.mockReset();
 
     createAgentSessionMock.mockImplementation(async (options: any) => createMockAgentSession(options));
     modelRuntimeCreateMock.mockImplementation(async () => {
@@ -951,6 +967,188 @@ describe("btw runtime behavior", () => {
     expect(prompt.slice(prompt.lastIndexOf("<btw_capabilities>"))).toContain(
       "No tools are available in this BTW session.",
     );
+  });
+
+  function allowExtensionTools(names = ["web_search", "fetch_content"]) {
+    readBtwExtensionSourcesMock.mockResolvedValue(["npm:pi-web-access"]);
+    const extensionsResult = {
+      extensions: [{ path: "/btw/web.ts", tools: new Map(names.map((name) => [name, {}])) }],
+      errors: [] as Array<{ path: string; error: string }>,
+      runtime: {},
+    };
+    loadBtwExtensionResourcesMock.mockResolvedValue({ getExtensions: () => extensionsResult });
+    return extensionsResult;
+  }
+
+  it.each(["btw", "side", "btw:tangent"])("%s activates allowlisted extension tools with headless startup", async (command) => {
+    const harness = createHarness();
+    allowExtensionTools();
+    vi.mocked(harness.api.getAllTools).mockReturnValue([
+      { name: "web_search", sourceInfo: { path: "/parent/web.ts" } } as any,
+    ]);
+
+    await harness.runSessionStart();
+    await harness.command(command, "look this up");
+
+    expect(readBtwExtensionSourcesMock).toHaveBeenCalledWith(expect.objectContaining({
+      cwd: "/test/project", projectTrusted: true,
+    }));
+    expect(loadBtwExtensionResourcesMock).toHaveBeenCalledWith(expect.objectContaining({
+      sources: ["npm:pi-web-access"], parentExtensionPaths: ["/parent/web.ts"],
+    }));
+    const { session, options, promptCalls } = subSessionRecords[0];
+    expect(options.noTools).toBe("builtin");
+    expect(options).not.toHaveProperty("tools");
+    expect(session.getActiveToolNames()).toEqual(["read", "bash", "edit", "write", "web_search", "fetch_content"]);
+    expect(session.bindExtensions).toHaveBeenCalledWith({ onError: expect.any(Function) });
+    expect(session.bindExtensions.mock.invocationCallOrder[0]).toBeLessThan(session.prompt.mock.invocationCallOrder[0]);
+    expect(promptCalls[0].context.systemPrompt).toContain(
+      "Available tools in this BTW session: read, bash, edit, write, web_search, fetch_content.",
+    );
+  });
+
+  it("uses the current tool surface in the capability note after startup changes", async () => {
+    const harness = createHarness();
+    allowExtensionTools();
+    createAgentSessionMock.mockImplementation(async (options: any) => {
+      const result = createMockAgentSession(options);
+      result.session.bindExtensions.mockImplementation(async () => {
+        result.session.setActiveToolsByName(["read", "bash", "edit", "write", "load_web_tools"]);
+      });
+      return result;
+    });
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+    const capabilities = subSessionRecords[0].promptCalls[0].context.systemPrompt.split("<btw_capabilities>")[1];
+    expect(capabilities).toContain("load_web_tools");
+    expect(capabilities).not.toContain("web_search");
+  });
+
+  it("does not read extension config or load extensions for /btw:ask", async () => {
+    const harness = createHarness();
+    readBtwExtensionSourcesMock.mockRejectedValue(new Error("invalid config"));
+
+    await harness.runSessionStart();
+    await harness.command("btw:ask", "safe question");
+
+    expect(readBtwExtensionSourcesMock).not.toHaveBeenCalled();
+    expect(loadBtwExtensionResourcesMock).not.toHaveBeenCalled();
+    expect(subSessionRecords[0].session.getActiveToolNames()).toEqual(["read", "grep", "find", "ls"]);
+    expect(subSessionRecords[0].session.bindExtensions).not.toHaveBeenCalled();
+  });
+
+  it("keeps the summarizer tool-free when the BTW thread uses extensions", async () => {
+    const harness = createHarness();
+    allowExtensionTools();
+
+    await harness.runSessionStart();
+    await harness.command("btw", "search question");
+    await harness.command("btw:summarize", "");
+
+    const summary = subSessionRecords[1];
+    expect(loadBtwExtensionResourcesMock).toHaveBeenCalledTimes(1);
+    expect(summary.options.tools).toEqual([]);
+    expect(summary.options.resourceLoader.getExtensions().extensions).toEqual([]);
+    expect(summary.session.bindExtensions).not.toHaveBeenCalled();
+  });
+
+  it("shuts down extensions before disposal when switching into read-only mode", async () => {
+    const harness = createHarness();
+    allowExtensionTools();
+
+    await harness.runSessionStart();
+    await harness.command("btw", "search question");
+    await harness.command("btw:ask", "read-only question");
+    const session = subSessionRecords[0].session;
+    expect(session.extensionRunner.emit).toHaveBeenCalledWith({ type: "session_shutdown", reason: "quit" });
+    expect(session.abort.mock.invocationCallOrder[0]).toBeLessThan(session.extensionRunner.emit.mock.invocationCallOrder[0]);
+    expect(session.extensionRunner.emit.mock.invocationCallOrder[0]).toBeLessThan(session.dispose.mock.invocationCallOrder[0]);
+    expect(subSessionRecords[1].options.tools).toEqual(["read", "grep", "find", "ls"]);
+  });
+
+  it.each(["btw:clear", "btw:new", "btw:model", "btw:thinking", "session_tree", "session_shutdown"])("cleans up extensions on %s", async (action) => {
+    const harness = createHarness();
+    allowExtensionTools();
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+    if (action.startsWith("session_")) await harness.runEvent(action);
+    else await harness.command(action, action === "btw:model" ? "fast-provider fast-model custom-api" : action === "btw:thinking" ? "low" : "");
+    expect(subSessionRecords[0].session.extensionRunner.emit).toHaveBeenCalledTimes(1);
+    expect(subSessionRecords[0].session.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports loading/config errors without starting a partially configured child", async () => {
+    const harness = createHarness();
+    readBtwExtensionSourcesMock.mockRejectedValue(new Error("Invalid BTW config /test/btw.json"));
+    await harness.runSessionStart();
+    await harness.command("btw", "question");
+    expect(createAgentSessionMock).not.toHaveBeenCalled();
+    expect(harness.notifications.at(-1)).toMatchObject({
+      type: "error", message: expect.stringContaining("Invalid BTW config /test/btw.json"),
+    });
+
+    allowExtensionTools();
+    await harness.command("btw", "retry");
+    expect(subSessionRecords[0].session.prompt).toHaveBeenCalledWith("retry", { source: "extension" });
+  });
+
+  it.each(["load error", "startup error", "tool collision"])("cleans up and reports an extension %s", async (failure) => {
+    const harness = createHarness();
+    const result = allowExtensionTools(failure === "tool collision" ? ["read"] : ["web_search"]);
+    if (failure === "load error") result.errors.push({ path: "/broken.ts", error: "load failed" });
+    if (failure === "startup error") {
+      createAgentSessionMock.mockImplementation(async (options: any) => {
+        const created = createMockAgentSession(options);
+        created.session.bindExtensions.mockImplementation(async (bindings: any) => {
+          bindings.onError({ extensionPath: "/broken.ts", error: "startup failed" });
+        });
+        return created;
+      });
+    }
+    await harness.runSessionStart();
+    await harness.command("btw", "question");
+    const session = subSessionRecords[0].session;
+    expect(session.prompt).not.toHaveBeenCalled();
+    expect(session.extensionRunner.emit).toHaveBeenCalledWith({ type: "session_shutdown", reason: "quit" });
+    expect(session.dispose).toHaveBeenCalledTimes(1);
+    expect(harness.notifications.at(-1)).toMatchObject({ type: "error", message: expect.stringContaining("Could not start BTW session") });
+  });
+
+  it("disposes a child whose extension loading finishes after /btw:clear", async () => {
+    const harness = createHarness();
+    allowExtensionTools();
+    const loader = await loadBtwExtensionResourcesMock();
+    let finishLoad!: (loader: unknown) => void;
+    loadBtwExtensionResourcesMock.mockImplementation(() => new Promise((resolve) => { finishLoad = resolve; }));
+    await harness.runSessionStart();
+    const pending = harness.command("btw", "question");
+    await flushAsyncWork();
+    await harness.command("btw:clear", "");
+    finishLoad(loader);
+    await pending;
+    const session = subSessionRecords[0].session;
+    expect(session.prompt).not.toHaveBeenCalled();
+    expect(session.extensionRunner.emit).toHaveBeenCalledTimes(1);
+    expect(session.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("reuses one child for overlapping composer opens during extension loading", async () => {
+    const harness = createHarness();
+    allowExtensionTools();
+    const loader = await loadBtwExtensionResourcesMock();
+    loadBtwExtensionResourcesMock.mockClear();
+    let finishLoad!: (loader: unknown) => void;
+    loadBtwExtensionResourcesMock.mockImplementation(() => new Promise((resolve) => { finishLoad = resolve; }));
+    await harness.runSessionStart();
+    const first = harness.command("btw", "");
+    const second = harness.command("btw", "");
+    await flushAsyncWork();
+    expect(loadBtwExtensionResourcesMock).toHaveBeenCalledTimes(1);
+    finishLoad(loader);
+    await Promise.all([first, second]);
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(1);
+    expect(subSessionRecords[0].session.bindExtensions).toHaveBeenCalledTimes(1);
   });
 
   it("accepts configured keyless auth for normal BTW prompts", async () => {
