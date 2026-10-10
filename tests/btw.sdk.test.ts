@@ -27,7 +27,7 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-async function fixture(withExtension = false) {
+async function fixture(withExtension = false, withToolHistory = false) {
   const root = await mkdtemp(join(tmpdir(), "pi-btw-sdk-test-"));
   roots.push(root);
   const cwd = join(root, "project");
@@ -87,6 +87,14 @@ async function fixture(withExtension = false) {
   });
   await modelRuntime.refresh({ allowNetwork: false });
   const sessionManager = SessionManager.inMemory(cwd);
+  if (withToolHistory) {
+    sessionManager.appendMessage({
+      role: "system", content: "Initial parent prompt sentinel",
+      sections: { "parent-instructions": "Preserved parent instruction sentinel" },
+      toolsAdded: [{ name: "unavailable_parent_tool", description: "Parent-only fixture", parameters: piAI.Type.Object({}) }],
+      timestamp: Date.now(),
+    });
+  }
   sessionManager.appendMessage({ role: "user", content: "parent context sentinel", timestamp: Date.now() });
   const settingsManager = SettingsManager.inMemory();
   const loader = new DefaultResourceLoader({
@@ -112,6 +120,18 @@ async function fixture(withExtension = false) {
   await session.prompt("parent request sentinel");
   expect(requests.at(-1)!.tools).toContain("unavailable_parent_tool");
   requests.length = 0;
+  if (withToolHistory) {
+    sessionManager.appendMessage({
+      role: "system", content: "Parent tool update sentinel",
+      sections: { "parent-update": "Preserved parent update sentinel" },
+      toolsAdded: [{ name: "retired_parent_tool", description: "Retired fixture", parameters: piAI.Type.Object({}) }],
+      timestamp: Date.now(),
+    });
+    sessionManager.appendMessage({
+      role: "system", content: "Parent tool removal sentinel",
+      toolsRemoved: [{ name: "retired_parent_tool" }], timestamp: Date.now(),
+    });
+  }
   const parentAnswers = sessionManager.buildSessionContext().messages.filter((message) => message.role === "assistant");
   const command = async (name: string, args: string) => {
     const registered = session.extensionRunner.getCommand(name);
@@ -141,6 +161,52 @@ describe("BTW commands with the real Pi SDK", () => {
     expect(sessionManager.getEntries().some((entry) => entry.type === "custom" && entry.customType === "btw-thread-entry")).toBe(true);
     // A child response must never become an assistant response in the parent.
     expect(sessionManager.buildSessionContext().messages.filter((message) => message.role === "assistant")).toEqual(parentAnswers);
+  });
+
+  it.skipIf(!("createInitialSystemMessage" in piAI)).each([
+    { command: "btw", tools: ["read", "bash", "edit", "write"] },
+    { command: "btw:ask", tools: ["read", "grep", "find", "ls"] },
+  ])("$command does not replay parent tool declarations in Anthropic requests", async (mode) => {
+    const { command, requests, sessionManager } = await fixture(false, true);
+    const parentBefore = structuredClone(sessionManager.buildSessionContext().messages);
+
+    await command(mode.command, "child question sentinel");
+
+    const request = requests[0];
+    const systemMessages = request.messages.filter((message) => message.role === "system");
+    const declarations = systemMessages.flatMap((message) => [
+      ...(message.toolsAdded ?? []), ...(message.toolsRemoved ?? []),
+    ]).map((tool) => tool.name);
+    expect(declarations).not.toContain("unavailable_parent_tool");
+    expect(declarations).not.toContain("retired_parent_tool");
+    expect(JSON.stringify(systemMessages)).toContain("Initial parent prompt sentinel");
+    expect(JSON.stringify(systemMessages)).toContain("Preserved parent instruction sentinel");
+    expect(JSON.stringify(systemMessages)).toContain("Preserved parent update sentinel");
+    expect(sessionManager.buildSessionContext().messages.slice(0, parentBefore.length)).toEqual(parentBefore);
+
+    // Use the real serializer, but stop before any HTTP request. Older Pi SDKs
+    // do not have transcript tools, so this regression is skipped on those SDKs.
+    const { stream } = await import("@earendil-works/pi-ai/api/anthropic-messages");
+    let payload: { tools?: Array<{ name: string }>; messages: Array<{ content: unknown }> } | undefined;
+    const fetch = vi.fn(async () => { throw new Error("Unexpected network request"); });
+    const serialized = stream({
+      id: "fixture-anthropic", name: "Fixture", provider: "anthropic", api: "anthropic-messages",
+      baseUrl: "http://unused.invalid", reasoning: false, input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 32000, maxTokens: 1024,
+      compat: { supportsMidConvoSystemMessages: true, supportsMidConvoToolChanges: true },
+    }, { messages: request.messages }, {
+      apiKey: "fixture-key", fetch,
+      onPayload(value) {
+        payload = value as typeof payload;
+        throw new Error("Fixture stops after payload capture");
+      },
+    });
+    await serialized.result();
+    expect(fetch).not.toHaveBeenCalled();
+    expect(payload).toBeDefined();
+    expect(payload!.tools?.map((tool) => tool.name).sort()).toEqual([...mode.tools].sort());
+    const blocks = payload!.messages.flatMap((message) => Array.isArray(message.content) ? message.content : []);
+    expect(blocks.filter((block) => block.type === "tool_addition" || block.type === "tool_removal")).toEqual([]);
   });
 
   it("keeps follow-ups in the child and summarizes with no tools", async () => {
