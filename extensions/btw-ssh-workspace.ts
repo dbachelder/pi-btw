@@ -78,13 +78,13 @@ function textResult(text: string, details: SearchDetails = {}): AgentToolResult<
   };
 }
 
-async function displayFilePath<T extends AgentToolResult<unknown>>(
+async function displayFileErrors<T extends AgentToolResult<unknown>>(
   displayPath: string, toolPath: string, run: () => Promise<T>,
 ): Promise<T> {
   try {
-    const result = await run();
-    return { ...result, content: result.content.map((item) => item.type === "text"
-      ? { ...item, text: item.text.replaceAll(toolPath, displayPath) } : item) };
+    // Successful results may contain literal file contents or diff lines.
+    // Never rewrite them just to make encoded remote paths prettier.
+    return await run();
   } catch (error) {
     throw new Error((error instanceof Error ? error.message : String(error)).replaceAll(toolPath, displayPath));
   }
@@ -151,7 +151,7 @@ export async function createBtwSshWorkspace(
       async execute(id, args, signal, onUpdate, toolCtx) {
         assertCurrent();
         const path = filePath(args.path);
-        return displayFilePath(args.path, path, () => createReadToolDefinition(cwd, { operations: {
+        return displayFileErrors(args.path, path, () => createReadToolDefinition(cwd, { operations: {
           readFile: (path) => adapter.readFile(path, signal),
           access: (path) => adapter.access(path, "read", signal),
           detectImageMimeType: (path) => adapter.detectImageMimeType(path, signal),
@@ -216,7 +216,7 @@ export async function createBtwSshWorkspace(
         async execute(id, args, signal, onUpdate, toolCtx) {
           assertCurrent();
           const path = filePath(args.path);
-          return displayFilePath(args.path, path, () => createWriteToolDefinition(cwd, { operations: {
+          return displayFileErrors(args.path, path, () => createWriteToolDefinition(cwd, { operations: {
             mkdir: (path) => adapter.mkdir(path, signal),
             writeFile: (path, data) => adapter.writeFile(path, data, signal),
           } }).execute(id, { ...args, path }, signal, onUpdate, toolCtx));
@@ -226,7 +226,7 @@ export async function createBtwSshWorkspace(
         async execute(id, args, signal, onUpdate, toolCtx) {
           assertCurrent();
           const path = filePath(args.path);
-          return displayFilePath(args.path, path, () => createEditToolDefinition(cwd, { operations: {
+          return displayFileErrors(args.path, path, () => createEditToolDefinition(cwd, { operations: {
             readFile: (path) => adapter.readFile(path, signal),
             access: (path) => adapter.access(path, "write", signal),
             writeFile: (path, data) => adapter.writeFile(path, data, signal),

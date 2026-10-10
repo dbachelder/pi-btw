@@ -318,7 +318,7 @@ function createBtwResourceLoader(
     const availableTools = typeof tools === "function" ? tools() : tools;
     return [
       "<btw_capabilities>",
-      `Workspace for all file and shell tools: ${workspaceLabel}.`,
+      `Workspace for built-in file and shell tools: ${workspaceLabel}.`,
       availableTools.length > 0
         ? `Available tools in this BTW session: ${availableTools.join(", ")}.`
         : "No tools are available in this BTW session.",

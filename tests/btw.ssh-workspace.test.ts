@@ -96,6 +96,18 @@ describe("BTW SSH workspace backend", () => {
     expect(backend.calls.filter((call: unknown[]) => call[0] === "dispose")).toHaveLength(1);
   });
 
+  it("preserves literal remote paths in file contents and edit diffs", async () => {
+    const { create, execute, backend } = await fixture();
+    const workspace = await create();
+    const path = "/__remote__/srv/project/notes.txt";
+    const content = `source=${path}\n`;
+    backend.files.set("/srv/project/notes.txt", Buffer.from(content));
+    expect((await execute(workspace, "read", { path: "notes.txt" })).content[0]).toMatchObject({ text: content });
+    const result = await execute(workspace, "edit", { path: "notes.txt", oldText: content, newText: `updated=${path}\n` });
+    expect(JSON.stringify(result.details)).toContain(path);
+    expect(backend.files.get("/srv/project/notes.txt").toString()).toBe(`updated=${path}\n`);
+  });
+
   it("ask mode exposes only remote read, grep, find, and ls tools", async () => {
     const { create, execute, backend } = await fixture();
     const workspace = await create(true);
