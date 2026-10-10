@@ -2,7 +2,9 @@
 
 All notable changes to this project are documented here.
 
-## Unreleased
+## [0.8.0] - 2026-10-10
+
+Supports Pi 0.85.1 through 1.x. Tested with Pi 0.85.1, 0.99.2, and 1.1.0.
 
 ### Added
 - Slash-command completion in the BTW composer: type `/`, filter command names,
