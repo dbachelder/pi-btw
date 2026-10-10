@@ -11,7 +11,7 @@ import {
   type AgentSession,
   type ResourceLoader,
 } from "@earendil-works/pi-coding-agent";
-import { loadBtwExtensionResources, readBtwExtensionSources } from "../extensions/btw-extension-tools";
+import { loadBtwExtensionResources, readBtwExtensionSources, readBtwWorkspaceMode } from "../extensions/btw-extension-tools";
 
 const roots: string[] = [];
 const sessions: AgentSession[] = [];
@@ -88,6 +88,31 @@ describe("BTW extension config", () => {
     await write(join(options.agentDir, "btw.json"), '{"extensions":["npm:pi-web-access"]}');
     await write(join(options.cwd, ".pi", "btw.json"), 'invalid project config');
     expect(await readBtwExtensionSources({ ...options, projectTrusted: false })).toEqual(["npm:pi-web-access"]);
+  });
+
+  it("inherits workspace independently and lets trusted projects select local tools", async () => {
+    const options = await fixture();
+    expect(await readBtwWorkspaceMode(options)).toBe("local");
+    await write(join(options.agentDir, "btw.json"), '{"workspace":"ssh","extensions":["npm:pi-web-access"]}');
+    await write(join(options.cwd, ".pi", "btw.json"), '{"extensions":[]}');
+    expect(await readBtwWorkspaceMode(options)).toBe("ssh");
+    await write(join(options.cwd, ".pi", "btw.json"), '{"workspace":"local"}');
+    expect(await readBtwWorkspaceMode(options)).toBe("local");
+    expect(await readBtwWorkspaceMode({ ...options, projectTrusted: false })).toBe("ssh");
+    expect(await readBtwExtensionSources(options)).toEqual(["npm:pi-web-access"]);
+  });
+
+  it("workspace selection does not resolve or validate extension tools", async () => {
+    const options = await fixture();
+    await write(join(options.agentDir, "btw.json"), '{"workspace":"ssh","extensions":123}');
+    expect(await readBtwWorkspaceMode(options)).toBe("ssh");
+    await expect(readBtwExtensionSources(options)).rejects.toThrow("extensions");
+  });
+
+  it("rejects unsupported workspace values", async () => {
+    const options = await fixture();
+    await write(join(options.agentDir, "btw.json"), '{"workspace":"remote"}');
+    await expect(readBtwWorkspaceMode(options)).rejects.toThrow('"workspace" must be "local" or "ssh"');
   });
 
   it.each(['{', '[]', 'null', '{"extensions":"web"}', '{"extensions":[4]}', '{"extensions":[" "]}', '{"askExtensions":[]}'])(

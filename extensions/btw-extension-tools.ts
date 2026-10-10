@@ -15,7 +15,9 @@ function resolveSource(source: string, configPath: string): string {
   return resolve(dirname(configPath), source);
 }
 
-async function readSources(path: string): Promise<string[] | undefined> {
+type BtwConfig = { extensions?: string[]; workspace?: "local" | "ssh" };
+
+async function readConfig(path: string, includeExtensions = true): Promise<BtwConfig | undefined> {
   let text: string;
   try {
     text = await readFile(path, "utf8");
@@ -34,14 +36,19 @@ async function readSources(path: string): Promise<string[] | undefined> {
     throw new Error(`Invalid BTW config ${path}: expected an object.`);
   }
   const fields = Object.keys(config);
-  if (fields.some((field) => field !== "extensions")) {
-    throw new Error(`Invalid BTW config ${path}: only the "extensions" key is supported.`);
+  if (fields.some((field) => field !== "extensions" && field !== "workspace")) {
+    throw new Error(`Invalid BTW config ${path}: only "extensions" and "workspace" keys are supported.`);
   }
-  if (!("extensions" in config)) return undefined;
-  if (!Array.isArray(config.extensions) || config.extensions.some((source) => typeof source !== "string" || !source.trim())) {
+  if ("workspace" in config && config.workspace !== "local" && config.workspace !== "ssh") {
+    throw new Error(`Invalid BTW config ${path}: "workspace" must be "local" or "ssh".`);
+  }
+  if (includeExtensions && "extensions" in config && (!Array.isArray(config.extensions) || config.extensions.some((source) => typeof source !== "string" || !source.trim()))) {
     throw new Error(`Invalid BTW config ${path}: "extensions" must be an array of nonempty source strings.`);
   }
-  return [...new Set(config.extensions.map((source: string) => resolveSource(source.trim(), path)))];
+  return {
+    ...(includeExtensions && "extensions" in config && Array.isArray(config.extensions) ? { extensions: [...new Set(config.extensions.map((source: string) => resolveSource(source.trim(), path)))] } : {}),
+    ...("workspace" in config ? { workspace: config.workspace as "local" | "ssh" } : {}),
+  };
 }
 
 /** Project lists replace global lists, including an explicit empty list. */
@@ -50,11 +57,22 @@ export async function readBtwExtensionSources(options: {
   agentDir: string;
   projectTrusted: boolean;
 }): Promise<string[]> {
-  const globalSources = await readSources(join(options.agentDir, "btw.json"));
+  const globalSources = await readConfig(join(options.agentDir, "btw.json"));
   const projectSources = options.projectTrusted
-    ? await readSources(join(options.cwd, ".pi", "btw.json"))
+    ? await readConfig(join(options.cwd, ".pi", "btw.json"))
     : undefined;
-  return projectSources ?? globalSources ?? [];
+  return projectSources?.extensions ?? globalSources?.extensions ?? [];
+}
+
+/** Workspace selection is independent of extension tool loading, including ask mode. */
+export async function readBtwWorkspaceMode(options: {
+  cwd: string;
+  agentDir: string;
+  projectTrusted: boolean;
+}): Promise<"local" | "ssh"> {
+  const globalConfig = await readConfig(join(options.agentDir, "btw.json"), false);
+  const projectConfig = options.projectTrusted ? await readConfig(join(options.cwd, ".pi", "btw.json"), false) : undefined;
+  return projectConfig?.workspace ?? globalConfig?.workspace ?? "local";
 }
 
 async function canonicalPath(path: string): Promise<string> {

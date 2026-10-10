@@ -4,6 +4,12 @@ All notable changes to this project are documented here.
 
 ## Unreleased
 
+### Added
+- Opt-in SSH workspaces for BTW via `workspace: "ssh"`, using the active parent
+  pi-ssh-remote target and directory through an independent connection. Remote
+  ask mode retains only read-only tools; workspace changes require a fresh thread.
+- Local/remote workspace labels in the overlay and child capability prompt.
+
 ### Fixed
 - Contextual `/btw` no longer fails with Anthropic `400 tool_addition/tool_removal
   references unknown tool` on Pi 1.1+. Seeded parent system messages are stripped
