@@ -261,9 +261,16 @@ untrusted project settings are ignored.
 
 ### In-modal slash behavior
 
+Type `/` at the start of the composer to see BTW-owned commands. Keep typing to
+filter, use Up/Down to select, and Tab or Enter to complete a partial command.
+Completion inserts the command and a trailing space without submitting. Enter on
+an exact command or with arguments submits normally. Escape closes the list
+first; a subsequent Escape keeps the existing abort/dismiss behavior. The menu
+shares space with the transcript rather than growing the modal.
+
 Inside the BTW modal composer, slash handling is split at the BTW/session boundary:
 
-- `/btw:new`, `/btw:tangent`, `/btw:ask`, `/btw:clear`, `/btw:model`, `/btw:thinking`, `/btw:inject`, and `/btw:summarize` stay owned by BTW because they control BTW lifecycle, configuration, or handoff behavior
+- `/btw`, `/side`, `/btw:new`, `/btw:tangent`, `/btw:ask`, `/btw:clear`, `/btw:model`, `/btw:thinking`, `/btw:inject`, and `/btw:summarize` stay owned by BTW because they control BTW lifecycle, configuration, or handoff behavior
 - any other slash-prefixed input is routed through the BTW sub-session's normal `prompt()` path
 - this means ordinary pi slash commands like `/help` are handled by the sub-session instead of being rejected by a modal-only fallback
 - if the sub-session cannot handle a slash command, BTW surfaces the real sub-session failure through the transcript/status state instead of inventing an "unsupported slash input" warning

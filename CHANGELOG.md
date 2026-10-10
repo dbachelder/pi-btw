@@ -5,6 +5,8 @@ All notable changes to this project are documented here.
 ## Unreleased
 
 ### Added
+- Slash-command completion in the BTW composer: type `/`, filter command names,
+  navigate with Up/Down, and accept with Tab or Enter. Includes `/btw` and `/side`.
 - Opt-in SSH workspaces for BTW via `workspace: "ssh"`, using the active parent
   pi-ssh-remote target and directory through an independent connection. Remote
   ask mode retains only read-only tools; workspace changes require a fresh thread.

@@ -159,7 +159,9 @@ const tuiMocks = vi.hoisted(() => {
     render(_width: number) {
       return [`> ${this.value}`];
     }
-    handleInput(_data: string) {}
+    handleInput(data: string) {
+      if (data.startsWith("\x1b[200~") && data.endsWith("\x1b[201~")) this.value += data.slice(6, -6);
+    }
   }
 
   class FakeContainer {
@@ -1814,6 +1816,18 @@ describe("btw runtime behavior", () => {
     const transcript = transcriptText(overlay);
     expect(transcript).toContain("You  read-only follow-up");
     expect(transcript).not.toContain("You  first question");
+  });
+
+  it.each(["btw", "side"])("dispatches in-modal /%s through contextual BTW semantics", async (command) => {
+    const harness = createHarness();
+    await harness.runSessionStart();
+    await harness.command("btw:ask", "");
+    const overlay = harness.latestOverlayComponent();
+    overlay.input.onSubmit?.(`/${command} contextual follow-up`);
+    await flushAsyncWork();
+    expect([...subSessionRecords.at(-1)!.options.tools].sort()).toEqual(["bash", "edit", "read", "write"]);
+    expect(subSessionRecords.at(-1)?.session.prompt).toHaveBeenLastCalledWith("contextual follow-up", { source: "extension" });
+    expect(overlay["modeText"].text).not.toContain("read-only");
   });
 
   it("preserves BTW overlay recoverability after agent prompt failure", async () => {
