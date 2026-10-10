@@ -475,6 +475,15 @@ const BTW_TOOLS_BY_MODE: Record<BtwThreadMode, readonly string[]> = {
   readonly: ["read", "grep", "find", "ls"],
 };
 
+function withoutParentToolDeclarations(message: Message): Message {
+  if ((message as { role: string }).role !== "system") return message;
+  const { toolsAdded: _added, toolsRemoved: _removed, ...rest } = message as Message & {
+    toolsAdded?: unknown;
+    toolsRemoved?: unknown;
+  };
+  return rest as Message;
+}
+
 function buildBtwSeedState(
   ctx: ExtensionCommandContext,
   thread: BtwDetails[],
@@ -488,7 +497,7 @@ function buildBtwSeedState(
       messages.push(
         ...(buildSessionContext(ctx.sessionManager.getEntries(), ctx.sessionManager.getLeafId()).messages as Message[]).filter(
           (message) => !isVisibleBtwMessage(message),
-        ),
+        ).map(withoutParentToolDeclarations),
       );
     } catch {
       messages.push(
@@ -502,7 +511,9 @@ function buildBtwSeedState(
             return [];
           }
 
-          return isVisibleBtwMessage({ role: message.role, customType: message.customType }) ? [] : [message as Message];
+          return isVisibleBtwMessage({ role: message.role, customType: message.customType })
+            ? []
+            : [withoutParentToolDeclarations(message as Message)];
         }),
       );
     }

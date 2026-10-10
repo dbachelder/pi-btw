@@ -1467,6 +1467,41 @@ describe("btw runtime behavior", () => {
     expect(secondOptions.thinkingLevel).toBe("low");
   });
 
+  it("contextual BTW strips parent tool declarations from seeded system messages", async () => {
+    const harness = createHarness([
+      {
+        type: "message",
+        role: "system",
+        content: [{ type: "text", text: "main system prompt" }],
+        toolsAdded: [{ name: "parent_only_tool", description: "", parameters: {} }],
+        timestamp: Date.now(),
+      } as unknown as SessionEntry,
+      {
+        type: "message",
+        role: "system",
+        content: [{ type: "text", text: "main system update" }],
+        toolsRemoved: [{ name: "parent_only_tool" }],
+        timestamp: Date.now(),
+      } as unknown as SessionEntry,
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "text", text: "main session task" }],
+        timestamp: Date.now(),
+      } as SessionEntry,
+    ]);
+
+    await harness.runSessionStart();
+    await harness.command("btw", "contextual start");
+
+    const systemSeeds = subSessionRecords[0].seedMessages.filter((message) => message.role === "system");
+    expect(systemSeeds.map((message) => message.content[0].text)).toEqual(["main system prompt", "main system update"]);
+    for (const message of systemSeeds) {
+      expect(message).not.toHaveProperty("toolsAdded");
+      expect(message).not.toHaveProperty("toolsRemoved");
+    }
+  });
+
   it("contextual BTW seeds the sub-session with main-session messages but excludes visible BTW notes", async () => {
     const harness = createHarness([
       {
