@@ -521,6 +521,11 @@ async function flushAsyncWork() {
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+// TUI commands return before the BTW turn finishes (#62); let the mocked turn settle.
+async function settleBtwTurn() {
+  for (let i = 0; i < 5; i++) await flushAsyncWork();
+}
+
 function getCustomEntries(entries: SessionEntry[], customType: string): CustomEntry[] {
   return entries.filter((entry): entry is CustomEntry => entry.type === "custom" && entry.customType === customType);
 }
@@ -780,6 +785,7 @@ function createHarness(
     const cmd = commands.get(name);
     if (!cmd) throw new Error(`Missing command: ${name}`);
     await cmd.handler(args, baseCtx as unknown as ExtensionCommandContext);
+    await settleBtwTurn();
   }
 
   async function shortcut(name: string) {
@@ -921,6 +927,32 @@ describe("btw runtime behavior", () => {
     expect(subSession.getActiveToolNames()).toEqual(["read", "bash", "edit", "write"]);
     expect(subSession.prompt).toHaveBeenCalledWith("first question", { source: "extension" });
   });
+
+  // Pi's interactive loop awaits command handlers, so a handler that waits for the
+  // BTW answer holds every main-editor submit until the answer finishes (#62).
+  for (const [contextMode, returnsBeforeAnswer] of [["tui", true], ["rpc", false]] as const) {
+    it(`${returnsBeforeAnswer ? "returns" : "waits"} from /btw before the answer finishes in ${contextMode} mode`, async () => {
+      const harness = createHarness([], { contextMode });
+      const gate = Promise.withResolvers<void>();
+      promptStreamMock.mockImplementation(async function* () {
+        await gate.promise;
+        yield* streamAnswer("Slow answer");
+      });
+
+      await harness.runSessionStart();
+      let handlerDone = false;
+      const handler = harness.command("btw", "slow question").then(() => {
+        handlerDone = true;
+      });
+      await vi.waitFor(() => expect(subSessionRecords[0]?.session.prompt).toHaveBeenCalled());
+      await flushAsyncWork();
+
+      expect(handlerDone).toBe(returnsBeforeAnswer);
+      gate.resolve();
+      await handler;
+      await vi.waitFor(() => expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(1));
+    });
+  }
 
   it("treats /side as an alias for /btw on the same contextual sub-session", async () => {
     const harness = createHarness();
@@ -1201,6 +1233,7 @@ describe("btw runtime behavior", () => {
     await harness.command("btw:clear", "");
     finishLoad(loader);
     await pending;
+    await settleBtwTurn();
     const session = subSessionRecords[0].session;
     expect(session.prompt).not.toHaveBeenCalled();
     expect(session.extensionRunner.emit).toHaveBeenCalledTimes(1);

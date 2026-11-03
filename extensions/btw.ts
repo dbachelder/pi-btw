@@ -2378,7 +2378,7 @@ export default function (pi: ExtensionAPI) {
         await resetThread(ctx, true, "contextual");
       }
 
-      await runBtw(ctx, question, save, "contextual");
+      await startBtw(ctx, question, save, "contextual");
       return true;
     }
 
@@ -2398,7 +2398,7 @@ export default function (pi: ExtensionAPI) {
         return true;
       }
 
-      await runBtw(ctx, question, save, "tangent");
+      await startBtw(ctx, question, save, "tangent");
       return true;
     }
 
@@ -2421,7 +2421,7 @@ export default function (pi: ExtensionAPI) {
         return true;
       }
 
-      await runBtw(ctx, question, save, "readonly");
+      await startBtw(ctx, question, save, "readonly");
       return true;
     }
 
@@ -2434,7 +2434,7 @@ export default function (pi: ExtensionAPI) {
 
       await resetThread(ctx, true, "contextual");
       if (question) {
-        await runBtw(ctx, question, save, "contextual");
+        await startBtw(ctx, question, save, "contextual");
       } else {
         await ensureBtwSession(ctx, "contextual");
         setOverlayStatus("Started a fresh BTW thread.", ctx);
@@ -2685,6 +2685,24 @@ export default function (pi: ExtensionAPI) {
     }
 
     syncUi(ctx);
+  }
+
+  // Pi's interactive loop awaits command handlers, so waiting for the answer here
+  // would hold every main-editor submit until BTW finishes. The overlay shows the
+  // turn in the TUI; other modes deliver the answer as a session note, so a one-shot
+  // run has to wait for it.
+  function startBtw(
+    ctx: ExtensionCommandContext,
+    question: string,
+    saveRequested: boolean,
+    mode: BtwThreadMode,
+  ): Promise<void> {
+    const turn = runBtw(ctx, question, saveRequested, mode);
+    if (!canRenderBtwOverlay(ctx)) {
+      return turn;
+    }
+    turn.catch((error) => notify(ctx, error instanceof Error ? error.message : String(error), "error"));
+    return Promise.resolve();
   }
 
   async function runBtw(
