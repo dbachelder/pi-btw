@@ -10,6 +10,10 @@ All notable changes to this project are documented here.
   returns as soon as the BTW turn starts, so messages typed in the main editor
   run right away instead of waiting for the BTW answer. Non-TUI modes still wait,
   because the answer is delivered as a session note. (#62)
+- The BTW child prompt no longer states the working directory twice. BTW now
+  strips the parent's `<cwd>` section (Pi 0.99+) and the parent's
+  `Current working directory:` footer when it ends with a newline, as custom
+  system prompts do on older Pi.
 
 ### Maintenance
 - Development dependencies now target Pi 1.5.0. SDK test fixtures use plain JSON

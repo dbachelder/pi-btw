@@ -995,6 +995,21 @@ describe("btw runtime behavior", () => {
     expect(capabilities).not.toContain("mcp");
   });
 
+  it.each([
+    // Pi 0.99+ renders the working directory as a section, followed by any extension sections.
+    ["a <cwd> section", "Parent rules.\n\n<cwd>\n/parent\n</cwd>\n\n<team_notes>\nKeep it short.\n</team_notes>", "Parent rules.\n\n<team_notes>\nKeep it short.\n</team_notes>"],
+    // Older Pi ends a custom prompt's footer with a newline.
+    ["a custom-prompt footer", "Parent rules.\nCurrent working directory: /parent\n", "Parent rules."],
+  ])("drops the parent's working directory in %s so the child declares its own once", async (_format, parentPrompt, expected) => {
+    const harness = createHarness();
+    harness.baseCtx.getSystemPrompt = () => parentPrompt;
+
+    await harness.runSessionStart();
+    await harness.command("btw", "side question");
+
+    expect(createAgentSessionMock.mock.calls[0][0].resourceLoader.getSystemPrompt()).toBe(expected);
+  });
+
   it("tells the summarizer that no tools are available despite inherited tool claims", async () => {
     const harness = createHarness();
     harness.baseCtx.getSystemPrompt = () => "Available tools: bash, web_search, mcp.";

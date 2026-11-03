@@ -311,8 +311,11 @@ function isCustomEntry(entry: unknown, customType: string): entry is { type: "cu
 
 function stripDynamicSystemPromptFooter(systemPrompt: string): string {
   return systemPrompt
-    .replace(/\nCurrent date and time:[^\n]*(?:\nCurrent working directory:[^\n]*)?$/u, "")
-    .replace(/\nCurrent working directory:[^\n]*$/u, "")
+    // Older Pi ends a custom prompt's footer with a newline, so allow trailing whitespace.
+    .replace(/\nCurrent date and time:[^\n]*(?:\nCurrent working directory:[^\n]*)?\s*$/u, "")
+    .replace(/\nCurrent working directory:[^\n]*\s*$/u, "")
+    // Pi 0.99+ renders the cwd as a `<cwd>` section, which the child adds again itself.
+    .replace(/(?:^|\n\n)<cwd>\n[^\n]*\n<\/cwd>(?=\n\n|$)/gu, "")
     .trim();
 }
 

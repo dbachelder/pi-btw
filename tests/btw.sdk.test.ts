@@ -156,6 +156,8 @@ describe("BTW commands with the real Pi SDK", () => {
     expect(request.prompt).toContain("Project instruction sentinel");
     expect(request.prompt).toContain("<btw_capabilities>");
     expect(request.prompt).toContain(`Available tools in this BTW session: ${mode.tools.join(", ")}.`);
+    // The parent's cwd is stripped and the child declares its own, in either Pi prompt format.
+    expect(request.prompt.match(/<cwd>|Current working directory:/g)).toHaveLength(1);
     expect(JSON.stringify(request.messages).includes("parent context sentinel")).toBe(mode.inheritsContext);
     expect(JSON.stringify(request.messages)).toContain("child question sentinel");
     expect(sessionManager.getEntries().some((entry) => entry.type === "custom" && entry.customType === "btw-thread-entry")).toBe(true);
