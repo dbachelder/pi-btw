@@ -91,7 +91,7 @@ async function fixture(withExtension = false, withToolHistory = false) {
     sessionManager.appendMessage({
       role: "system", content: "Initial parent prompt sentinel",
       sections: { "parent-instructions": "Preserved parent instruction sentinel" },
-      toolsAdded: [{ name: "unavailable_parent_tool", description: "Parent-only fixture", parameters: piAI.Type.Object({}) }],
+      toolsAdded: [{ name: "unavailable_parent_tool", description: "Parent-only fixture", parameters: { type: "object", properties: {} } }],
       timestamp: Date.now(),
     });
   }
@@ -102,7 +102,7 @@ async function fixture(withExtension = false, withToolHistory = false) {
     noPromptTemplates: true, noContextFiles: true,
     extensionFactories: [btwExtension, (pi) => pi.registerTool({
       name: "unavailable_parent_tool", label: "Parent tool", description: "Parent-only fixture",
-      parameters: piAI.Type.Object({}),
+      parameters: { type: "object", properties: {} },
       execute: async () => ({ content: [{ type: "text", text: "parent-only fact" }], details: {} }),
     })],
     systemPrompt: "Project instruction sentinel. Parent can use unavailable_parent_tool.",
@@ -124,7 +124,7 @@ async function fixture(withExtension = false, withToolHistory = false) {
     sessionManager.appendMessage({
       role: "system", content: "Parent tool update sentinel",
       sections: { "parent-update": "Preserved parent update sentinel" },
-      toolsAdded: [{ name: "retired_parent_tool", description: "Retired fixture", parameters: piAI.Type.Object({}) }],
+      toolsAdded: [{ name: "retired_parent_tool", description: "Retired fixture", parameters: { type: "object", properties: {} } }],
       timestamp: Date.now(),
     });
     sessionManager.appendMessage({
@@ -156,6 +156,8 @@ describe("BTW commands with the real Pi SDK", () => {
     expect(request.prompt).toContain("Project instruction sentinel");
     expect(request.prompt).toContain("<btw_capabilities>");
     expect(request.prompt).toContain(`Available tools in this BTW session: ${mode.tools.join(", ")}.`);
+    // The parent's cwd is stripped and the child declares its own, in either Pi prompt format.
+    expect(request.prompt.match(/<cwd>|Current working directory:/g)).toHaveLength(1);
     expect(JSON.stringify(request.messages).includes("parent context sentinel")).toBe(mode.inheritsContext);
     expect(JSON.stringify(request.messages)).toContain("child question sentinel");
     expect(sessionManager.getEntries().some((entry) => entry.type === "custom" && entry.customType === "btw-thread-entry")).toBe(true);
@@ -228,7 +230,7 @@ describe("BTW commands with the real Pi SDK", () => {
     await command("btw", "use lookup");
     expect(requests).toHaveLength(2);
     expect(requests[0].tools).toContain("lookup_fact");
-    expect(requests[0].prompt).toContain("write, lookup_fact.");
+    expect(requests[0].prompt).toMatch(/Available tools in this BTW session: [^\n]*\blookup_fact\b/);
     expect(requests[1].messages.some((message) => message.role === "toolResult" && JSON.stringify(message.content).includes("fixture fact"))).toBe(true);
     expect(await readFile(marker, "utf8")).toBe("start\n");
     await command("btw:ask", "read-only question");
