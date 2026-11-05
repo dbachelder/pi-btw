@@ -2,6 +2,16 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased]
+
+### Fixed
+- `/btw` no longer fails on pi-claude-bridge models with `prompt-capture: no
+  capture for this ... system prompt` (elidickinson/pi-claude-bridge#158). The
+  child now inherits the parent prompt verbatim, as the main model last saw it,
+  including sections extensions add each turn. BTW previously dropped those
+  sections on every provider. The child prompt states the working directory
+  twice again: stripping the parent's copy (#63) broke the bridge's match.
+
 ## [0.8.1] - 2026-11-03
 
 Supports Pi 0.85.1 through 1.x. Tested with Pi 0.85.1 and 1.5.0.
