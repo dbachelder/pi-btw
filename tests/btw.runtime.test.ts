@@ -978,14 +978,13 @@ describe("btw runtime behavior", () => {
   ])("%s appends an authoritative child capability list after inherited instructions", async (command, tools) => {
     const harness = createHarness();
     const inherited = "Keep the project's conventions. Available tools: bash, edit, web_search. Skills: use mcp.";
-    harness.baseCtx.getSystemPrompt = () => `${inherited}\nCurrent working directory: /parent`;
+    harness.baseCtx.getSystemPrompt = () => inherited;
 
     await harness.runSessionStart();
     await harness.command(command, "side question");
 
     const prompt = subSessionRecords[0].promptCalls[0].context.systemPrompt;
     expect(prompt).toContain(inherited);
-    expect(prompt).not.toContain("Current working directory: /parent");
     const capabilities = prompt.slice(prompt.lastIndexOf("<btw_capabilities>"));
     expect(capabilities).toContain(`Available tools in this BTW session: ${tools}.`);
     expect(capabilities).toContain("This capability list is authoritative");
@@ -997,14 +996,32 @@ describe("btw runtime behavior", () => {
 
   it.each([
     // Pi 0.99+ renders the working directory as a section, followed by any extension sections.
-    ["a <cwd> section", "Parent rules.\n\n<cwd>\n/parent\n</cwd>\n\n<team_notes>\nKeep it short.\n</team_notes>", "Parent rules.\n\n<team_notes>\nKeep it short.\n</team_notes>"],
+    ["a <cwd> section", "Parent rules.\n\n<cwd>\n/parent\n</cwd>\n\n<team_notes>\nKeep it short.\n</team_notes>"],
     // Older Pi ends a custom prompt's footer with a newline.
-    ["a custom-prompt footer", "Parent rules.\nCurrent working directory: /parent\n", "Parent rules."],
-  ])("drops the parent's working directory in %s so the child declares its own once", async (_format, parentPrompt, expected) => {
+    ["a custom-prompt footer", "Parent rules.\nCurrent working directory: /parent\n"],
+  ])("passes the parent prompt with %s to the child verbatim", async (_format, parentPrompt) => {
     const harness = createHarness();
     harness.baseCtx.getSystemPrompt = () => parentPrompt;
 
     await harness.runSessionStart();
+    await harness.command("btw", "side question");
+
+    expect(createAgentSessionMock.mock.calls[0][0].resourceLoader.getSystemPrompt()).toBe(parentPrompt);
+  });
+
+  it.each([
+    ["the parent's last turn", false, "Parent rules.\n\n<team_notes>\nAdded this turn.\n</team_notes>"],
+    ["the idle prompt after a new session starts", true, "Parent rules."],
+  ])("seeds the child with %s", async (_case, newSession, expected) => {
+    const harness = createHarness();
+    let parentPrompt = "Parent rules.\n\n<team_notes>\nAdded this turn.\n</team_notes>";
+    harness.baseCtx.getSystemPrompt = () => parentPrompt;
+
+    await harness.runSessionStart();
+    await harness.runEvent("turn_start");
+    // Pi drops per-turn extension sections once the run ends.
+    parentPrompt = "Parent rules.";
+    if (newSession) await harness.runSessionStart();
     await harness.command("btw", "side question");
 
     expect(createAgentSessionMock.mock.calls[0][0].resourceLoader.getSystemPrompt()).toBe(expected);

@@ -309,25 +309,17 @@ function isCustomEntry(entry: unknown, customType: string): entry is { type: "cu
   return !!entry && typeof entry === "object" && (entry as { type?: string }).type === "custom" && (entry as { customType?: string }).customType === customType;
 }
 
-function stripDynamicSystemPromptFooter(systemPrompt: string): string {
-  return systemPrompt
-    // Older Pi ends a custom prompt's footer with a newline, so allow trailing whitespace.
-    .replace(/\nCurrent date and time:[^\n]*(?:\nCurrent working directory:[^\n]*)?\s*$/u, "")
-    .replace(/\nCurrent working directory:[^\n]*\s*$/u, "")
-    // Pi 0.99+ renders the cwd as a `<cwd>` section, which the child adds again itself.
-    .replace(/(?:^|\n\n)<cwd>\n[^\n]*\n<\/cwd>(?=\n\n|$)/gu, "")
-    .trim();
-}
-
 function createBtwResourceLoader(
   ctx: ExtensionCommandContext,
+  parentSystemPrompt: string,
   tools: readonly string[] | (() => readonly string[]),
   appendSystemPrompt: string[] = [BTW_SYSTEM_PROMPT],
   extensionResources?: ResourceLoader,
   workspaceLabel = `local ${ctx.cwd}`,
 ): ResourceLoader {
   const extensionsResult = extensionResources?.getExtensions() ?? { extensions: [], errors: [], runtime: createExtensionRuntime() };
-  const systemPrompt = stripDynamicSystemPromptFooter(ctx.getSystemPrompt());
+  // Keep the parent prompt verbatim: providers such as pi-claude-bridge resolve the
+  // child by finding it unchanged inside the child's prompt.
   // Preserve the parent's project/custom instructions, but override capability
   // claims in its rendered prompt and in the history seeded into this child.
   const capabilities = () => {
@@ -352,7 +344,7 @@ function createBtwResourceLoader(
     getPrompts: () => ({ prompts: [], diagnostics: [] }),
     getThemes: () => ({ themes: [], diagnostics: [] }),
     getAgentsFiles: () => ({ agentsFiles: [] }),
-    getSystemPrompt: () => systemPrompt,
+    getSystemPrompt: () => parentSystemPrompt,
     getSystemPromptSource: () => undefined,
     getAppendSystemPrompt: () => [...appendSystemPrompt, capabilities()],
     getAppendSystemPromptSources: () => [],
@@ -1744,6 +1736,9 @@ export default function (pi: ExtensionAPI) {
   let activeBtwSession: BtwSessionRuntime | null = null;
   let btwLifecycleGeneration = 0;
   let btwSubmissionQueue = Promise.resolve();
+  // Idle getSystemPrompt() lacks sections extensions add per turn; reuse the prompt the main model last saw.
+  let lastTurnSystemPrompt: string | undefined;
+  const parentSystemPrompt = (ctx: ExtensionCommandContext) => lastTurnSystemPrompt ?? ctx.getSystemPrompt();
   let btwSessionCreationQueue = Promise.resolve();
 
   function invalidateBtwLifecycle(): void {
@@ -2150,7 +2145,7 @@ export default function (pi: ExtensionAPI) {
       // or later. Read-only sessions keep the structural built-in allowlist.
       ...(extensionResources ? { noTools: "builtin" as const } : { tools: [...builtinTools] }),
       resourceLoader: createBtwResourceLoader(
-        ctx, () => childSession?.getActiveToolNames() ?? builtinTools, [BTW_SYSTEM_PROMPT], extensionResources, workspace?.label,
+        ctx, parentSystemPrompt(ctx), () => childSession?.getActiveToolNames() ?? builtinTools, [BTW_SYSTEM_PROMPT], extensionResources, workspace?.label,
       ),
     };
     let created: Awaited<ReturnType<typeof createAgentSession>>;
@@ -2935,7 +2930,7 @@ export default function (pi: ExtensionAPI) {
       ...modelRuntimeOptions,
       thinkingLevel: "off",
       tools: [],
-      resourceLoader: createBtwResourceLoader(ctx, [], [BTW_SUMMARIZE_SYSTEM_PROMPT]),
+      resourceLoader: createBtwResourceLoader(ctx, parentSystemPrompt(ctx), [], [BTW_SUMMARIZE_SYSTEM_PROMPT]),
     };
     const { session } = await createAgentSession(sessionOptions);
 
@@ -3023,7 +3018,12 @@ export default function (pi: ExtensionAPI) {
     };
   });
 
+  pi.on("turn_start", (_event, ctx) => {
+    lastTurnSystemPrompt = ctx.getSystemPrompt();
+  });
+
   pi.on("session_start", async (_event, ctx) => {
+    lastTurnSystemPrompt = undefined;
     await restoreThread(ctx);
   });
 

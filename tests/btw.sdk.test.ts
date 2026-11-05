@@ -104,6 +104,11 @@ async function fixture(withExtension = false, withToolHistory = false) {
       name: "unavailable_parent_tool", label: "Parent tool", description: "Parent-only fixture",
       parameters: { type: "object", properties: {} },
       execute: async () => ({ content: [{ type: "text", text: "parent-only fact" }], details: {} }),
+    }), (pi) => pi.on("before_agent_start", (event) => {
+      // A per-turn addition, as extensions such as ponytail make. Older SDKs have no sections.
+      const sections = (event as { systemPromptOptions?: { sections?: Record<string, string> } }).systemPromptOptions?.sections;
+      if (sections) sections.turn_notes = "Per-turn section sentinel";
+      else return { systemPrompt: `${event.systemPrompt}\n\nPer-turn section sentinel` };
     })],
     systemPrompt: "Project instruction sentinel. Parent can use unavailable_parent_tool.",
   });
@@ -119,6 +124,8 @@ async function fixture(withExtension = false, withToolHistory = false) {
   // messages on newer releases, before creating any child session.
   await session.prompt("parent request sentinel");
   expect(requests.at(-1)!.tools).toContain("unavailable_parent_tool");
+  const parentPrompt = requests.at(-1)!.prompt;
+  expect(parentPrompt).toContain("Per-turn section sentinel");
   requests.length = 0;
   if (withToolHistory) {
     sessionManager.appendMessage({
@@ -139,7 +146,7 @@ async function fixture(withExtension = false, withToolHistory = false) {
     await registered!.handler(args, session.extensionRunner.createCommandContext());
     expect(errors).toEqual([]);
   };
-  return { sessionManager, requests, command, marker, parentAnswers };
+  return { sessionManager, requests, command, marker, parentAnswers, parentPrompt };
 }
 
 describe("BTW commands with the real Pi SDK", () => {
@@ -148,7 +155,7 @@ describe("BTW commands with the real Pi SDK", () => {
     { command: "btw:tangent", inheritsContext: false, tools: ["read", "bash", "edit", "write"] },
     { command: "btw:ask", inheritsContext: true, tools: ["read", "grep", "find", "ls"] },
   ])("$command sends the correct context, capabilities, and tool surface", async (mode) => {
-    const { command, requests, sessionManager, parentAnswers } = await fixture();
+    const { command, requests, sessionManager, parentAnswers, parentPrompt } = await fixture();
     await command(mode.command, "child question sentinel");
     expect(requests).toHaveLength(1);
     const request = requests[0];
@@ -156,8 +163,8 @@ describe("BTW commands with the real Pi SDK", () => {
     expect(request.prompt).toContain("Project instruction sentinel");
     expect(request.prompt).toContain("<btw_capabilities>");
     expect(request.prompt).toContain(`Available tools in this BTW session: ${mode.tools.join(", ")}.`);
-    // The parent's cwd is stripped and the child declares its own, in either Pi prompt format.
-    expect(request.prompt.match(/<cwd>|Current working directory:/g)).toHaveLength(1);
+    // The child embeds the prompt the parent model saw, per-turn sections included.
+    expect(request.prompt).toContain(parentPrompt);
     expect(JSON.stringify(request.messages).includes("parent context sentinel")).toBe(mode.inheritsContext);
     expect(JSON.stringify(request.messages)).toContain("child question sentinel");
     expect(sessionManager.getEntries().some((entry) => entry.type === "custom" && entry.customType === "btw-thread-entry")).toBe(true);
