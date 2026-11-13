@@ -390,6 +390,9 @@ function createMockAgentSession(options: any) {
     emit,
     getListenerCount: () => listeners.size,
     getIsStreaming: () => isStreaming,
+    setStateMessages: (messages: any[]) => {
+      stateMessages = messages.map((message) => structuredClone(message));
+    },
     session: null as any,
   };
 
@@ -508,6 +511,8 @@ function createMockAgentSession(options: any) {
       listeners.clear();
     }),
     bindExtensions: vi.fn(async () => {}),
+    // Compaction rewrites the child context; tests can also rewrite it directly.
+    compact: vi.fn(async () => ({ compacted: true })),
     extensionRunner: { emit: vi.fn(async () => {}) },
     setActiveToolsByName: vi.fn((tools: string[]) => { activeTools = tools; }),
     getActiveToolNames: vi.fn(() => activeTools),
@@ -3401,6 +3406,96 @@ describe("btw runtime behavior", () => {
       type: "error",
     });
     expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(1);
+  });
+
+  it("/btw:compact compacts the active sub-session and keeps the hidden thread", async () => {
+    const harness = createHarness();
+    promptStreamMock.mockImplementation(() => streamAnswer("First answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+
+    const overlay = harness.latestOverlayComponent();
+    const record = subSessionRecords[0];
+    await harness.command("btw:compact", "keep the decisions");
+
+    expect(record.session.compact).toHaveBeenCalledWith("keep the decisions");
+    expect(record.session.dispose).not.toHaveBeenCalled();
+    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(1);
+    expect(overlay.statusText.text).toContain("Compacted the BTW session context. Hidden thread preserved.");
+    expect(harness.notifications.at(-1)).toEqual({
+      message: "Compacted the BTW session context. Hidden thread preserved.",
+      type: "info",
+    });
+  });
+
+  it("/btw:compact without instructions passes undefined", async () => {
+    const harness = createHarness();
+    promptStreamMock.mockImplementation(() => streamAnswer("First answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+    await harness.command("btw:compact", "");
+
+    expect(subSessionRecords[0].session.compact).toHaveBeenCalledWith(undefined);
+  });
+
+  it("/btw:compact warns when there is no BTW session or thread", async () => {
+    const harness = createHarness();
+    await harness.runSessionStart();
+
+    await harness.command("btw:compact", "");
+
+    expect(createAgentSessionMock).not.toHaveBeenCalled();
+    expect(harness.notifications.at(-1)).toEqual({
+      message: "No BTW thread to compact.",
+      type: "warning",
+    });
+  });
+
+  it("/btw:compact keeps the thread when compaction fails", async () => {
+    const harness = createHarness();
+    promptStreamMock.mockImplementation(() => streamAnswer("First answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+    const record = subSessionRecords[0];
+    record.session.compact.mockRejectedValue(new Error("compaction exploded"));
+
+    await harness.command("btw:compact", "");
+
+    expect(harness.notifications.at(-1)).toEqual({ message: "compaction exploded", type: "error" });
+    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(1);
+    expect(record.session.dispose).not.toHaveBeenCalled();
+  });
+
+  it("/btw:inject after compaction hands off the recorded exchanges, not the rewritten context", async () => {
+    const harness = createHarness();
+    promptStreamMock
+      .mockImplementationOnce(() => streamAnswer("First answer"))
+      .mockImplementationOnce(() => streamAnswer("Second answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+    await harness.command("btw", "second question");
+
+    const record = subSessionRecords[0];
+    await harness.command("btw:compact", "");
+
+    // Compaction replaces the child context with a summary plus the most recent turn,
+    // so the seeded offset no longer lines up with the hidden thread.
+    record.setStateMessages([
+      { role: "user", content: [{ type: "text", text: "Compaction summary" }], timestamp: Date.now() },
+      { role: "user", content: [{ type: "text", text: "second question" }], timestamp: Date.now() },
+      makeAssistantMessage("Second answer"),
+    ]);
+
+    await harness.command("btw:inject", "");
+
+    expect(harness.sentUserMessages).toHaveLength(1);
+    expect(harness.sentUserMessages[0].content).toContain("User: first question\nAssistant: First answer");
+    expect(harness.sentUserMessages[0].content).toContain("User: second question\nAssistant: Second answer");
+    expect(harness.sentUserMessages[0].content).not.toContain("Compaction summary");
   });
 
   it("/btw:summarize success summarizes the active sub-session thread, disposes it, dismisses the overlay, and reopens fresh", async () => {

@@ -70,6 +70,7 @@ pi install /absolute/path/to/pi-btw
 /btw:summarize turn that side thread into a short handoff
 /btw:copy
 /btw:copy --all
+/btw:compact keep the decisions and open questions
 /btw:clear
 ```
 
@@ -146,6 +147,14 @@ pi install /absolute/path/to/pi-btw
 - with `--all`, copies the whole hidden thread as `User:`/`Assistant:` blocks separated by `---`
 - waits for an in-flight turn first, so it copies the answer you just saw
 - never clears or disposes the thread; clipboard failures are reported without losing it
+
+### `/btw:compact [instructions]`
+
+- compacts the BTW sub-session context with the current effective BTW model, keeping the hidden thread
+- optional `instructions` are passed to the summarizer, like pi's own `/compact`
+- waits for the current BTW turn to finish before compacting
+- after compaction the hidden thread becomes the handoff source, because the child's rewritten message list no longer lines up with the seeded offset; `/btw:inject` and `/btw:summarize` still send every exchange
+- a failed compaction is reported and leaves the thread untouched
 
 ### `/btw:inject [instructions]`
 
@@ -279,7 +288,7 @@ shares space with the transcript rather than growing the modal.
 
 Inside the BTW modal composer, slash handling is split at the BTW/session boundary:
 
-- `/btw`, `/side`, `/btw:new`, `/btw:tangent`, `/btw:ask`, `/btw:clear`, `/btw:copy`, `/btw:model`, `/btw:thinking`, `/btw:inject`, and `/btw:summarize` stay owned by BTW because they control BTW lifecycle, configuration, or handoff behavior
+- `/btw`, `/side`, `/btw:new`, `/btw:tangent`, `/btw:ask`, `/btw:clear`, `/btw:copy`, `/btw:compact`, `/btw:model`, `/btw:thinking`, `/btw:inject`, and `/btw:summarize` stay owned by BTW because they control BTW lifecycle, configuration, or handoff behavior
 - any other slash-prefixed input is routed through the BTW sub-session's normal `prompt()` path
 - this means ordinary pi slash commands like `/help` are handled by the sub-session instead of being rejected by a modal-only fallback
 - if the sub-session cannot handle a slash command, BTW surfaces the real sub-session failure through the transcript/status state instead of inventing an "unsupported slash input" warning
