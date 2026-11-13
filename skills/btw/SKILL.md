@@ -34,6 +34,8 @@ Use these commands in your guidance to the user:
 /btw:thinking [<level> | clear]
 /btw:inject [instructions]
 /btw:summarize [instructions]
+/btw:copy [--all]
+/btw:compact [instructions]
 ```
 
 `/side` is an alias for `/btw` and shares the same thread, overlay, and settings. `/btw` is canonical; the lifecycle commands stay in the `/btw:*` namespace.
@@ -130,6 +132,27 @@ Recommend:
 
 Use this when the thread is long and only the distilled outcome should go back into the main agent.
 
+### To copy the last answer or the whole thread
+
+Recommend:
+
+```text
+/btw:copy
+/btw:copy --all
+```
+
+Use this when the user wants the text on the clipboard instead of in the main agent. `/btw:copy` copies the last answer; `--all` copies every exchange. Copying never clears the thread.
+
+### To shrink the BTW context
+
+Recommend:
+
+```text
+/btw:compact <instructions>
+```
+
+Use this when the BTW thread has grown long but the user wants to keep talking in it. Compaction keeps the hidden thread, so `/btw:inject` and `/btw:summarize` still send every exchange. Pi keeps roughly the last 20k tokens, so a short thread reports that it is too small to compact.
+
 ### To make BTW cheaper or faster than the main thread
 
 Recommend:
@@ -147,6 +170,8 @@ Use these when the main thread should keep its current model or thinking level, 
 - Prefer `/btw:tangent` when the user wants that side conversation to be contextless.
 - Prefer `/btw:ask` when the user wants a side conversation that cannot modify the workspace.
 - Prefer `/btw:summarize` over `/btw:inject` for long exploratory threads.
+- Prefer `/btw:copy` when the user wants the answer on the clipboard rather than in the main agent.
+- Prefer `/btw:compact` when the BTW thread is long but the user wants to keep working in it.
 - Prefer `/btw:inject` when precise wording, detailed tradeoffs, or a full plan matters.
 - Suggest `/btw:new` before starting a totally unrelated side topic when main-session context is still useful.
 - Suggest `/btw:clear` when the widget/thread should be dismissed.

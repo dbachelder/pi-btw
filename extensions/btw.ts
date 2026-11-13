@@ -1,5 +1,6 @@
 import {
   buildSessionContext,
+  copyToClipboard,
   createAgentSession,
   createExtensionRuntime,
   getAgentDir,
@@ -49,6 +50,8 @@ export const BTW_COMMANDS = [
   { name: "btw:ask", description: "Ask a read-only side question: inherits main-session context but exposes only read/grep/find/ls tools." },
   { name: "btw:new", description: "Start a fresh BTW thread with main-session context. Optionally ask the first question immediately." },
   { name: "btw:clear", description: "Dismiss the BTW modal/widget and clear the current thread." },
+  { name: "btw:copy", description: "Copy the last BTW answer to the clipboard. Add --all to copy the whole thread." },
+  { name: "btw:compact", description: "Compact the BTW sub-session context. Optionally pass instructions for the summary." },
   { name: "btw:inject", description: "Inject the full BTW thread into the main agent as a user message." },
   { name: "btw:summarize", description: "Summarize the BTW thread, then inject the summary into the main agent." },
   { name: "btw:model", description: "Show, set, or clear the BTW-only model override." },
@@ -287,7 +290,13 @@ type BtwSessionRuntime = {
   sideThreadStartIndex: number;
   abortPromise?: Promise<void>;
   promptQueue: Promise<void>;
+  // Set while a manual /btw:compact runs: pi rejects prompt() for the whole duration of
+  // compact(), so new turns queue behind this instead of failing.
+  compactionPromise?: Promise<void>;
   hasExtensions: boolean;
+  // Compaction rewrites the child's message list, so the seeded offset no longer maps
+  // onto the hidden thread. Handoff then falls back to the recorded exchanges.
+  compacted?: boolean;
   workspace?: BtwSshWorkspace;
   workspaceIdentity: string;
 };
@@ -1859,6 +1868,13 @@ export default function (pi: ExtensionAPI) {
     event: AgentSessionEvent,
     ctx?: ExtensionContext | ExtensionCommandContext,
   ): void {
+    // Automatic compaction rewrites the child's messages too, so handoff falls back to the
+    // recorded exchanges. This handler only runs while the session subscription exists, which
+    // is the TUI overlay lifecycle, so non-TUI hosts never observe the flag.
+    if (event.type === "compaction_end" && event.result && !event.aborted) {
+      sessionRuntime.compacted = true;
+    }
+
     if (activeBtwSession?.session !== sessionRuntime.session || !overlayRuntime) {
       return;
     }
@@ -2454,6 +2470,99 @@ export default function (pi: ExtensionAPI) {
       return true;
     }
 
+    if (name === "btw:copy") {
+      // Wait for an in-flight turn so the copied answer is the one the user just saw.
+      await btwSubmissionQueue;
+      const copyAll = /(?:^|\s)--all(?=\s|$)/.test(trimmedArgs);
+      const thread = getPendingThreadForHandoff();
+      const text = copyAll ? formatThread(thread) : (pendingThread.at(-1)?.answer.trim() ?? "");
+
+      if (!text) {
+        notify(ctx, copyAll ? "No BTW thread to copy." : "No BTW answer to copy yet.", "warning");
+        return true;
+      }
+
+      try {
+        await copyToClipboard(text);
+        const message = copyAll
+          ? `Copied the BTW thread (${thread.length} exchange${thread.length === 1 ? "" : "s"}) to the clipboard.`
+          : "Copied the last BTW answer to the clipboard.";
+        setOverlayStatus(message, ctx);
+        notify(ctx, message, "info");
+      } catch (error) {
+        const message = `Could not copy to the clipboard: ${error instanceof Error ? error.message : String(error)}`;
+        setOverlayStatus(message, ctx);
+        notify(ctx, message, "error");
+      }
+      return true;
+    }
+
+    if (name === "btw:compact") {
+      await btwSubmissionQueue;
+      if (pendingThread.length === 0 && !activeBtwSession) {
+        notify(ctx, "No BTW thread to compact.", "warning");
+        return true;
+      }
+
+      if (activeBtwSession?.compactionPromise) {
+        notify(ctx, "A compaction is already running.", "warning");
+        return true;
+      }
+
+      setOverlayStatus("⏳ compacting the BTW context...", ctx);
+      await ensureOverlay(ctx);
+
+      try {
+        const sessionRuntime = activeBtwSession ?? (await ensureBtwSession(ctx, pendingMode));
+        if (!sessionRuntime) {
+          const message = "Compaction failed. Thread preserved.";
+          setOverlayStatus(message, ctx);
+          notify(ctx, message, "error");
+          return true;
+        }
+        await sessionRuntime.promptQueue;
+        await sessionRuntime.abortPromise;
+        if (activeBtwSession !== sessionRuntime) {
+          throw new Error("BTW session closed before compaction completed.");
+        }
+
+        const compaction = sessionRuntime.session.compact(trimmedArgs || undefined);
+        // Publish the in-flight compaction before awaiting it so a turn submitted now
+        // queues behind it instead of hitting pi's "compaction in progress" rejection.
+        sessionRuntime.compactionPromise = compaction.then(
+          () => {},
+          () => {},
+        );
+        try {
+          await compaction;
+        } finally {
+          sessionRuntime.compactionPromise = undefined;
+        }
+
+        // The hidden thread is the source of truth for handoff from now on: compaction
+        // replaces the child's messages, so the seeded offset no longer lines up.
+        sessionRuntime.compacted = true;
+        const message = "Compacted the BTW session context. Hidden thread preserved.";
+        setOverlayStatus(message, ctx);
+        notify(ctx, message, "info");
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        if (/Nothing to compact/i.test(errorMessage)) {
+          const message = "The BTW thread is too small to compact. Thread preserved.";
+          setOverlayStatus(message, ctx);
+          notify(ctx, message, "warning");
+        } else if (/Already compacted/i.test(errorMessage)) {
+          const message = "This BTW thread is already compacted.";
+          setOverlayStatus(message, ctx);
+          notify(ctx, message, "warning");
+        } else {
+          setOverlayStatus("Compaction failed. Thread preserved.", ctx);
+          notify(ctx, errorMessage, "error");
+        }
+      }
+      return true;
+    }
+
     if (name === "btw:model") {
       const parsed = parseBtwModelArgs(trimmedArgs);
       if (parsed.action === "invalid") {
@@ -2800,6 +2909,13 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
+    // pi rejects prompt() while a manual compaction is in progress.
+    await sessionRuntime.compactionPromise;
+    if (activeBtwSession !== sessionRuntime) {
+      releasePromptTurn();
+      return;
+    }
+
     if (!isCurrentGeneration()) {
       releasePromptTurn();
       return;
@@ -2898,14 +3014,16 @@ export default function (pi: ExtensionAPI) {
     if (sessionRuntime) {
       const pendingPromptTurns = sessionRuntime.promptQueue;
       const pendingAbort = sessionRuntime.abortPromise;
+      const pendingCompaction = sessionRuntime.compactionPromise;
       await pendingPromptTurns;
       await pendingAbort;
+      await pendingCompaction;
       if (activeBtwSession !== sessionRuntime) {
         throw new Error("BTW session closed before handoff completed.");
       }
     }
 
-    const thread = sessionRuntime ? extractBtwHandoffThread(sessionRuntime) : [];
+    const thread = sessionRuntime && !sessionRuntime.compacted ? extractBtwHandoffThread(sessionRuntime) : [];
     const resolvedThread = thread.length > 0 ? thread : getPendingThreadForHandoff();
 
     if (resolvedThread.length === 0) {
