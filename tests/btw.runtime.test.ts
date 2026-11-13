@@ -11,6 +11,7 @@ import btwExtension, {
 } from "../extensions/btw";
 
 const {
+  copyToClipboardMock,
   promptStreamMock,
   createAgentSessionMock,
   sessionManagerInMemoryMock,
@@ -23,6 +24,7 @@ const {
   loadBtwExtensionResourcesMock,
   createBtwSshWorkspaceMock,
 } = vi.hoisted(() => ({
+  copyToClipboardMock: vi.fn(),
   promptStreamMock: vi.fn(),
   createAgentSessionMock: vi.fn(),
   sessionManagerInMemoryMock: vi.fn(() => {
@@ -89,6 +91,7 @@ vi.mock("@earendil-works/pi-coding-agent", async () => {
   return {
     ...actual,
     createAgentSession: createAgentSessionMock,
+    copyToClipboard: copyToClipboardMock,
     getMarkdownTheme: () => markdownTheme,
     ModelRuntime: modelRuntimeExport,
     SessionManager: {
@@ -873,6 +876,7 @@ function createHarness(
 
 describe("btw runtime behavior", () => {
   beforeEach(() => {
+    copyToClipboardMock.mockReset().mockResolvedValue(undefined);
     promptStreamMock.mockReset();
     createAgentSessionMock.mockReset();
     sessionManagerInMemoryMock.mockClear();
@@ -3317,6 +3321,86 @@ describe("btw runtime behavior", () => {
       message: "No BTW thread to inject.",
       type: "warning",
     });
+  });
+
+  it("/btw:copy copies the last BTW answer without touching the thread", async () => {
+    const harness = createHarness();
+    promptStreamMock
+      .mockImplementationOnce(() => streamAnswer("First answer"))
+      .mockImplementationOnce(() => streamAnswer("Second answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+    await harness.command("btw", "second question");
+
+    const record = subSessionRecords[0];
+    await harness.command("btw:copy", "");
+
+    expect(copyToClipboardMock).toHaveBeenCalledWith("Second answer");
+    expect(harness.notifications.at(-1)).toEqual({
+      message: "Copied the last BTW answer to the clipboard.",
+      type: "info",
+    });
+    // Copying is read-only: the session survives and the hidden thread is intact.
+    expect(record.session.dispose).not.toHaveBeenCalled();
+    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(2);
+    expect(getCustomEntries(harness.entries, "btw-thread-reset")).toHaveLength(0);
+  });
+
+  it("/btw:copy --all copies the formatted hidden thread", async () => {
+    const harness = createHarness();
+    promptStreamMock
+      .mockImplementationOnce(() => streamAnswer("First answer"))
+      .mockImplementationOnce(() => streamAnswer("Second answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+    await harness.command("btw", "second question");
+
+    await harness.command("btw:copy", "--all");
+
+    expect(copyToClipboardMock).toHaveBeenCalledWith(
+      "User: first question\nAssistant: First answer\n\n---\n\nUser: second question\nAssistant: Second answer",
+    );
+    expect(harness.notifications.at(-1)).toEqual({
+      message: "Copied the BTW thread (2 exchanges) to the clipboard.",
+      type: "info",
+    });
+  });
+
+  it("/btw:copy warns when there is nothing to copy", async () => {
+    const harness = createHarness();
+    await harness.runSessionStart();
+
+    await harness.command("btw:copy", "");
+    expect(copyToClipboardMock).not.toHaveBeenCalled();
+    expect(harness.notifications.at(-1)).toEqual({
+      message: "No BTW answer to copy yet.",
+      type: "warning",
+    });
+
+    await harness.command("btw:copy", "--all");
+    expect(copyToClipboardMock).not.toHaveBeenCalled();
+    expect(harness.notifications.at(-1)).toEqual({
+      message: "No BTW thread to copy.",
+      type: "warning",
+    });
+  });
+
+  it("/btw:copy reports clipboard failures without clearing the thread", async () => {
+    const harness = createHarness();
+    copyToClipboardMock.mockRejectedValue(new Error("no clipboard tool"));
+    promptStreamMock.mockImplementation(() => streamAnswer("First answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+    await harness.command("btw:copy", "");
+
+    expect(harness.notifications.at(-1)).toEqual({
+      message: "Could not copy to the clipboard: no clipboard tool",
+      type: "error",
+    });
+    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(1);
   });
 
   it("/btw:summarize success summarizes the active sub-session thread, disposes it, dismisses the overlay, and reopens fresh", async () => {

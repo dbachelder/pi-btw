@@ -34,6 +34,7 @@ Use these commands in your guidance to the user:
 /btw:thinking [<level> | clear]
 /btw:inject [instructions]
 /btw:summarize [instructions]
+/btw:copy [--all]
 ```
 
 `/side` is an alias for `/btw` and shares the same thread, overlay, and settings. `/btw` is canonical; the lifecycle commands stay in the `/btw:*` namespace.

@@ -1,5 +1,6 @@
 import {
   buildSessionContext,
+  copyToClipboard,
   createAgentSession,
   createExtensionRuntime,
   getAgentDir,
@@ -49,6 +50,7 @@ export const BTW_COMMANDS = [
   { name: "btw:ask", description: "Ask a read-only side question: inherits main-session context but exposes only read/grep/find/ls tools." },
   { name: "btw:new", description: "Start a fresh BTW thread with main-session context. Optionally ask the first question immediately." },
   { name: "btw:clear", description: "Dismiss the BTW modal/widget and clear the current thread." },
+  { name: "btw:copy", description: "Copy the last BTW answer to the clipboard. Add --all to copy the whole thread." },
   { name: "btw:inject", description: "Inject the full BTW thread into the main agent as a user message." },
   { name: "btw:summarize", description: "Summarize the BTW thread, then inject the summary into the main agent." },
   { name: "btw:model", description: "Show, set, or clear the BTW-only model override." },
@@ -2451,6 +2453,33 @@ export default function (pi: ExtensionAPI) {
       await resetThread(ctx);
       dismissOverlay();
       notify(ctx, "Cleared BTW thread.", "info");
+      return true;
+    }
+
+    if (name === "btw:copy") {
+      // Wait for an in-flight turn so the copied answer is the one the user just saw.
+      await btwSubmissionQueue;
+      const copyAll = /(?:^|\s)--all(?=\s|$)/.test(trimmedArgs);
+      const thread = getPendingThreadForHandoff();
+      const text = copyAll ? formatThread(thread) : (pendingThread.at(-1)?.answer.trim() ?? "");
+
+      if (!text) {
+        notify(ctx, copyAll ? "No BTW thread to copy." : "No BTW answer to copy yet.", "warning");
+        return true;
+      }
+
+      try {
+        await copyToClipboard(text);
+        const message = copyAll
+          ? `Copied the BTW thread (${thread.length} exchange${thread.length === 1 ? "" : "s"}) to the clipboard.`
+          : "Copied the last BTW answer to the clipboard.";
+        setOverlayStatus(message, ctx);
+        notify(ctx, message, "info");
+      } catch (error) {
+        const message = `Could not copy to the clipboard: ${error instanceof Error ? error.message : String(error)}`;
+        setOverlayStatus(message, ctx);
+        notify(ctx, message, "error");
+      }
       return true;
     }
 

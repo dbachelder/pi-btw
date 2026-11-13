@@ -68,6 +68,8 @@ pi install /absolute/path/to/pi-btw
 /btw:thinking low
 /btw:inject implement the plan we just discussed
 /btw:summarize turn that side thread into a short handoff
+/btw:copy
+/btw:copy --all
 /btw:clear
 ```
 
@@ -137,6 +139,13 @@ pi install /absolute/path/to/pi-btw
 
 - dismisses the BTW modal/widget
 - clears the current BTW thread
+
+### `/btw:copy [--all]`
+
+- copies the last BTW answer to the system clipboard
+- with `--all`, copies the whole hidden thread as `User:`/`Assistant:` blocks separated by `---`
+- waits for an in-flight turn first, so it copies the answer you just saw
+- never clears or disposes the thread; clipboard failures are reported without losing it
 
 ### `/btw:inject [instructions]`
 
@@ -270,7 +279,7 @@ shares space with the transcript rather than growing the modal.
 
 Inside the BTW modal composer, slash handling is split at the BTW/session boundary:
 
-- `/btw`, `/side`, `/btw:new`, `/btw:tangent`, `/btw:ask`, `/btw:clear`, `/btw:model`, `/btw:thinking`, `/btw:inject`, and `/btw:summarize` stay owned by BTW because they control BTW lifecycle, configuration, or handoff behavior
+- `/btw`, `/side`, `/btw:new`, `/btw:tangent`, `/btw:ask`, `/btw:clear`, `/btw:copy`, `/btw:model`, `/btw:thinking`, `/btw:inject`, and `/btw:summarize` stay owned by BTW because they control BTW lifecycle, configuration, or handoff behavior
 - any other slash-prefixed input is routed through the BTW sub-session's normal `prompt()` path
 - this means ordinary pi slash commands like `/help` are handled by the sub-session instead of being rejected by a modal-only fallback
 - if the sub-session cannot handle a slash command, BTW surfaces the real sub-session failure through the transcript/status state instead of inventing an "unsupported slash input" warning
