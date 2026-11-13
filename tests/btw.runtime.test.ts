@@ -390,9 +390,6 @@ function createMockAgentSession(options: any) {
     emit,
     getListenerCount: () => listeners.size,
     getIsStreaming: () => isStreaming,
-    setStateMessages: (messages: any[]) => {
-      stateMessages = messages.map((message) => structuredClone(message));
-    },
     session: null as any,
   };
 
@@ -511,8 +508,25 @@ function createMockAgentSession(options: any) {
       listeners.clear();
     }),
     bindExtensions: vi.fn(async () => {}),
-    // Compaction rewrites the child context; tests can also rewrite it directly.
-    compact: vi.fn(async () => ({ compacted: true })),
+    // Compaction rewrites the child context the way pi does: a compactionSummary message
+    // followed by the most recent messages, reported as a CompactionResult.
+    compact: vi.fn(async (instructions?: string) => {
+      const kept = stateMessages.slice(-2).map((message: any) => structuredClone(message));
+      stateMessages = [
+        {
+          role: "compactionSummary",
+          summary: "Compaction summary",
+          tokensBefore: 24000,
+          timestamp: Date.now(),
+        },
+        ...kept,
+      ];
+      return {
+        summary: instructions ? `Compaction summary: ${instructions}` : "Compaction summary",
+        firstKeptEntryId: "entry-1",
+        tokensBefore: 24000,
+      };
+    }),
     extensionRunner: { emit: vi.fn(async () => {}) },
     setActiveToolsByName: vi.fn((tools: string[]) => { activeTools = tools; }),
     getActiveToolNames: vi.fn(() => activeTools),
@@ -3373,6 +3387,28 @@ describe("btw runtime behavior", () => {
     });
   });
 
+  it("/btw:copy waits for a streaming turn before copying", async () => {
+    const harness = createHarness();
+    const blocking = createBlockingSuccessStream("Pending answer");
+    promptStreamMock.mockImplementationOnce(() => blocking.stream());
+
+    await harness.runSessionStart();
+    const pendingTurn = harness.command("btw", "pending question");
+    await flushAsyncWork();
+
+    const copy = harness.command("btw:copy", "");
+    await flushAsyncWork();
+
+    expect(copyToClipboardMock).not.toHaveBeenCalled();
+
+    blocking.release();
+    await pendingTurn;
+    await copy;
+
+    expect(copyToClipboardMock).toHaveBeenCalledTimes(1);
+    expect(copyToClipboardMock).toHaveBeenCalledWith("Pending answer");
+  });
+
   it("/btw:copy warns when there is nothing to copy", async () => {
     const harness = createHarness();
     await harness.runSessionStart();
@@ -3437,7 +3473,7 @@ describe("btw runtime behavior", () => {
     await harness.command("btw", "first question");
     await harness.command("btw:compact", "");
 
-    expect(subSessionRecords[0].session.compact).toHaveBeenCalledWith(undefined);
+    expect(subSessionRecords[0].session.compact.mock.calls[0][0]).toBeUndefined();
   });
 
   it("/btw:compact warns when there is no BTW session or thread", async () => {
@@ -3465,8 +3501,180 @@ describe("btw runtime behavior", () => {
     await harness.command("btw:compact", "");
 
     expect(harness.notifications.at(-1)).toEqual({ message: "compaction exploded", type: "error" });
+    expect(harness.latestOverlayComponent().statusText.text).toContain("Compaction failed. Thread preserved.");
     expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(1);
     expect(record.session.dispose).not.toHaveBeenCalled();
+
+    // The failed compaction left `compacted` unset, so handoff still reads the child thread.
+    record.session.state.messages.push(
+      { role: "user", content: [{ type: "text", text: "session-only question" }], timestamp: Date.now() },
+      makeAssistantMessage("session-only answer"),
+    );
+
+    await harness.command("btw:inject", "");
+
+    expect(harness.sentUserMessages).toHaveLength(1);
+    expect(String(harness.sentUserMessages[0].content)).toContain(
+      "User: session-only question\nAssistant: session-only answer",
+    );
+  });
+
+  it("/btw:compact warns when the thread is too small to compact", async () => {
+    const harness = createHarness();
+    promptStreamMock.mockImplementation(() => streamAnswer("First answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+    const record = subSessionRecords[0];
+    record.session.compact.mockRejectedValueOnce(new Error("Nothing to compact (session too small)"));
+
+    await harness.command("btw:compact", "");
+
+    expect(harness.notifications.at(-1)).toEqual({
+      message: "The BTW thread is too small to compact. Thread preserved.",
+      type: "warning",
+    });
+    expect(harness.latestOverlayComponent().statusText.text).toContain(
+      "The BTW thread is too small to compact. Thread preserved.",
+    );
+    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(1);
+    expect(record.session.dispose).not.toHaveBeenCalled();
+  });
+
+  it("/btw:compact warns when the thread is already compacted", async () => {
+    const harness = createHarness();
+    promptStreamMock.mockImplementation(() => streamAnswer("First answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+    const record = subSessionRecords[0];
+    record.session.compact.mockRejectedValueOnce(new Error("Already compacted"));
+
+    await harness.command("btw:compact", "");
+
+    expect(harness.notifications.at(-1)).toEqual({
+      message: "This BTW thread is already compacted.",
+      type: "warning",
+    });
+    expect(harness.latestOverlayComponent().statusText.text).toContain("This BTW thread is already compacted.");
+    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(1);
+    expect(record.session.dispose).not.toHaveBeenCalled();
+  });
+
+  it("/btw:compact queues a new turn behind the in-flight compaction", async () => {
+    const harness = createHarness();
+    promptStreamMock
+      .mockImplementationOnce(() => streamAnswer("First answer"))
+      .mockImplementationOnce(() => streamAnswer("Second answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+
+    const overlay = harness.latestOverlayComponent();
+    const record = subSessionRecords[0];
+    let releaseCompaction!: () => void;
+    const compactionPending = new Promise<void>((resolve) => {
+      releaseCompaction = resolve;
+    });
+    record.session.compact.mockImplementationOnce(async () => {
+      await compactionPending;
+      return { summary: "Compaction summary", firstKeptEntryId: "entry-1", tokensBefore: 24000 };
+    });
+
+    const compacting = harness.command("btw:compact", "");
+    await flushAsyncWork();
+
+    overlay.input.onSubmit?.("second question");
+    await flushAsyncWork();
+
+    // pi rejects prompt() while compact() runs, so the turn has to wait.
+    expect(record.session.prompt).toHaveBeenCalledTimes(1);
+
+    releaseCompaction();
+    await compacting;
+    await settleBtwTurn();
+
+    expect(record.session.prompt).toHaveBeenCalledTimes(2);
+    expect(record.session.prompt).toHaveBeenNthCalledWith(2, "second question", { source: "extension" });
+    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(2);
+  });
+
+  it("/btw:compact warns instead of starting a second compaction", async () => {
+    const harness = createHarness();
+    promptStreamMock.mockImplementation(() => streamAnswer("First answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+
+    const record = subSessionRecords[0];
+    let releaseCompaction!: () => void;
+    const compactionPending = new Promise<void>((resolve) => {
+      releaseCompaction = resolve;
+    });
+    record.session.compact.mockImplementationOnce(async () => {
+      await compactionPending;
+      return { summary: "Compaction summary", firstKeptEntryId: "entry-1", tokensBefore: 24000 };
+    });
+
+    const compacting = harness.command("btw:compact", "");
+    await flushAsyncWork();
+
+    await harness.command("btw:compact", "");
+
+    expect(harness.notifications.at(-1)).toEqual({
+      message: "A compaction is already running.",
+      type: "warning",
+    });
+    expect(record.session.compact).toHaveBeenCalledTimes(1);
+
+    releaseCompaction();
+    await compacting;
+  });
+
+  it("/btw:inject waits for an in-flight compaction before handing off", async () => {
+    const harness = createHarness();
+    promptStreamMock
+      .mockImplementationOnce(() => streamAnswer("First answer"))
+      .mockImplementationOnce(() => streamAnswer("Second answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+    await harness.command("btw", "second question");
+
+    const record = subSessionRecords[0];
+    let releaseCompaction!: () => void;
+    const compactionPending = new Promise<void>((resolve) => {
+      releaseCompaction = resolve;
+    });
+    // pi rewrites the child context while compacting, before the compaction finishes.
+    record.session.compact.mockImplementationOnce(async () => {
+      const kept = record.session.state.messages.slice(-2).map((message: any) => structuredClone(message));
+      record.session.state.messages.splice(
+        0,
+        record.session.state.messages.length,
+        { role: "compactionSummary", summary: "Compaction summary", tokensBefore: 24000, timestamp: Date.now() },
+        ...kept,
+      );
+      await compactionPending;
+      return { summary: "Compaction summary", firstKeptEntryId: "entry-1", tokensBefore: 24000 };
+    });
+
+    const compacting = harness.command("btw:compact", "");
+    await flushAsyncWork();
+
+    const injecting = harness.command("btw:inject", "");
+    await flushAsyncWork();
+
+    // The handoff has to wait for the compaction, not read the half-rewritten context.
+    expect(harness.sentUserMessages).toHaveLength(0);
+
+    releaseCompaction();
+    await compacting;
+    await injecting;
+
+    expect(harness.sentUserMessages).toHaveLength(1);
+    expect(harness.sentUserMessages[0].content).toContain("User: first question\nAssistant: First answer");
+    expect(harness.sentUserMessages[0].content).toContain("User: second question\nAssistant: Second answer");
   });
 
   it("/btw:inject after compaction hands off the recorded exchanges, not the rewritten context", async () => {
@@ -3479,16 +3687,37 @@ describe("btw runtime behavior", () => {
     await harness.command("btw", "first question");
     await harness.command("btw", "second question");
 
-    const record = subSessionRecords[0];
+    // The mocked compaction replaces the child context with a summary plus the most recent
+    // turn, so the seeded offset no longer lines up with the hidden thread.
     await harness.command("btw:compact", "");
+    await harness.command("btw:inject", "");
 
-    // Compaction replaces the child context with a summary plus the most recent turn,
-    // so the seeded offset no longer lines up with the hidden thread.
-    record.setStateMessages([
-      { role: "user", content: [{ type: "text", text: "Compaction summary" }], timestamp: Date.now() },
-      { role: "user", content: [{ type: "text", text: "second question" }], timestamp: Date.now() },
-      makeAssistantMessage("Second answer"),
-    ]);
+    expect(harness.sentUserMessages).toHaveLength(1);
+    expect(harness.sentUserMessages[0].content).toContain("User: first question\nAssistant: First answer");
+    expect(harness.sentUserMessages[0].content).toContain("User: second question\nAssistant: Second answer");
+    expect(harness.sentUserMessages[0].content).not.toContain("Compaction summary");
+  });
+
+  it("/btw:inject hands off the recorded exchanges after an automatic compaction", async () => {
+    const harness = createHarness();
+    promptStreamMock
+      .mockImplementationOnce(() => streamAnswer("First answer"))
+      .mockImplementationOnce(() => streamAnswer("Second answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+    await harness.command("btw", "second question");
+
+    const record = subSessionRecords[0];
+    // pi's automatic compaction rewrites the child context without going through /btw:compact.
+    await record.session.compact();
+    record.emit({
+      type: "compaction_end",
+      reason: "threshold",
+      result: { summary: "Compaction summary", firstKeptEntryId: "entry-1", tokensBefore: 24000 },
+      aborted: false,
+      willRetry: false,
+    });
 
     await harness.command("btw:inject", "");
 
@@ -3496,6 +3725,90 @@ describe("btw runtime behavior", () => {
     expect(harness.sentUserMessages[0].content).toContain("User: first question\nAssistant: First answer");
     expect(harness.sentUserMessages[0].content).toContain("User: second question\nAssistant: Second answer");
     expect(harness.sentUserMessages[0].content).not.toContain("Compaction summary");
+  });
+
+  it("/btw:inject keeps reading the child thread when compaction_end carries no result", async () => {
+    const harness = createHarness();
+    promptStreamMock.mockImplementation(() => streamAnswer("First answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+
+    const record = subSessionRecords[0];
+    record.session.state.messages.push(
+      { role: "user", content: [{ type: "text", text: "session-only question" }], timestamp: Date.now() },
+      makeAssistantMessage("session-only answer"),
+    );
+
+    // A result-less compaction_end means pi did not rewrite the child messages.
+    record.emit({
+      type: "compaction_end",
+      reason: "threshold",
+      result: undefined,
+      aborted: false,
+      willRetry: false,
+    });
+
+    await harness.command("btw:inject", "");
+
+    expect(harness.sentUserMessages).toHaveLength(1);
+    expect(String(harness.sentUserMessages[0].content)).toContain(
+      "User: session-only question\nAssistant: session-only answer",
+    );
+  });
+
+  it("/btw:inject keeps reading the child thread when compaction_end was aborted", async () => {
+    const harness = createHarness();
+    promptStreamMock.mockImplementation(() => streamAnswer("First answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+
+    const record = subSessionRecords[0];
+    record.session.state.messages.push(
+      { role: "user", content: [{ type: "text", text: "session-only question" }], timestamp: Date.now() },
+      makeAssistantMessage("session-only answer"),
+    );
+
+    record.emit({
+      type: "compaction_end",
+      reason: "manual",
+      result: { summary: "Compaction summary", firstKeptEntryId: "entry-1", tokensBefore: 24000 },
+      aborted: true,
+      willRetry: false,
+    });
+
+    await harness.command("btw:inject", "");
+
+    expect(harness.sentUserMessages).toHaveLength(1);
+    expect(String(harness.sentUserMessages[0].content)).toContain(
+      "User: session-only question\nAssistant: session-only answer",
+    );
+  });
+
+  it("/btw:compact then a follow-up turn still hands off every exchange", async () => {
+    const harness = createHarness();
+    promptStreamMock
+      .mockImplementationOnce(() => streamAnswer("First answer"))
+      .mockImplementationOnce(() => streamAnswer("Second answer"))
+      .mockImplementationOnce(() => streamAnswer("Third answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+    await harness.command("btw", "second question");
+    await harness.command("btw:compact", "");
+    await harness.command("btw", "third question");
+    await harness.command("btw:inject", "");
+
+    const record = subSessionRecords[0];
+    expect(record.session.prompt).toHaveBeenCalledTimes(3);
+    expect(record.session.prompt).toHaveBeenNthCalledWith(3, "third question", { source: "extension" });
+    expect(harness.sentUserMessages).toHaveLength(1);
+    const content = String(harness.sentUserMessages[0].content);
+    expect(content).toContain("User: first question\nAssistant: First answer");
+    expect(content).toContain("User: second question\nAssistant: Second answer");
+    expect(content).toContain("User: third question\nAssistant: Third answer");
+    expect(content).not.toContain("Compaction summary");
   });
 
   it("/btw:summarize success summarizes the active sub-session thread, disposes it, dismisses the overlay, and reopens fresh", async () => {

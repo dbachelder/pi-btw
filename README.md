@@ -154,6 +154,7 @@ pi install /absolute/path/to/pi-btw
 - optional `instructions` are passed to the summarizer, like pi's own `/compact`
 - waits for the current BTW turn to finish before compacting
 - after compaction the hidden thread becomes the handoff source, because the child's rewritten message list no longer lines up with the seeded offset; `/btw:inject` and `/btw:summarize` still send every exchange
+- pi keeps roughly the last 20k tokens when compacting, so a short BTW thread reports that it is too small to compact, and re-running right after a compaction reports that the thread is already compacted; both leave the thread untouched
 - a failed compaction is reported and leaves the thread untouched
 
 ### `/btw:inject [instructions]`
@@ -197,7 +198,7 @@ BTW is implemented as an actual pi sub-session with its own in-memory session st
 - `/btw:summarize` uses the current effective BTW model but keeps thinking off
 - the overlay transcript/status line is driven from sub-session events, so tool activity, streaming deltas, failures, and recovery are all visible without scraping rendered output
 - child prompts preserve the main session's instructions and append an authoritative list of their own tools; inherited tool/skill instructions and historical tool calls do not grant additional capabilities
-- handoff commands (`/btw:inject` and `/btw:summarize`) read from the BTW sub-session thread rather than maintaining a separate manual transcript model
+- handoff commands (`/btw:inject` and `/btw:summarize`) read from the BTW sub-session thread rather than maintaining a separate manual transcript model, except after `/btw:compact`, where the child's rewritten messages no longer map onto the hidden thread and handoff falls back to the recorded exchanges
 
 ### Opt-in extension tools
 
