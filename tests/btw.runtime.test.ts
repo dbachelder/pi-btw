@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -223,6 +223,27 @@ async function* streamAnswer(answer: string) {
   yield { type: "text_delta" as const, delta: answer.slice(0, Math.max(1, Math.floor(answer.length / 2))) };
   yield { type: "text_delta" as const, delta: answer.slice(Math.max(1, Math.floor(answer.length / 2))) };
   yield { type: "done" as const, message: makeAssistantMessage(answer) };
+}
+
+function createBlockingSilentStream() {
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+
+  return {
+    release,
+    stream: async function* () {
+      await blocked;
+      yield {
+        type: "error" as const,
+        error: {
+          ...makeAssistantMessage(""),
+          stopReason: "aborted" as const,
+        },
+      };
+    },
+  };
 }
 
 function createBlockingToolStream() {
@@ -872,6 +893,10 @@ function createHarness(
 }
 
 describe("btw runtime behavior", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   beforeEach(() => {
     promptStreamMock.mockReset();
     createAgentSessionMock.mockReset();
@@ -2312,6 +2337,109 @@ describe("btw runtime behavior", () => {
 
     mainTurn.finish();
     expect(harness.baseCtx.isIdle()).toBe(true);
+  });
+
+  it("times out a prompt with no assistant payload, preserves the reason, and allows a retry", async () => {
+    vi.stubEnv("PI_BTW_FIRST_BYTE_TIMEOUT_MS", "80");
+    vi.stubEnv("PI_BTW_IDLE_TIMEOUT_MS", "1000");
+    const blocking = createBlockingSilentStream();
+    promptStreamMock
+      .mockImplementationOnce(() => blocking.stream())
+      .mockImplementationOnce(() => streamAnswer("Recovered after timeout"));
+    const harness = createHarness();
+
+    await harness.runSessionStart();
+    const pendingCommand = harness.command("btw", "silent request");
+    await flushAsyncWork();
+    const overlay = harness.latestOverlayComponent();
+    const firstRecord = subSessionRecords[0];
+
+    await vi.waitFor(() => expect(firstRecord.session.abort).toHaveBeenCalledTimes(1), { timeout: 1000 });
+    blocking.release();
+    await pendingCommand;
+    await settleBtwTurn();
+    await vi.waitFor(() => expect(firstRecord.session.dispose).toHaveBeenCalledTimes(1));
+
+    expect(overlay.statusText.text).toContain("sent no first byte");
+    expect(overlay.statusText.text).not.toContain("Aborted");
+    expect(overlay.statusText.text).not.toContain("streaming...");
+    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(0);
+
+    overlay.input.onSubmit?.("retry after timeout");
+    await vi.waitFor(() => expect(subSessionRecords).toHaveLength(2));
+    await settleBtwTurn();
+
+    expect(transcriptText(overlay)).toContain("Recovered after timeout");
+    expect(overlay.statusText.text).toContain("Ready for a follow-up");
+    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(1);
+  });
+
+  it("times out an idle stream without overwriting the reason during abort teardown", async () => {
+    vi.stubEnv("PI_BTW_FIRST_BYTE_TIMEOUT_MS", "1000");
+    vi.stubEnv("PI_BTW_IDLE_TIMEOUT_MS", "80");
+    const blocking = createBlockingPartialAbortStream();
+    promptStreamMock.mockImplementationOnce(() => blocking.stream());
+    const harness = createHarness();
+
+    await harness.runSessionStart();
+    const pendingCommand = harness.command("btw", "stall after a delta");
+    await flushAsyncWork();
+    const overlay = harness.latestOverlayComponent();
+    const record = subSessionRecords[0];
+
+    await vi.waitFor(() => expect(record.session.abort).toHaveBeenCalledTimes(1), { timeout: 1000 });
+    blocking.release();
+    await pendingCommand;
+    await settleBtwTurn();
+
+    expect(transcriptText(overlay)).toContain("BTW request stalled");
+    expect(overlay.statusText.text).toContain("request stalled");
+    expect(overlay.statusText.text).not.toContain("Aborted");
+    expect(overlay.statusText.text).not.toContain("streaming...");
+  });
+
+  it("resets timeout activity for each prompt instead of reusing a previous turn's timestamps", async () => {
+    vi.stubEnv("PI_BTW_FIRST_BYTE_TIMEOUT_MS", "80");
+    vi.stubEnv("PI_BTW_IDLE_TIMEOUT_MS", "1000");
+    const blocking = createBlockingSilentStream();
+    promptStreamMock
+      .mockImplementationOnce(() => streamAnswer("First answer"))
+      .mockImplementationOnce(() => blocking.stream());
+    const harness = createHarness();
+
+    await harness.runSessionStart();
+    await harness.command("btw", "successful first request");
+    const overlay = harness.latestOverlayComponent();
+    const record = subSessionRecords[0];
+
+    overlay.input.onSubmit?.("silent second request");
+    await vi.waitFor(() => expect(record.session.abort).toHaveBeenCalledTimes(1), { timeout: 1000 });
+    blocking.release();
+    await settleBtwTurn();
+
+    expect(overlay.statusText.text).toContain("sent no first byte");
+    expect(overlay.statusText.text).not.toContain("request stalled");
+  });
+
+  it("keeps a slow stream alive while assistant deltas continue arriving", async () => {
+    vi.stubEnv("PI_BTW_FIRST_BYTE_TIMEOUT_MS", "1000");
+    vi.stubEnv("PI_BTW_IDLE_TIMEOUT_MS", "100");
+    promptStreamMock.mockImplementationOnce(async function* () {
+      yield { type: "text_delta" as const, delta: "Slow " };
+      await new Promise((resolve) => setTimeout(resolve, 70));
+      yield { type: "text_delta" as const, delta: "answer" };
+      await new Promise((resolve) => setTimeout(resolve, 70));
+      yield { type: "done" as const, message: makeAssistantMessage("Slow answer") };
+    });
+    const harness = createHarness();
+
+    await harness.runSessionStart();
+    await harness.command("btw", "slow but active request");
+
+    const overlay = harness.latestOverlayComponent();
+    await vi.waitFor(() => expect(transcriptText(overlay)).toContain("Slow answer"), { timeout: 1000 });
+    await vi.waitFor(() => expect(overlay.statusText.text).toContain("Ready for a follow-up"), { timeout: 1000 });
+    expect(subSessionRecords[0].session.abort).not.toHaveBeenCalled();
   });
 
   it("dismisses immediately on Escape when the side session is idle", async () => {

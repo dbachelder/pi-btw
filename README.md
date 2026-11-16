@@ -104,6 +104,8 @@ pi install /absolute/path/to/pi-btw
 - the value is a comma-separated list of pi-tui key identifiers such as `PI_BTW_FOCUS_KEYS="ctrl+/,ctrl+alt+b"`; it replaces the defaults entirely
 - identifiers combine `ctrl`, `shift`, `alt`, and `super` with a single base key (letter, digit, symbol, or named key like `enter`/`f5`); blank or invalid entries are ignored, and the defaults are kept if none are usable
 - while BTW is streaming, the first `Esc` aborts the request and keeps its partial transcript visible; press `Esc` again to dismiss
+- overlay requests stop waiting after 90 seconds without an assistant message update; after streaming starts, 75 seconds without session activity is treated as a stalled request
+- set `PI_BTW_FIRST_BYTE_TIMEOUT_MS` or `PI_BTW_IDLE_TIMEOUT_MS` to positive millisecond values to override those limits; timed-out threads remain visible and can be retried
 - while BTW is idle, `Esc` dismisses the overlay immediately
 - BTW now opens top-centered so the main session remains visible underneath it
 

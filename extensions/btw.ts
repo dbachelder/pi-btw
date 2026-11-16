@@ -63,6 +63,15 @@ const BTW_THINKING_OVERRIDE_TYPE = "btw-thinking-override";
 const BTW_DEFAULT_FOCUS_SHORTCUTS: readonly KeyId[] = [Key.alt("/"), Key.super("/"), Key.ctrlAlt("w")];
 const BTW_FOCUS_KEYS_ENV = "PI_BTW_FOCUS_KEYS";
 const BTW_FOCUS_MODIFIERS = new Set(["ctrl", "shift", "alt", "super"]);
+const BTW_FIRST_BYTE_TIMEOUT_ENV = "PI_BTW_FIRST_BYTE_TIMEOUT_MS";
+const BTW_IDLE_TIMEOUT_ENV = "PI_BTW_IDLE_TIMEOUT_MS";
+
+function readBtwTimeoutMs(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const value = Number(raw);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
 // Mirrors the SpecialKey union in @earendil-works/pi-tui keys.d.ts (lower-cased).
 const BTW_FOCUS_SPECIAL_KEYS = new Set([
   "escape", "esc", "enter", "return", "tab", "space", "backspace", "delete", "insert", "clear",
@@ -290,6 +299,11 @@ type BtwSessionRuntime = {
   hasExtensions: boolean;
   workspace?: BtwSshWorkspace;
   workspaceIdentity: string;
+  /** Monotonic event activity used to bound each overlay prompt independently. */
+  eventCount: number;
+  /** Assistant message_update count; message_start can precede transport completion. */
+  assistantMessageUpdateCount: number;
+  lastEventAt: number;
 };
 
 type OverlayRuntime = {
@@ -528,6 +542,7 @@ function buildBtwSeedState(
             return [];
           }
 
+          // SAFETY: entry is known to be an object; every field used below is runtime-validated.
           const message = entry as unknown as Partial<Message> & { role?: string; customType?: string; content?: unknown };
           if (typeof message.role !== "string" || !Array.isArray(message.content)) {
             return [];
@@ -1859,6 +1874,12 @@ export default function (pi: ExtensionAPI) {
     event: AgentSessionEvent,
     ctx?: ExtensionContext | ExtensionCommandContext,
   ): void {
+    sessionRuntime.eventCount += 1;
+    sessionRuntime.lastEventAt = Date.now();
+    if (event.type === "message_update") {
+      sessionRuntime.assistantMessageUpdateCount += 1;
+    }
+
     if (activeBtwSession?.session !== sessionRuntime.session || !overlayRuntime) {
       return;
     }
@@ -2204,7 +2225,19 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    return { session, mode, subscriptions: new Set(), sideThreadStartIndex, promptQueue: Promise.resolve(), hasExtensions, workspace, workspaceIdentity };
+    return {
+      session,
+      mode,
+      subscriptions: new Set(),
+      sideThreadStartIndex,
+      promptQueue: Promise.resolve(),
+      hasExtensions,
+      workspace,
+      workspaceIdentity,
+      eventCount: 0,
+      assistantMessageUpdateCount: 0,
+      lastEventAt: 0,
+    };
   }
 
   function ensureBtwSession(ctx: ExtensionCommandContext, mode: BtwThreadMode): Promise<BtwSessionRuntime | null> {
@@ -2637,6 +2670,7 @@ export default function (pi: ExtensionAPI) {
 
     for (let i = 0; i < branch.length; i++) {
       if (isCustomEntry(branch[i], BTW_MODEL_OVERRIDE_TYPE)) {
+        // SAFETY: isCustomEntry verified the custom type; action-specific fields are checked below.
         const details = (branch[i] as unknown as { data?: BtwModelOverrideDetails }).data;
         if (details?.action === "set") {
           const resolved = ctx.modelRegistry.find(details.provider, details.id);
@@ -2652,6 +2686,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       if (isCustomEntry(branch[i], BTW_THINKING_OVERRIDE_TYPE)) {
+        // SAFETY: isCustomEntry verified the custom type; the optional action is checked below.
         const details = (branch[i] as unknown as { data?: BtwThinkingOverrideDetails }).data;
         btwThinkingOverride =
           details?.action === "set"
@@ -2663,6 +2698,7 @@ export default function (pi: ExtensionAPI) {
 
       if (isCustomEntry(branch[i], BTW_RESET_TYPE)) {
         lastResetIndex = i;
+        // SAFETY: isCustomEntry verified the custom type; mode has a safe fallback below.
         const details = (branch[i] as unknown as { data?: BtwResetDetails }).data;
         pendingMode = details?.mode ?? "contextual";
       }
@@ -2673,6 +2709,7 @@ export default function (pi: ExtensionAPI) {
         continue;
       }
 
+      // SAFETY: isCustomEntry verified the custom type; question and answer are checked below.
       const details = (entry as unknown as { data?: BtwDetails }).data;
       if (!details?.question || !details.answer) {
         continue;
@@ -2809,9 +2846,61 @@ export default function (pi: ExtensionAPI) {
     setOverlayStatus("⏳ streaming...", ctx);
     await ensureOverlay(ctx);
 
+    // OpenAI-compatible SSE transports do not consistently impose a first-byte or
+    // inter-chunk deadline. Bound the visible overlay request here so a silent peer
+    // cannot leave the modal displaying "streaming..." forever.
+    const timeoutFirstByteMs = readBtwTimeoutMs(BTW_FIRST_BYTE_TIMEOUT_ENV, 90_000);
+    const timeoutIdleMs = readBtwTimeoutMs(BTW_IDLE_TIMEOUT_ENV, 75_000);
+    const promptStartedAt = Date.now();
+    const eventCountStart = sessionRuntime.eventCount;
+    const assistantPayloadCountStart = sessionRuntime.assistantMessageUpdateCount;
+    const watchdogArmed = overlayAvailable && sessionRuntime.subscriptions.size > 0;
+    let promptSettled = false;
+    let timeoutFired = false;
+    let watchdog: ReturnType<typeof setInterval> | undefined;
+
+    if (watchdogArmed) {
+      // Keep the normal UI cheap, while making intentionally short test/override
+      // deadlines responsive instead of rounding them up to a five-second tick.
+      const pollMs = Math.max(10, Math.min(5_000, Math.floor(Math.min(timeoutFirstByteMs, timeoutIdleMs) / 3)));
+      watchdog = setInterval(() => {
+        if (promptSettled || timeoutFired || activeBtwSession !== sessionRuntime) return;
+
+        const now = Date.now();
+        const hasAssistantPayload = sessionRuntime.assistantMessageUpdateCount > assistantPayloadCountStart;
+        const lastEventAt = sessionRuntime.eventCount > eventCountStart ? sessionRuntime.lastEventAt : promptStartedAt;
+        const timeoutMessage = !hasAssistantPayload && now - promptStartedAt >= timeoutFirstByteMs
+          ? `BTW request timed out: ${model.provider}/${model.id} sent no first byte within ${Math.max(1, Math.round(timeoutFirstByteMs / 1000))}s.`
+          : hasAssistantPayload && now - lastEventAt >= timeoutIdleMs
+            ? `BTW request stalled: no data for ${Math.max(1, Math.round(timeoutIdleMs / 1000))}s after streaming started (${model.provider}/${model.id}).`
+            : null;
+        if (!timeoutMessage) return;
+
+        timeoutFired = true;
+        if (watchdog) clearInterval(watchdog);
+        setTranscriptFailure(transcriptState, timeoutMessage);
+        setOverlayStatus(`⏱ ${timeoutMessage} Press Esc to dismiss, or send the question again.`, ctx);
+        notify(ctx, timeoutMessage, "error");
+        // Abort emits turn_end/message_end. Detach first so teardown cannot
+        // overwrite the terminal timeout state with another "streaming...".
+        clearBtwSessionSubscriptions(sessionRuntime);
+        void requestBtwSessionAbort(sessionRuntime)
+          .then(() => activeBtwSession === sessionRuntime ? disposeBtwSession() : undefined)
+          .catch(() => {
+            // The timeout is already visible; disposal remains best-effort.
+          });
+      }, pollMs);
+    }
+
     try {
       sessionRuntime.workspace?.assertCurrent();
       await session.prompt(question, { source: "extension" });
+      promptSettled = true;
+      if (timeoutFired) {
+        // The watchdog already selected a terminal state. In particular, do not
+        // relabel a timed-out request as a user-initiated abort.
+        return;
+      }
       if (!isCurrentGeneration()) {
         return;
       }
@@ -2870,7 +2959,8 @@ export default function (pi: ExtensionAPI) {
         setOverlayStatus("Ready for a follow-up. Hidden BTW thread updated.", ctx);
       }
     } catch (error) {
-      if (!isCurrentGeneration()) {
+      promptSettled = true;
+      if (timeoutFired || !isCurrentGeneration()) {
         return;
       }
       const errorMessage = error instanceof Error ? error.message : String(error);
@@ -2879,6 +2969,8 @@ export default function (pi: ExtensionAPI) {
       notify(ctx, errorMessage, "error");
       await disposeBtwSession();
     } finally {
+      promptSettled = true;
+      if (watchdog) clearInterval(watchdog);
       releasePromptTurn();
       syncUi(ctx);
     }
